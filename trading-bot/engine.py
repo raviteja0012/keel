@@ -380,6 +380,8 @@ def try_execute(sig: Dict, p: Dict) -> None:
             decisions.record(strat, symbol, sig["trade_mode"], "news", "skipped",
                              reason=blk["reason"], grade=sig["grade"],
                              regime=regime_ctx, news_ctx=blk)
+            _news_cal.log_action(blk.get("event_id"), "block_entry", symbol,
+                                 blk["reason"])
             _recent_keys[sig["key"]] = time.time() + 30 * 60
             _log_signal(sig, "skipped", blk["reason"])
             return

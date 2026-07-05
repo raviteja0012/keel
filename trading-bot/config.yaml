@@ -53,6 +53,24 @@ telegram:
   chat_id: ""
   notify_signals: true    # also notify on signals that were skipped by filters
 
+news_calendar:            # scheduled-event blackout gate (runs inside server.py)
+  enabled: true
+  refresh_min: 60         # re-fetch the weekly calendar this often
+  on_stale: halt          # halt = classes WITH windows stop opening entries when
+                          # the calendar can't refresh (fail safe, constraint 4);
+                          # warn = keep trading, staleness shown on dashboard only
+  stale_after_hours: 48   # grace before a failed feed counts as stale
+  windows:                # minutes [before, after] a release blocking NEW entries,
+    forex:                # per asset class per impact level. Empty class = no
+      high: [30, 30]      # scheduled blackout (crypto default — explicit policy:
+    metals:               # 24/7 market, weekend half-risk handles thinness).
+      high: [30, 30]
+    energies:
+      high: [30, 30]
+    indices:
+      high: [30, 30]
+    crypto: {}
+
 news_agent:               # news monitoring sub-agent (run: python news_agent.py)
   live_mode: true         # true = act (paper SLs updated in DB; live SLs sent to MT5,
                           # where the EA still refuses anything that loosens a stop)

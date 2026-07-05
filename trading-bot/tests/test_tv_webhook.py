@@ -81,6 +81,9 @@ def _fresh_db_and_feed():
                  "agent_disabled_pairs": [], "agent_disabled_modes": [],
                  "paper_balance": 10000.0}.items():
         storage.set_setting(k, v)
+    # mark the news calendar fresh so its stale-halt fail-safe (tested in
+    # test_news_regime.py) doesn't block entries in this fresh DB
+    storage.set_setting("news_calendar_last_ok", int(time.time()))
     # synthetic live feed: tight spread + tick sizing so calc_lots works
     engine.feed_state["prices"] = {"EURUSD": {
         "symbol": "EURUSD", "bid": 1.09998, "ask": 1.10002,

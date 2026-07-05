@@ -20,6 +20,7 @@ import decisions
 import engine
 import exposure
 import instruments
+import news_calendar
 import notifier
 import params_store
 import storage
@@ -403,6 +404,27 @@ def api_instruments():
     return jsonify({"instruments": instruments.all_rows()})
 
 
+@app.route("/api/news_calendar")
+def api_news_calendar():
+    return jsonify({"status": news_calendar.status(),
+                    "upcoming": news_calendar.upcoming(
+                        int(request.args.get("hours", 48)))})
+
+
+@app.route("/api/news_calendar/manual", methods=["POST"])
+def api_news_calendar_manual():
+    body = request.get_json(force=True, silent=True) or {}
+    t, title = body.get("t"), body.get("title")
+    entities = body.get("entities") or []
+    if not (t and title and entities):
+        return jsonify({"ok": False, "error": "t, title, entities required"}), 400
+    row = news_calendar.add_manual(int(t), str(title)[:200], list(entities),
+                                   str(body.get("impact", "high")))
+    storage.log_agent("info", "news_calendar",
+                      "manual event added: %s (%s)" % (title, entities))
+    return jsonify({"ok": bool(row), "id": row})
+
+
 @app.route("/api/halt", methods=["POST"])
 def api_halt():
     params_store.set_param("halt_new_entries", True, origin="human",
@@ -573,6 +595,8 @@ if __name__ == "__main__":
     storage.init()
     seed_settings()
     instruments.seed_defaults()      # per-symbol metadata registry (Phase 2)
+    news_calendar.configure(CFG.get("news_calendar"))
+    news_calendar.start_refresher()  # scheduled-event blackouts (Phase 3)
     notifier.start()
     engine.set_notifier(notifier.send)
 

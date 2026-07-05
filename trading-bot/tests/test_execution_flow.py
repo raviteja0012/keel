@@ -23,6 +23,9 @@ import instruments
 instruments.seed_defaults()
 # pin the session gate open (time-injected session tests live in test_risk_rails)
 engine.sessions.is_market_open = lambda symbol, now=None: (True, "")
+# mark the news calendar fresh so its stale-halt fail-safe (tested in
+# test_news_regime.py) doesn't block these execution-flow tests
+storage.set_setting("news_calendar_last_ok", int(time.time()))
 
 
 def _price(symbol, bid, ask, tick=0.0001):
