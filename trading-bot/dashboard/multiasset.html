@@ -390,11 +390,26 @@ async function loadPromotion(){
       return `<tr><td><span class="check"><span class="dot" style="background:${col}"></span>${esc(k.replaceAll('_',' '))}</span></td>
         <td>${esc(String(ch.value??'—'))}${ch.required?` / ${ch.required}`:''}</td>
         <td class="note">${esc(ch.note||'')}</td></tr>`;}).join('');
+    const needsSignoff=!c.checks.manual_signoff.pass
+      && Object.entries(c.checks).every(([k,ch])=>k==='manual_signoff'||ch.pass);
+    const signBtn=needsSignoff
+      ?`<div class="row" style="margin:8px 0"><button class="act" onclick="signoff('${esc(c.strategy)}','${esc(c.asset_class)}')">
+         Sign off ${esc(c.strategy)} × ${esc(c.asset_class)}…</button>
+         <span class="note">all data checks pass — the manual sign-off is yours to give</span></div>`:'';
     return `<h2>${esc(c.strategy)} × ${esc(c.asset_class)} —
       <span style="color:${c.gate_open?'var(--good)':'var(--serious)'}">${c.gate_open?'GATE OPEN':'gate closed'}</span>
       <span class="note">n=${c.stats.n}, exp ${fmt(c.stats.expectancy_r,3)}R</span></h2>
-      <table><thead><tr><th>Check</th><th>Value</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+      <table><thead><tr><th>Check</th><th>Value</th><th></th></tr></thead><tbody>${rows}</tbody></table>${signBtn}`;
   }).join(''):'<p class="note">no closed paper trades attributed yet — cells appear as strategy×class samples accumulate</p>';
+}
+
+async function signoff(strategy,asset_class){
+  const signed_by=prompt(`Manual promotion sign-off for ${strategy} × ${asset_class}.\n\nYour name (recorded with the sample snapshot):`);
+  if(!signed_by)return;
+  const note=prompt('Optional note (e.g. "forward-test continuation, min size"):')||'';
+  const r=await POST('/api/live/signoff',{strategy,asset_class,signed_by,note});
+  alert(r.ok?'Sign-off recorded.':'Refused: '+(r.reason||''));
+  loadPromotion();
 }
 
 /* ---------- decisions ---------- */

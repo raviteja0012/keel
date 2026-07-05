@@ -340,6 +340,16 @@ def update_settings():
     for k, v in body.items():
         if v == "•••set•••" and k in _SECRET_KEYS:
             continue                     # redacted echo — never overwrite a secret
+        if k == "trading_mode" and str(v).lower() == "live":
+            # going live is ONLY possible via the two-step, promotion-gated
+            # switch (live_switch.py on the control dashboard). paper/off
+            # stay one-click here — de-escalation must always be easy.
+            rejected[k] = ("live requires the two-step switch on the control "
+                           "dashboard (promotion gate + confirm phrase)")
+            storage.log_agent("info", "trading_mode",
+                              "REFUSED live via /api/settings — use the "
+                              "two-step switch")
+            continue
         if k in guarded:
             try:
                 changed[k] = params_store.set_param(

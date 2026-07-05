@@ -18,14 +18,12 @@ Security model:
 
 Run:  python3 dashboard_api.py         # http://127.0.0.1:8767
 """
-import json
 import os
-import secrets
 from typing import Any, Dict, Optional
 
 import yaml
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 
 import analysis
 import decisions
@@ -33,9 +31,9 @@ import instruments
 import news_calendar
 import params_store
 import storage
+from dash_auth import get_token, require_token, _TOKEN_FILE
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-_TOKEN_FILE = os.path.join(BASE, "state", "dashboard_token")
 
 
 def _load_cfg() -> Dict[str, Any]:
@@ -46,33 +44,6 @@ def _load_cfg() -> Dict[str, Any]:
         cfg = {}
     d = cfg.get("dashboard") or {}
     return {"host": d.get("host", "127.0.0.1"), "port": int(d.get("port", 8767))}
-
-
-def get_token() -> str:
-    """Control token: env wins; else a generated secret persisted with 0600
-    perms under state/ (gitignored). Never in the repo, config, or the DB."""
-    env = os.environ.get("DASHBOARD_TOKEN")
-    if env:
-        return env
-    try:
-        with open(_TOKEN_FILE) as f:
-            tok = f.read().strip()
-        if tok:
-            return tok
-    except FileNotFoundError:
-        pass
-    tok = secrets.token_urlsafe(24)
-    os.makedirs(os.path.dirname(_TOKEN_FILE), exist_ok=True)
-    with open(_TOKEN_FILE, "w") as f:
-        f.write(tok)
-    os.chmod(_TOKEN_FILE, 0o600)
-    return tok
-
-
-def require_token(x_dashboard_token: Optional[str] = Header(None)) -> None:
-    if not x_dashboard_token or not secrets.compare_digest(
-            x_dashboard_token, get_token()):
-        raise HTTPException(401, "missing/invalid X-Dashboard-Token")
 
 
 app = FastAPI(title="SLC multi-asset dashboard", docs_url=None, redoc_url=None)
