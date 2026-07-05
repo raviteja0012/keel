@@ -16,8 +16,12 @@ import yaml
 from flask import Flask, jsonify, request, send_from_directory
 
 import agent
+import decisions
 import engine
+import exposure
+import instruments
 import notifier
+import params_store
 import storage
 import tv_webhook
 
@@ -53,6 +57,11 @@ def seed_settings():
         "discord_webhook_url": "",
         "agent_disabled_pairs": [],
         "agent_disabled_modes": [],
+        "notify_agent": True,
+        # multi-asset rails (Phase 2): per-class concurrency + factor buckets
+        "max_concurrent_per_class": CFG.get("risk", {}).get("max_concurrent_per_class", 2),
+        "max_bucket_exposure": CFG.get("risk", {}).get("max_bucket_exposure", 2.0),
+        "halt_new_entries": False,
         # strategy-plugin flags (strategy_<name>_enabled); SLC default-on
         "strategy_slc_enabled": True,
         # TradingView / external webhook — OFF until enabled AND a token is set
@@ -215,6 +224,20 @@ def index():
     return send_from_directory(os.path.join(BASE, "dashboard"), "index.html")
 
 
+_SECRET_KEYS = ("telegram_bot_token", "telegram_chat_id", "discord_webhook_url",
+                "tradingview_webhook_token")
+
+
+def _redact(settings):
+    """Never hand credentials to a dashboard client (constraint 8): presence
+    is signalled, values are not."""
+    out = dict(settings)
+    for k in _SECRET_KEYS:
+        if out.get(k):
+            out[k] = "•••set•••"
+    return out
+
+
 @app.route("/api/state")
 def state():
     feed = engine.get_feed()
@@ -226,7 +249,7 @@ def state():
         t["upnl"] = engine.trade_upnl(t)
     return jsonify({
         "feed": feed,
-        "settings": storage.all_settings(),
+        "settings": _redact(storage.all_settings()),
         "open_trades": open_trades,
         "open_pnl": round(sum(t["upnl"] or 0 for t in open_trades), 2),
         "shadow_open": len(storage.open_trades("shadow")),
@@ -295,22 +318,34 @@ def agent_log():
 
 @app.route("/api/settings", methods=["POST"])
 def update_settings():
+    """Dashboard settings writes. Risk-relevant keys go through
+    params_store.set_param (origin=human) so bounds and code ceilings are
+    enforced server-side and every change lands in param_changes with its
+    old/new values; violations are reported back per key, not applied.
+    Non-risk keys (credentials, toggles, lists) write directly as before."""
     body = request.get_json(force=True) or {}
-    allowed = {
-        "trading_mode", "modes", "risk_pct", "b_setup_risk_factor", "min_rr",
-        "atr_buffer", "max_concurrent", "daily_stop_pct", "weekly_stop_pct",
-        "min_grade", "regime_max", "regime_b_ban", "max_spread_frac", "vol_mult",
-        "enabled_pairs", "watch_pairs", "agent_enabled", "telegram_enabled",
+    allowed_direct = {
+        "trading_mode", "modes", "enabled_pairs", "watch_pairs",
+        "agent_enabled", "telegram_enabled",
         "telegram_bot_token", "telegram_chat_id", "notify_signals", "notify_agent",
         "discord_enabled", "discord_webhook_url",
         "paper_balance", "agent_disabled_pairs", "agent_disabled_modes",
         "strategy_slc_enabled",
         "tradingview_webhook_enabled", "tradingview_webhook_token",
-        "tradingview_symbol_map",
+        "tradingview_symbol_map", "halt_new_entries",
     }
-    changed = {}
+    guarded = set(params_store.BOUNDS) | {"min_grade"}
+    changed, rejected = {}, {}
     for k, v in body.items():
-        if k in allowed:
+        if v == "•••set•••" and k in _SECRET_KEYS:
+            continue                     # redacted echo — never overwrite a secret
+        if k in guarded:
+            try:
+                changed[k] = params_store.set_param(
+                    k, v, origin="human", reason="dashboard settings")
+            except params_store.ParamRejected as e:
+                rejected[k] = str(e)
+        elif k in allowed_direct:
             storage.set_setting(k, v)
             changed[k] = v
     if "trading_mode" in changed:
@@ -318,7 +353,70 @@ def update_settings():
                           "switched to %s via dashboard" % changed["trading_mode"])
         notifier.send("🔁 Trading mode switched to <b>%s</b>"
                       % str(changed["trading_mode"]).upper())
-    return jsonify({"ok": True, "changed": changed})
+    return jsonify({"ok": not rejected, "changed": changed, "rejected": rejected})
+
+
+@app.route("/api/param_changes")
+def param_changes():
+    unacked = request.args.get("unacked") == "1"
+    return jsonify({"changes": params_store.recent_changes(
+        int(request.args.get("limit", 100)), unacked_only=unacked)})
+
+
+@app.route("/api/param_changes/ack/<int:change_id>", methods=["POST"])
+def param_changes_ack(change_id):
+    return jsonify({"ok": params_store.ack_change(change_id)})
+
+
+@app.route("/api/exposure")
+def api_exposure():
+    p = engine.params()
+    mode = p["trading_mode"]
+    open_trades = storage.open_trades("paper" if mode != "live" else "live")
+    return jsonify({
+        "buckets": exposure.bucket_exposures(open_trades, p["risk_pct"]),
+        "by_class": exposure.class_concurrency(open_trades),
+        "cap": p["max_bucket_exposure"],
+        "positions": [{"symbol": t["symbol"], "side": t["side"],
+                       "risk_pct": t["risk_pct"],
+                       "asset_class": instruments.asset_class(t["symbol"]),
+                       "factors": instruments.factor_exposures(t["symbol"], t["side"])}
+                      for t in open_trades],
+    })
+
+
+@app.route("/api/decisions")
+def api_decisions():
+    return jsonify({
+        "funnel": decisions.funnel(int(request.args.get("hours", 24))),
+        "recent": decisions.recent(
+            int(request.args.get("limit", 100)),
+            strategy=request.args.get("strategy"),
+            symbol=request.args.get("symbol"),
+            stage=request.args.get("stage"),
+            action=request.args.get("action")),
+    })
+
+
+@app.route("/api/instruments")
+def api_instruments():
+    return jsonify({"instruments": instruments.all_rows()})
+
+
+@app.route("/api/halt", methods=["POST"])
+def api_halt():
+    params_store.set_param("halt_new_entries", True, origin="human",
+                           reason="manual halt (dashboard)")
+    notifier.send("⛔ <b>Manual halt</b> — new entries stopped (open trades still managed)")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/resume", methods=["POST"])
+def api_resume():
+    params_store.set_param("halt_new_entries", False, origin="human",
+                           reason="manual resume (dashboard)")
+    notifier.send("▶️ Manual halt lifted — new entries allowed again")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/tv_webhook", methods=["POST"])
@@ -474,6 +572,7 @@ load(); setInterval(load,5000);
 if __name__ == "__main__":
     storage.init()
     seed_settings()
+    instruments.seed_defaults()      # per-symbol metadata registry (Phase 2)
     notifier.start()
     engine.set_notifier(notifier.send)
 

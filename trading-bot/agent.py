@@ -17,6 +17,7 @@ Every change is written to agent_log and announced on Telegram.
 import time
 from typing import Any, Dict, List, Optional
 
+import params_store
 import storage
 
 STEP_BUFFER = 0.05
@@ -67,13 +68,25 @@ def evaluate() -> Dict[str, Any]:
     return out
 
 
-def _change(key: str, old, new, why: str, notify) -> None:
-    storage.set_setting(key, new)
+def _change(key: str, old, new, why: str, notify, trigger=None) -> None:
+    """All agent tuning goes through params_store.set_param, which enforces
+    the whitelist + bounds at the WRITE layer and records a structured
+    param_changes row with the stats that triggered it (lesson 3: no silent
+    tuning). A refused write is logged and announced, never applied.
+    Change notifications are deliberately NOT gated on notify_agent — that
+    flag only quiets routine eval summaries."""
+    try:
+        params_store.set_param(key, new, origin="agent", reason=why,
+                               trigger_data=trigger)
+    except params_store.ParamRejected as e:
+        detail = "REFUSED %s: %s -> %s | %s" % (key, old, new, e)
+        storage.log_agent("info", key, detail)
+        print("agent:", detail)
+        return
     detail = "%s: %s -> %s | %s" % (key, old, new, why)
     storage.log_agent("change", key, detail)
-    if storage.get_setting("notify_agent", True):
-        notify("🤖 <b>Agent adjustment</b>\n<code>%s</code>: %s → %s\n<i>%s</i>"
-               % (key, old, new, why))
+    notify("🤖 <b>Agent adjustment</b>\n<code>%s</code>: %s → %s\n<i>%s</i>"
+           % (key, old, new, why))
     print("agent:", detail)
 
 
@@ -99,11 +112,11 @@ def run_once(cfg: Dict[str, Any], notify) -> None:
     if gb.get("n", 0) >= 15 and gb.get("expectancy_r", 0) < 0 and min_grade == "B":
         _change("min_grade", "B", "A",
                 "B setups expectancy %.2fR over %d trades — A+ only from now"
-                % (gb["expectancy_r"], gb["n"]), notify)
+                % (gb["expectancy_r"], gb["n"]), notify, trigger=gb)
     elif gb.get("n", 0) >= 15 and gb.get("expectancy_r", 0) > 0.15 and min_grade == "A":
         _change("min_grade", "A", "B",
                 "B setups recovered to +%.2fR — re-enabled at half risk"
-                % gb["expectancy_r"], notify)
+                % gb["expectancy_r"], notify, trigger=gb)
 
     # 2. Per-symbol kill switch -------------------------------------------
     disabled = storage.get_setting("agent_disabled_pairs", [])
@@ -113,7 +126,7 @@ def run_once(cfg: Dict[str, Any], notify) -> None:
             storage.set_setting("agent_disabled_pair_t_" + sym, int(time.time()))
             _change("agent_disabled_pairs", "active", disabled,
                     "%s expectancy %.2fR over %d trades — disabled" %
-                    (sym, st["expectancy_r"], st["n"]), notify)
+                    (sym, st["expectancy_r"], st["n"]), notify, trigger=st)
     # re-trial after 14 days
     for sym in list(disabled):
         t0 = storage.get_setting("agent_disabled_pair_t_" + sym, 0)
@@ -130,7 +143,7 @@ def run_once(cfg: Dict[str, Any], notify) -> None:
             disabled_modes = disabled_modes + [tm]
             _change("agent_disabled_modes", "active", disabled_modes,
                     "%s mode expectancy %.2fR over %d trades — disabled"
-                    % (tm, st["expectancy_r"], st["n"]), notify)
+                    % (tm, st["expectancy_r"], st["n"]), notify, trigger=st)
 
     # 4. ATR buffer tuning (wick-out analysis) ------------------------------
     # Losses where MFE >= 0.5R = price went our way then stopped us out:
@@ -143,10 +156,11 @@ def run_once(cfg: Dict[str, Any], notify) -> None:
         if frac > 0.4 and buf + STEP_BUFFER <= b_buf[1]:
             _change("atr_buffer", buf, round(buf + STEP_BUFFER, 2),
                     "%.0f%% of recent losers reached +0.5R before stopping out — widening buffer"
-                    % (frac * 100), notify)
+                    % (frac * 100), notify, trigger={"wicked_frac": round(frac, 3), "losers": len(losers)})
         elif frac < 0.1 and buf - STEP_BUFFER >= b_buf[0]:
             _change("atr_buffer", buf, round(buf - STEP_BUFFER, 2),
-                    "clean stop-outs — tightening buffer to improve RR", notify)
+                    "clean stop-outs — tightening buffer to improve RR", notify,
+                    trigger={"wicked_frac": round(frac, 3), "losers": len(losers)})
 
     # 5. min_rr tuning -------------------------------------------------------
     # Winners closed at TP2: if most runners exceed target by far (mfe >>
@@ -162,11 +176,13 @@ def run_once(cfg: Dict[str, Any], notify) -> None:
             avg_overshoot = sum((t["mfe"] or 0) for t in tp2_hits) / len(tp2_hits)
             if avg_overshoot > rr + 0.8:
                 _change("min_rr", rr, round(rr + STEP_RR, 2),
-                        "runners average %.1fR MFE — extending targets" % avg_overshoot, notify)
+                        "runners average %.1fR MFE — extending targets" % avg_overshoot, notify,
+                        trigger={"tp2_hits": len(tp2_hits), "avg_mfe": round(avg_overshoot, 2)})
         if len(tp1_then_back) > len(tp2_hits) and rr - STEP_RR >= b_rr[0]:
             _change("min_rr", rr, round(rr - STEP_RR, 2),
                     "%d trades faded after TP1 vs %d full targets — closer targets"
-                    % (len(tp1_then_back), len(tp2_hits)), notify)
+                    % (len(tp1_then_back), len(tp2_hits)), notify,
+                    trigger={"tp1_then_back": len(tp1_then_back), "tp2_hits": len(tp2_hits)})
 
     storage.set_setting("agent_last_eval_trade_id", closed[-1]["id"])
     o = s["overall"]

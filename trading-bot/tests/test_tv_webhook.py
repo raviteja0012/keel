@@ -17,6 +17,12 @@ storage._DB_PATH = os.path.join(tempfile.mkdtemp(), "test.db")
 
 import tv_webhook
 import engine
+import sessions
+
+# Pin the session calendar open: these tests exercise the webhook->rails
+# path with EURUSD at arbitrary wall-clock times (weekends included); the
+# session gate has its own time-injected tests in test_risk_rails.py.
+engine.sessions.is_market_open = lambda symbol, now=None: (True, "")
 
 
 # ---------------------------------------------------------- pure parser / auth

@@ -15,6 +15,24 @@ _lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
 _recover = {"last": 0.0, "in_progress": False}
 _RECOVER_THROTTLE_S = 600        # at most one auto-recovery attempt per 10 min
+_suspect = {"flag": False, "reason": ""}
+
+
+def integrity_suspect() -> str:
+    """Non-empty reason string while DB integrity is in doubt (corruption seen
+    and not yet successfully recovered). The engine fails safe on this: no new
+    entries may be opened while it is set (CLAUDE.md invariant 7)."""
+    return _suspect["reason"] if _suspect["flag"] else ""
+
+
+def _mark_suspect(reason: str) -> None:
+    _suspect["flag"] = True
+    _suspect["reason"] = reason
+
+
+def _clear_suspect() -> None:
+    _suspect["flag"] = False
+    _suspect["reason"] = ""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars (
@@ -60,11 +78,79 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     t INTEGER, type TEXT, payload TEXT,
-    status TEXT DEFAULT 'pending'    -- pending | sent | acked
+    status TEXT DEFAULT 'pending'    -- pending | sent | acked | expired
+);
+CREATE TABLE IF NOT EXISTS instruments (
+    symbol TEXT PRIMARY KEY,
+    asset_class TEXT NOT NULL,       -- forex | metals | indices | energies | crypto
+    venue TEXT DEFAULT 'mt5',
+    venue_symbol TEXT,
+    session_calendar TEXT,           -- forex | metals | indices | crypto
+    day_boundary TEXT,               -- broker | utc
+    display_digits INTEGER,
+    factor_exposures TEXT,           -- JSON {"USD":-1,"EUR":1,...} for a BUY
+    news_entities TEXT,              -- JSON ["EUR","USD"] / ["BTC","crypto"] ...
+    volume_min REAL, volume_step REAL, volume_max REAL,
+    enabled INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t INTEGER, strategy TEXT, symbol TEXT, trade_mode TEXT, stage TEXT,
+    action TEXT,                     -- executed | skipped | shadow | stand_aside | no_setup
+    grade TEXT, checks TEXT, features TEXT,
+    regime TEXT, session TEXT, news_ctx TEXT,
+    reason TEXT, signal_id INTEGER, trade_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS param_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t INTEGER, origin TEXT,          -- agent | sanity | human | system | news
+    strategy TEXT, asset_class TEXT,
+    key TEXT, old TEXT, new TEXT,
+    bounds TEXT, trigger_data TEXT,
+    accepted INTEGER DEFAULT 1,      -- 0 = refused by the write layer (still logged)
+    ack INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS news_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t INTEGER,                       -- scheduled/publish time (epoch UTC)
+    kind TEXT,                       -- scheduled | headline
+    source TEXT, entities TEXT, impact TEXT,
+    title TEXT, payload TEXT, hash TEXT UNIQUE
+);
+CREATE TABLE IF NOT EXISTS news_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t INTEGER, event_id INTEGER, action TEXT,
+    symbol TEXT, ticket INTEGER, reason TEXT
+);
+CREATE TABLE IF NOT EXISTS promotion_signoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t INTEGER, strategy TEXT, asset_class TEXT,
+    sample_n INTEGER, expectancy_r REAL, data_trust TEXT,
+    signed_by TEXT, note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status, mode);
 CREATE INDEX IF NOT EXISTS idx_signals_t ON signals(t);
+CREATE INDEX IF NOT EXISTS idx_decisions_t ON decisions(t);
+CREATE INDEX IF NOT EXISTS idx_news_events_t ON news_events(t);
 """
+
+# Additive column migrations for tables that predate the multi-asset work.
+# Each entry is (table, column, DDL type/default). Idempotent.
+_MIGRATIONS = [
+    ("trades", "strategy", "TEXT"),
+    ("trades", "asset_class", "TEXT"),
+    ("signals", "strategy", "TEXT"),
+    ("commands", "expires_at", "INTEGER"),   # honored by next_command
+    ("commands", "sent_t", "INTEGER"),
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Additive ALTERs for columns introduced after a table already existed."""
+    for table, col, decl in _MIGRATIONS:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)]
+        if col not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, decl))
 
 
 def init() -> None:
@@ -73,7 +159,9 @@ def init() -> None:
         os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
         _conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
+        _apply_migrations(_conn)
         _conn.commit()
 
 
@@ -129,7 +217,9 @@ def _attempt_recover() -> bool:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
+        _apply_migrations(_conn)
         _conn.commit()
+        _clear_suspect()
         print("[storage] recovery OK — DB rebuilt + WAL enabled; corrupt copy kept")
         return True
     except Exception as e:
@@ -152,10 +242,13 @@ def execute(sql: str, params: tuple = ()) -> int:
             _c().commit()
             return cur.lastrowid or 0
         except sqlite3.DatabaseError as e:
-            if _is_corrupt(e) and _attempt_recover():
-                cur = _c().execute(sql, params)
-                _c().commit()
-                return cur.lastrowid or 0
+            if _is_corrupt(e):
+                if _attempt_recover():
+                    _clear_suspect()
+                    cur = _c().execute(sql, params)
+                    _c().commit()
+                    return cur.lastrowid or 0
+                _mark_suspect("DB corruption detected; recovery pending/throttled")
             raise
 
 
@@ -167,8 +260,13 @@ def query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
         except sqlite3.DatabaseError as e:
             if _is_corrupt(e):
                 if _attempt_recover():
+                    _clear_suspect()
                     rows = _c().execute(sql, params).fetchall()
                     return [dict(r) for r in rows]
+                # Flag the DB as untrustworthy BEFORE degrading to an empty
+                # result: an empty read must never be mistaken for "no open
+                # trades / no losses today" while the file is broken.
+                _mark_suspect("DB corruption detected; recovery pending/throttled")
                 return []          # don't crash the engine loop while throttled
             raise
 
@@ -246,17 +344,37 @@ def open_trades(mode: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 # ---------------- command queue (server -> EA) ------------------------
-def enqueue_command(cmd_type: str, payload: Dict[str, Any]) -> int:
+# Commands carry an expiry (default 5 min) so a stale SL move or open can
+# never execute arbitrarily late, and a served command is marked 'sent' and
+# only re-served after RESEND_GRACE_S without an ack — an EA that executed
+# but failed to ack no longer gets the same live order replayed every poll.
+COMMAND_TTL_S = 300
+RESEND_GRACE_S = 120
+
+
+def enqueue_command(cmd_type: str, payload: Dict[str, Any],
+                    ttl_s: int = COMMAND_TTL_S) -> int:
+    now = int(time.time())
     return execute(
-        "INSERT INTO commands(t,type,payload,status) VALUES(?,?,?,'pending')",
-        (int(time.time()), cmd_type, json.dumps(payload)),
+        "INSERT INTO commands(t,type,payload,status,expires_at) "
+        "VALUES(?,?,?,'pending',?)",
+        (now, cmd_type, json.dumps(payload), now + max(1, int(ttl_s))),
     )
 
 
 def next_command() -> Optional[Dict[str, Any]]:
-    row = query_one("SELECT * FROM commands WHERE status='pending' ORDER BY id LIMIT 1")
+    now = int(time.time())
+    execute("UPDATE commands SET status='expired' "
+            "WHERE status IN ('pending','sent') AND expires_at IS NOT NULL "
+            "AND expires_at < ?", (now,))
+    row = query_one(
+        "SELECT * FROM commands WHERE status='pending' "
+        "OR (status='sent' AND sent_t IS NOT NULL AND sent_t < ?) "
+        "ORDER BY id LIMIT 1", (now - RESEND_GRACE_S,))
     if row is None:
         return None
+    execute("UPDATE commands SET status='sent', sent_t=? WHERE id=?",
+            (now, row["id"]))
     payload = json.loads(row["payload"])
     payload["id"] = str(row["id"])
     payload["type"] = row["type"]
@@ -265,7 +383,9 @@ def next_command() -> Optional[Dict[str, Any]]:
 
 def ack_command(cmd_id: str) -> bool:
     with _lock:
-        cur = _c().execute("UPDATE commands SET status='acked' WHERE id=?", (cmd_id,))
+        cur = _c().execute(
+            "UPDATE commands SET status='acked' WHERE id=? "
+            "AND status IN ('pending','sent')", (cmd_id,))
         _c().commit()
         return cur.rowcount > 0
 

@@ -24,7 +24,11 @@ risk:
   atr_buffer: 0.35        # SL buffer beyond sweep extreme, in ATR(14) of setup TF
   vol_mult: 1.0           # relative-volume confirmation gate (0 = off)
   max_concurrent: 2       # max open trades per mode
-  max_correlated: 3       # max simultaneous same-direction USD exposures
+  max_concurrent_per_class: 2  # max open trades per asset class (forex/metals/indices/energies/crypto)
+  max_correlated: 3       # max simultaneous same-direction positions (legacy count rail)
+  max_bucket_exposure: 2.0  # cap on |net| risk-weighted exposure per factor bucket
+                            # (USD/EUR/GOLD/RISK/CRYPTO...) across ALL asset classes:
+                            # long EURUSD + long GER40 + long XAUUSD stack in USD/RISK
   daily_stop_pct: 2.0     # halt new entries for the day at -2%
   weekly_stop_pct: 5.0    # halt new entries for the week at -5%
   min_grade: B            # A = only 6/6 setups; B = allow no-sweep trend taps at half risk

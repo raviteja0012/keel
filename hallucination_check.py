@@ -29,13 +29,28 @@ DB   = os.path.join(BOT, "data", "trading.db")
 CFG  = os.path.join(BOT, "config.yaml")
 LOG  = os.path.join(HERE, "hallucination_check.jsonl")
 
-ALLOWED_AGENT_KEYS = {"min_grade", "atr_buffer", "min_rr",
-                      "agent_disabled_pairs", "agent_disabled_modes"}
+# Single source of truth: whitelist + bounds come from params_store (the same
+# constants the write layer enforces), so this audit can never drift from the
+# tuner. Falls back to the historical constants if the module isn't importable
+# (e.g. running against an old checkout).
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading-bot"))
+    import params_store as _ps
+    ALLOWED_AGENT_KEYS = set(_ps.WHITELISTS["agent"])
+    BUF_BOUNDS = _ps.BOUNDS["atr_buffer"]
+    RR_BOUNDS = _ps.BOUNDS["min_rr"]
+except Exception:
+    _ps = None
+    ALLOWED_AGENT_KEYS = {"min_grade", "atr_buffer", "min_rr",
+                          "agent_disabled_pairs", "agent_disabled_modes"}
+    BUF_BOUNDS = (0.25, 0.60)
+    RR_BOUNDS = (1.8, 3.0)
 FORBIDDEN_KEYS = {"risk_pct", "daily_stop_pct", "weekly_stop_pct",
                   "max_concurrent", "trading_mode"}
-BUF_BOUNDS = (0.25, 0.60)
-RR_BOUNDS = (1.8, 3.0)
-FRESH_HRS = 12          # newest bar should be within this many hours
+FRESH_HRS = 12          # newest bar should be within this many hours (forex;
+                        # crypto is audited separately at 4h below)
+CRYPTO_FRESH_HRS = 4
+CRYPTO_PREFIXES = ("BTC", "ETH", "ADA", "DOG", "LINK", "BCH", "SOL", "XRP")
 
 fails, warns, info = [], [], {}
 
@@ -66,12 +81,22 @@ def main():
     if integ != "ok":
         fails.append("DB integrity NOT ok (%s…) — agent stats are unreliable" % integ[:40])
 
-    # 2. freshness
+    # 2. freshness — clamp clock skew (broker bars can be timestamped ahead of
+    # this machine's clock; a negative age means skew, not freshness)
     mt = c.execute("SELECT MAX(t) FROM bars").fetchone()[0] or 0
-    age_h = (time.time() - mt) / 3600.0
+    age_h = max(0.0, (time.time() - mt) / 3600.0)
     info["newest_bar_age_h"] = round(age_h, 1)
     if age_h > FRESH_HRS:
         warns.append("newest bar is %.1fh old (>%dh) — feed may be stale" % (age_h, FRESH_HRS))
+    # crypto trades 24/7 — a gap there is a dead feed, not a weekend
+    like = " OR ".join("symbol LIKE '%s%%'" % p for p in CRYPTO_PREFIXES)
+    mt_c = c.execute("SELECT MAX(t) FROM bars WHERE %s" % like).fetchone()[0]
+    if mt_c:
+        age_c = max(0.0, (time.time() - mt_c) / 3600.0)
+        info["newest_crypto_bar_age_h"] = round(age_c, 1)
+        if age_c > CRYPTO_FRESH_HRS:
+            warns.append("newest CRYPTO bar is %.1fh old (>%dh) — 24/7 feed gap"
+                         % (age_c, CRYPTO_FRESH_HRS))
 
     # settings snapshot
     st = {r["key"]: r["value"] for r in c.execute("SELECT key,value FROM settings")}
@@ -98,6 +123,33 @@ def main():
             if vals and not (RR_BOUNDS[0] <= vals[-1] <= RR_BOUNDS[1]):
                 fails.append("min_rr change out of bounds: %s" % vals[-1])
 
+    # 3b. structured param_changes audit (Phase 2+): every accepted automated
+    # change must be whitelisted for its origin and inside bounds — this reads
+    # exact old/new values instead of regex-parsing prose, and also verifies
+    # refused writes were indeed not applied.
+    have_pc = c.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name='param_changes'").fetchone()
+    if have_pc and _ps is not None:
+        pcs = list(c.execute("SELECT * FROM param_changes ORDER BY t"))
+        info["param_changes"] = len(pcs)
+        for pc in pcs:
+            origin, key = pc["origin"], pc["key"]
+            wl = _ps.WHITELISTS.get(origin)
+            if pc["accepted"] and wl is not None and key not in wl:
+                fails.append("param_changes: origin %r changed non-whitelisted "
+                             "key '%s'" % (origin, key))
+            b = _ps.BOUNDS.get(key)
+            if pc["accepted"] and b is not None:
+                try:
+                    v = float(json.loads(pc["new"]))
+                    if not (b[0] <= v <= b[1]):
+                        fails.append("param_changes: %s=%s outside bounds %s "
+                                     "(origin %s)" % (key, v, list(b), origin))
+                except (ValueError, TypeError):
+                    pass
+        n_refused = sum(1 for pc in pcs if not pc["accepted"])
+        if n_refused:
+            info["param_changes_refused"] = n_refused
     # current tuned params within bounds
     try:
         buf = float(st.get("atr_buffer", 0.35))
@@ -160,7 +212,9 @@ def main():
     print("\nVERDICT:", verdict,
           "— agent decisions are grounded in healthy data" if verdict == "GROUNDED"
           else ("— review warnings" if verdict == "WARN" else "— ungrounded/at-risk, investigate"))
-    sys.exit(2 if verdict == "FAIL" else 0)
+    # distinct exit codes so automation can tell the three states apart:
+    # 0 = GROUNDED, 1 = WARN, 2 = FAIL
+    sys.exit(2 if verdict == "FAIL" else (1 if verdict == "WARN" else 0))
 
 
 if __name__ == "__main__":

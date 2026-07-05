@@ -8,9 +8,12 @@ parameters come from storage.settings (dashboard- and agent-tunable).
 import json
 import threading
 import time
-from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
+import decisions
+import exposure
+import instruments
+import sessions
 import storage
 import strategy
 import strategies
@@ -20,6 +23,11 @@ try:
     _TV_AVAILABLE = True
 except ImportError:
     _TV_AVAILABLE = False
+try:
+    import news_calendar as _news_cal          # Phase 3 blackout gate
+    _NEWS_CAL_AVAILABLE = True
+except ImportError:
+    _NEWS_CAL_AVAILABLE = False
 
 TF_SECONDS = {"15m": 900, "30m": 1800, "1h": 3600,
               "2h": 7200, "4h": 14400, "1d": 86400}
@@ -141,7 +149,10 @@ def params() -> Dict[str, Any]:
         "atr_buffer": float(s.get("atr_buffer", 0.35)),
         "vol_mult": float(s.get("vol_mult", 0.0)),
         "max_concurrent": int(s.get("max_concurrent", 2)),
+        "max_concurrent_per_class": int(s.get("max_concurrent_per_class", 2)),
         "max_correlated": int(s.get("max_correlated", 3)),
+        "max_bucket_exposure": float(s.get("max_bucket_exposure", 2.0)),
+        "halt_new_entries": bool(s.get("halt_new_entries", False)),
         "daily_stop_pct": float(s.get("daily_stop_pct", 2.0)),
         "weekly_stop_pct": float(s.get("weekly_stop_pct", 5.0)),
         "min_grade": s.get("min_grade", "B"),
@@ -223,18 +234,52 @@ def _pnl_since(mode: str, since_ts: int) -> float:
     return row["s"] if row else 0.0
 
 
+def _open_pnl(mode: str) -> float:
+    return round(sum(trade_upnl(t) or 0 for t in storage.open_trades(mode)), 2)
+
+
+def _broker_offset() -> float:
+    term = feed_state.get("terminal", {})
+    return (term.get("time_local") or 0) - (term.get("time_utc") or 0)
+
+
 def loss_limits_hit(mode: str, balance: float, p: Dict) -> Optional[str]:
-    now = datetime.now(timezone.utc)
-    day0 = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    week0 = int((now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0).timestamp())
+    """Daily/weekly kill switches. The loss 'day' follows the broker clock
+    (statements cut there, not at UTC midnight), and OPEN drawdown counts
+    against the stop — being -2% underwater on open positions halts new
+    entries just as surely as -2% realized. Open profit never offsets
+    realized losses (conservative by construction)."""
     if balance <= 0:
         return None
-    if _pnl_since(mode, day0) <= -balance * p["daily_stop_pct"] / 100:
+    day0, week0 = sessions.day_week_start("broker", broker_offset_s=_broker_offset())
+    open_dd = min(0.0, _open_pnl(mode))
+    if _pnl_since(mode, day0) + open_dd <= -balance * p["daily_stop_pct"] / 100:
         return "daily stop (-%.1f%%) hit" % p["daily_stop_pct"]
-    if _pnl_since(mode, week0) <= -balance * p["weekly_stop_pct"] / 100:
+    if _pnl_since(mode, week0) + open_dd <= -balance * p["weekly_stop_pct"] / 100:
         return "weekly stop (-%.1f%%) hit" % p["weekly_stop_pct"]
     return None
+
+
+def loss_governor(mode: str) -> float:
+    """Playbook §10.3: after 3 consecutive losses, halve risk until 2
+    consecutive wins. Derived from the trades table (restart-safe — no
+    counters to lose)."""
+    rows = storage.query(
+        "SELECT pnl FROM trades WHERE mode=? AND status='closed' "
+        "ORDER BY exit_time DESC LIMIT 50", (mode,))
+    halved, consec_loss, consec_win = False, 0, 0
+    for r in reversed(rows):                       # oldest -> newest
+        if (r["pnl"] or 0) < 0:
+            consec_loss += 1
+            consec_win = 0
+            if consec_loss >= 3:
+                halved = True
+        else:
+            consec_win += 1
+            consec_loss = 0
+            if halved and consec_win >= 2:
+                halved = False
+    return 0.5 if halved else 1.0
 
 
 def _balance(mode: str, p: Dict) -> float:
@@ -262,16 +307,19 @@ def _get_tv_ctx() -> Dict[str, Any]:
 
 def _log_signal(sig: Dict, status: str, reason: str) -> int:
     return storage.execute(
-        "INSERT INTO signals(t,symbol,trade_mode,side,grade,entry,sl,tp,rr,status,reason,setup) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO signals(t,symbol,trade_mode,side,grade,entry,sl,tp,rr,status,reason,setup,strategy) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (int(time.time()), sig["symbol"], sig["trade_mode"], sig["side"], sig["grade"],
          sig["entry"], sig["sl"], sig["tp"], sig["rr"], status, reason,
-         json.dumps(sig["setup"], default=str)))
+         json.dumps(sig["setup"], default=str), sig.get("strategy", "slc")))
 
 
 def try_execute(sig: Dict, p: Dict) -> None:
     mode = p["trading_mode"]
     symbol = sig["symbol"]
+    strat = sig.get("strategy", "slc")
+    a_class = instruments.asset_class(symbol)
+    regime_ctx = {"atr_ratio": sig.get("regime")}
 
     # dedup: one shot per setup zone. Skipped signals only lock the zone
     # briefly (so e.g. "max concurrent" can retry once capacity frees);
@@ -283,12 +331,16 @@ def try_execute(sig: Dict, p: Dict) -> None:
     if sig["key"] in _recent_keys:
         return
 
-    def skip(reason: str, track: bool = False) -> None:
+    def skip(reason: str, track: bool = False, stage: str = "rails",
+             checks: Any = None) -> None:
         """track=True: the setup itself was valid but a risk/capacity filter
         blocked it -> also record it as a SHADOW trade so the outcome is
         studied (what did the filter cost or save us?)."""
         _recent_keys[sig["key"]] = time.time() + (12 * 3600 if track else 30 * 60)
-        _log_signal(sig, "skipped", reason)
+        sig_id = _log_signal(sig, "skipped", reason)
+        decisions.record(strat, symbol, sig["trade_mode"], stage, "skipped",
+                         reason=reason, grade=sig["grade"], checks=checks,
+                         regime=regime_ctx, signal_id=sig_id)
         if track and not any(t["symbol"] == symbol
                              for t in storage.open_trades("shadow")):
             storage.insert_trade({
@@ -300,30 +352,61 @@ def try_execute(sig: Dict, p: Dict) -> None:
                 "lots": 0.0, "risk_pct": 0.0, "risk_amount": 0.0,
                 "setup": json.dumps({"skip_reason": reason, **sig["setup"]},
                                     default=str), "signal_id": 0,
+                "strategy": strat, "asset_class": a_class,
             })
         if _notify and storage.get_setting("notify_signals", True):
             notify("⚠️ <b>Signal skipped</b> %s %s (%s)\n%s"
                    % (sig["side"].upper(), symbol, sig["trade_mode"], reason))
 
+    # ---- fail-safe gates first (constraint 4: uncertainty halts entries) ----
+    suspect = storage.integrity_suspect()
+    if suspect:
+        return skip("DB integrity suspect — failing safe: %s" % suspect,
+                    stage="fail_safe")
+    if p.get("halt_new_entries"):
+        return skip("manual halt active (halt_new_entries)", stage="fail_safe")
     if mode == "off":
-        return skip("trading mode is OFF")
+        return skip("trading mode is OFF", stage="mode")
+
+    # ---- session calendar (never blocks crypto; see sessions.py) -----------
+    open_ok, closed_reason = sessions.is_market_open(symbol)
+    if not open_ok:
+        return skip(closed_reason, stage="session")
+
+    # ---- scheduled-news blackout (Phase 3; logs the exact event) -----------
+    if _NEWS_CAL_AVAILABLE:
+        blk = _news_cal.is_blackout(symbol)
+        if blk:
+            decisions.record(strat, symbol, sig["trade_mode"], "news", "skipped",
+                             reason=blk["reason"], grade=sig["grade"],
+                             regime=regime_ctx, news_ctx=blk)
+            _recent_keys[sig["key"]] = time.time() + 30 * 60
+            _log_signal(sig, "skipped", blk["reason"])
+            return
+
     all_open = storage.open_trades(mode)
     open_same = [t for t in all_open if t["trade_mode"] == sig["trade_mode"]]
     if len(open_same) >= p["max_concurrent"]:
-        return skip("max concurrent (%d) reached" % p["max_concurrent"], track=True)
+        return skip("max concurrent (%d) reached" % p["max_concurrent"],
+                    track=True, stage="concurrency")
     if any(t["symbol"] == symbol for t in all_open):
-        return skip("already in a %s trade" % symbol, track=True)
+        return skip("already in a %s trade" % symbol, track=True, stage="concurrency")
+    by_class = exposure.class_concurrency(all_open)
+    if by_class.get(a_class, 0) >= p["max_concurrent_per_class"]:
+        return skip("max concurrent per asset class (%s: %d) reached"
+                    % (a_class, p["max_concurrent_per_class"]),
+                    track=True, stage="concurrency")
     same_dir = [t for t in all_open if t["side"] == sig["side"]]
     if len(same_dir) >= p["max_correlated"]:
         return skip("max correlated same-direction exposure (%d) reached"
-                    % p["max_correlated"], track=True)
+                    % p["max_correlated"], track=True, stage="exposure")
 
     balance = _balance(mode, p)
     if balance <= 0:
-        return skip("no balance data yet (is the EA pushing?)")
+        return skip("no balance data yet (is the EA pushing?)", stage="fail_safe")
     lim = loss_limits_hit(mode, balance, p)
     if lim:
-        return skip(lim, track=True)
+        return skip(lim, track=True, stage="loss_limit")
 
     price = feed_state["prices"].get(symbol)
     if not price:
@@ -346,13 +429,30 @@ def try_execute(sig: Dict, p: Dict) -> None:
         return skip("RR at fill %.2f < required %.2f" % (rr_actual, p["min_rr"] * 0.9))
 
     risk_pct = p["risk_pct"] * (p["b_setup_risk_factor"] if sig["grade"] == "B" else 1.0)
+    # consecutive-loss governor (playbook §10.3) and session risk factor
+    # (e.g. crypto weekends) only ever REDUCE risk, never raise it
+    gov = loss_governor(mode)
+    sess_factor, sess_why = sessions.entry_risk_factor(symbol)
+    if gov < 1.0:
+        risk_pct *= gov
+    if sess_factor < 1.0:
+        risk_pct *= sess_factor
+
+    # cross-asset factor-bucket exposure gate (lesson 1: EUR+DAX+Gold longs
+    # are one stacked bet) — snapshot recorded on the decision either way
+    exp_ok, exp_reason, exp_snapshot = exposure.check_candidate(
+        symbol, sig["side"], risk_pct, all_open,
+        p["max_bucket_exposure"], base_risk_pct=p["risk_pct"])
+    if not exp_ok:
+        return skip(exp_reason, track=True, stage="exposure", checks=exp_snapshot)
+
     risk_amount = balance * risk_pct / 100.0
     lots, actual_risk = calc_lots(symbol, entry, sig["sl"], risk_amount)
     if lots <= 0:
-        return skip("could not size position (tick data missing)")
+        return skip("could not size position (tick data missing)", stage="sizing")
     if actual_risk > risk_amount * 1.5:
         return skip("min lot would risk %.2f > 1.5x intended %.2f"
-                    % (actual_risk, risk_amount), track=True)
+                    % (actual_risk, risk_amount), track=True, stage="sizing")
     risk_amount = actual_risk                       # record the TRUE risk
     risk_pct = round(risk_amount / balance * 100.0, 3)
 
@@ -367,9 +467,16 @@ def try_execute(sig: Dict, p: Dict) -> None:
     tv_adx    = (tv_ctx.get(symbol) or {}).get("ADX")
 
     _recent_keys[sig["key"]] = time.time() + 12 * 3600
+    risk_notes = []
+    if gov < 1.0:
+        risk_notes.append("risk halved: 3+ consecutive losses (until 2 wins)")
+    if sess_factor < 1.0:
+        risk_notes.append(sess_why)
     enhanced_setup = dict(sig["setup"], tv_score=tv_score, tv_regime=tv_regime,
                           tv_align=tv_align, tv_rsi=round(tv_rsi, 1) if tv_rsi else None,
                           tv_adx=round(tv_adx, 1) if tv_adx else None)
+    if risk_notes:
+        enhanced_setup["risk_notes"] = risk_notes
     sig_id = _log_signal(sig, "executed", "")
     trade = {
         "mode": mode, "trade_mode": sig["trade_mode"], "symbol": symbol,
@@ -378,8 +485,14 @@ def try_execute(sig: Dict, p: Dict) -> None:
         "sl": sig["sl"], "initial_sl": sig["sl"], "tp1": sig["tp1"], "tp2": sig["tp"],
         "lots": lots, "risk_pct": risk_pct, "risk_amount": risk_amount,
         "setup": json.dumps(enhanced_setup, default=str), "signal_id": sig_id,
+        "strategy": strat, "asset_class": a_class,
     }
     trade_id = storage.insert_trade(trade)
+    decisions.record(strat, symbol, sig["trade_mode"], "execution", "executed",
+                     reason="; ".join(risk_notes), grade=sig["grade"],
+                     checks=exp_snapshot, features={"rr": sig["rr"], "lots": lots,
+                                                    "risk_pct": risk_pct},
+                     regime=regime_ctx, signal_id=sig_id, trade_id=trade_id)
 
     if mode == "live":
         storage.enqueue_command("open_trade", {
@@ -472,6 +585,7 @@ def ingest_external_signal(symbol: str, fields: Dict[str, Any],
     src = str(fields.get("strategy") or "tradingview")
     sig = {
         "symbol": symbol, "trade_mode": trade_mode, "side": side,
+        "strategy": "ext:%s" % src,
         # external alerts size as a B setup (b_setup_risk_factor, conservative);
         # they are vetted by the provider plus the bot's hard rails, not the SLC
         # quality checklist.
@@ -511,14 +625,20 @@ def try_execute_shadow(sig: Dict, p: Dict) -> None:
         return
     _recent_keys[sig["key"]] = now + 12 * 3600
     sig_id = _log_signal(sig, "shadow", "watch-pair sample")
-    storage.insert_trade({
+    trade_id = storage.insert_trade({
         "mode": "shadow", "trade_mode": sig["trade_mode"], "symbol": symbol,
         "side": sig["side"], "status": "open", "grade": sig["grade"],
         "entry_time": int(time.time()), "entry": entry,
         "sl": sig["sl"], "initial_sl": sig["sl"], "tp1": sig["tp1"], "tp2": sig["tp"],
         "lots": 0.0, "risk_pct": 0.0, "risk_amount": 0.0,
         "setup": json.dumps(sig["setup"], default=str), "signal_id": sig_id,
+        "strategy": sig.get("strategy", "slc"),
+        "asset_class": instruments.asset_class(symbol),
     })
+    decisions.record(sig.get("strategy", "slc"), symbol, sig["trade_mode"],
+                     "execution", "shadow", reason="watch-pair sample",
+                     grade=sig["grade"], regime={"atr_ratio": sig.get("regime")},
+                     signal_id=sig_id, trade_id=trade_id)
 
 
 # --------------------------------------------------- open trade mgmt
@@ -772,15 +892,19 @@ def engine_loop(poll_seconds: int = 20) -> None:
                 live_mid = ((price_info["ask"] + price_info["bid"]) / 2) if price_info else None
                 for m in modes:
                     # don't analyze stale data: the newest setup-TF bar must
-                    # have closed within the last 2 bar-periods (broker clock)
+                    # have closed within the staleness limit for the symbol's
+                    # asset class (broker clock; crypto is stricter — a gap in
+                    # a 24/7 market means the feed died, not a weekend)
                     mtf_tf = MODE_TFS[m]["mtf"]
                     tf_sec = TF_SECONDS[mtf_tf]
                     mtf_bars = bars_by_tf.get(mtf_tf, [])
-                    if mtf_bars and broker_now - (mtf_bars[-1]["t"] + tf_sec) > 2 * tf_sec:
+                    stale_lim = sessions.staleness_limit_s(symbol, tf_sec)
+                    if mtf_bars and broker_now - (mtf_bars[-1]["t"] + tf_sec) > stale_lim:
+                        note = ("bar data stale (last %s bar %dm old) — standing aside"
+                                % (mtf_tf, (broker_now - mtf_bars[-1]["t"]) // 60))
                         _last_info["%s|%s" % (symbol, m)] = {
-                            "symbol": symbol, "trade_mode": m,
-                            "note": "bar data stale (last %s bar %dm old) — standing aside"
-                                    % (mtf_tf, (broker_now - mtf_bars[-1]["t"]) // 60)}
+                            "symbol": symbol, "trade_mode": m, "note": note}
+                        decisions.record_state(None, symbol, m, "fail_safe", note)
                         continue
                     for sname, res in strategies.generate_all(
                             symbol, m, bars_by_tf, p,
@@ -789,7 +913,15 @@ def engine_loop(poll_seconds: int = 20) -> None:
                         # one info row per symbol|mode|strategy (SLC-only keeps a
                         # single row per symbol|mode, now tagged with strategy)
                         _last_info["%s|%s|%s" % (symbol, m, sname)] = res["info"]
+                        if not res["signal"]:
+                            # audit the decision NOT to trade (deduped: only
+                            # writes when the reason changes for this cell)
+                            decisions.record_state(
+                                sname, symbol, m, "analysis",
+                                str(res["info"].get("note", "no setup")),
+                                action="no_setup")
                         if res["signal"]:
+                            res["signal"]["strategy"] = sname
                             if symbol in shadow_only:
                                 # shadow trades that mirror an already-open shadow
                                 # position on the same symbol are skipped
