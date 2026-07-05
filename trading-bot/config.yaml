@@ -9,6 +9,10 @@ server:
   host: 0.0.0.0          # listen on all interfaces so MT5 (other machine) can reach it
   port: 8766
 
+dashboard:               # multi-asset control dashboard (python3 dashboard_api.py)
+  host: 127.0.0.1        # localhost ONLY — it can control live trading. If you
+  port: 8767             # must expose it, put real auth in front; never bare LAN.
+
 engine:
   poll_seconds: 20        # how often the engine evaluates fresh data
   trading_mode: paper     # paper | live | off   (switchable from dashboard)

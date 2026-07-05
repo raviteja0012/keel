@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SLC — multi-asset control</title>
+<style>
+/* Dark-committed (matches the bot's existing pages). Palette: validated
+   dark-surface steps — series blue #3987e5, diverging blue↔red with neutral
+   #383835, status good/warn/serious/critical, ink/grid per reference. */
+:root{
+  --page:#0d0d0d; --surface:#1a1a19; --surface2:#222220;
+  --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+  --s1:#3987e5; --s2:#199e70; --neg:#e66767;
+  --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --crit:#d03b3b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);
+     font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:14px 22px;
+       border-bottom:1px solid var(--border);flex-wrap:wrap}
+header h1{font-size:16px;font-weight:650;margin:0}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{background:none;border:1px solid transparent;color:var(--ink2);
+  padding:6px 12px;border-radius:8px;font-size:13px;cursor:pointer}
+nav button.on{background:var(--surface);border-color:var(--border);color:var(--ink)}
+main{padding:18px 22px;max-width:1180px;margin:0 auto}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+      padding:12px 16px;min-width:140px}
+.card .label{font-size:12px;color:var(--muted)}
+.card .val{font-size:22px;font-weight:650;margin-top:2px}
+.card .sub{font-size:11px;color:var(--ink2);margin-top:2px}
+.status{display:inline-flex;align-items:center;gap:6px;font-weight:600}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+h2{font-size:14px;font-weight:650;margin:22px 0 10px;color:var(--ink)}
+table{width:100%;border-collapse:collapse;font-size:13px;background:var(--surface);
+      border:1px solid var(--border);border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--grid)}
+th{color:var(--muted);font-weight:500;font-size:12px}
+tr:last-child td{border-bottom:none}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.pos{color:var(--good)} .negt{color:var(--neg)}
+.pill{display:inline-block;padding:1px 8px;border-radius:6px;background:var(--surface2);
+      font-size:12px;color:var(--ink2)}
+.barrow{display:flex;align-items:center;gap:10px;margin:3px 0}
+.barrow .lbl{width:110px;color:var(--ink2);font-size:12px;text-align:right}
+.bartrack{flex:1;height:14px;position:relative;background:none}
+.bartrack .mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--axis)}
+.bar{position:absolute;top:1px;height:12px;border-radius:0 4px 4px 0}
+.bar.neg{border-radius:4px 0 0 4px}
+.bar.plain{border-radius:0 4px 4px 0;background:var(--s1)}
+.barrow .v{width:64px;font-variant-numeric:tabular-nums;font-size:12px;color:var(--ink)}
+.capline{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--warn)}
+.chartbox{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+          padding:14px;position:relative}
+#eqtip{position:absolute;pointer-events:none;background:var(--surface2);
+  border:1px solid var(--border);border-radius:8px;padding:6px 9px;font-size:12px;
+  display:none;white-space:nowrap;z-index:5}
+.check{display:inline-flex;align-items:center;gap:5px}
+.controls .row{display:flex;gap:10px;align-items:center;margin:8px 0;flex-wrap:wrap}
+input[type=number],input[type=text],select{background:var(--surface2);color:var(--ink);
+  border:1px solid var(--border);border-radius:8px;padding:6px 9px;font-size:13px;width:130px}
+button.act{background:var(--s1);border:none;color:#fff;border-radius:8px;
+  padding:7px 14px;font-size:13px;cursor:pointer}
+button.act.danger{background:var(--crit)} button.act.ghost{background:var(--surface2);color:var(--ink2)}
+button.act:disabled{opacity:.45;cursor:default}
+.note{font-size:12px;color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.filters{display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap;align-items:center}
+.view{display:none}.view.on{display:block}
+.badge{background:var(--crit);color:#fff;border-radius:9px;font-size:11px;
+       padding:0 6px;margin-left:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1>SLC · multi-asset</h1>
+  <nav id="nav">
+    <button data-v="health" class="on">Health</button>
+    <button data-v="perf">Performance</button>
+    <button data-v="exposure">Exposure</button>
+    <button data-v="regime">Regime &amp; session</button>
+    <button data-v="drawdown">Drawdown</button>
+    <button data-v="promotion">Promotion gate</button>
+    <button data-v="decisions">Decisions</button>
+    <button data-v="controls">Controls<span id="unackBadge" class="badge" style="display:none"></span></button>
+  </nav>
+  <span class="note" id="clock"></span>
+</header>
+<main>
+
+<section class="view on" id="v-health">
+  <div class="cards" id="healthCards"></div>
+  <h2>Data freshness by asset class</h2>
+  <table id="freshTable"><thead><tr><th>Asset class</th><th class="num">Newest bar age</th><th>State</th></tr></thead><tbody></tbody></table>
+  <h2>News calendar</h2>
+  <div id="calBox" class="note"></div>
+  <table id="calTable"><thead><tr><th>When (UTC)</th><th>Impact</th><th>Entities</th><th>Event</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view" id="v-perf">
+  <div class="filters">
+    <select id="perfMode"><option value="paper">paper</option><option value="live">live</option></select>
+    <select id="perfDays"><option value="">all time</option><option>7</option><option>30</option><option selected>90</option></select>
+    <span class="note">closed trades only; shadow excluded</span>
+  </div>
+  <div class="cards" id="perfCards"></div>
+  <h2>By strategy × asset class</h2>
+  <table id="perfCells"><thead><tr><th>Strategy</th><th>Class</th>
+    <th class="num">n</th><th class="num">Win %</th><th class="num">Expectancy (R)</th><th class="num">P&amp;L</th></tr></thead><tbody></tbody></table>
+  <h2>Open positions</h2>
+  <table id="openTable"><thead><tr><th>#</th><th>Symbol</th><th>Side</th><th>Class</th>
+    <th>Grade</th><th class="num">Risk %</th><th>Factors</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view" id="v-exposure">
+  <h2>Net factor-bucket exposure <span class="note">(risk-weighted units · amber line = cap)</span></h2>
+  <div class="chartbox" id="bucketBars"></div>
+  <h2>Open positions per asset class</h2>
+  <div class="chartbox" id="classBars"></div>
+  <p class="note">Long EURUSD + long GER40 + long XAUUSD stack in the USD and RISK
+  buckets — this view is the rail that blocks the 30-of-47 correlated-loser pattern.</p>
+</section>
+
+<section class="view" id="v-regime">
+  <div class="filters">
+    <select id="rsMode"><option value="paper">paper</option><option value="live">live</option></select>
+    <select id="rsDays"><option value="">all time</option><option>30</option><option selected>90</option></select>
+  </div>
+  <div class="grid2">
+    <div><h2>By session</h2><table id="sessTable"><thead><tr><th>Session</th>
+      <th class="num">n</th><th class="num">Win %</th><th class="num">Exp (R)</th></tr></thead><tbody></tbody></table></div>
+    <div><h2>By regime band (ATR14/ATR100)</h2><table id="regTable"><thead><tr><th>Band</th>
+      <th class="num">n</th><th class="num">Win %</th><th class="num">Exp (R)</th></tr></thead><tbody></tbody></table></div>
+  </div>
+  <h2>By asset class</h2>
+  <table id="clsTable"><thead><tr><th>Class</th><th class="num">n</th>
+    <th class="num">Win %</th><th class="num">Exp (R)</th><th class="num">Total R</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view" id="v-drawdown">
+  <div class="filters">
+    <select id="ddMode"><option value="paper">paper</option><option value="live">live</option></select>
+  </div>
+  <div class="cards" id="ddCards"></div>
+  <h2>Cumulative R (closed trades)</h2>
+  <div class="chartbox"><canvas id="eq" height="220" style="width:100%"></canvas><div id="eqtip"></div></div>
+  <h2>Loss concentration</h2>
+  <div class="grid2">
+    <div><table id="lossSym"><thead><tr><th>Symbol</th><th class="num">Losses</th><th class="num">Lost R</th></tr></thead><tbody></tbody></table></div>
+    <div><table id="lossCls"><thead><tr><th>Class / grade</th><th class="num">Losses</th><th class="num">Lost R</th></tr></thead><tbody></tbody></table></div>
+  </div>
+</section>
+
+<section class="view" id="v-promotion">
+  <p class="note">A green gate only permits <b>requesting</b> live through the
+  two-step switch — nothing flips automatically, ever.</p>
+  <div id="promoCells"></div>
+</section>
+
+<section class="view" id="v-decisions">
+  <div class="filters">
+    <select id="decStage"><option value="">all stages</option><option>fail_safe</option><option>session</option>
+      <option>news</option><option>concurrency</option><option>exposure</option><option>loss_limit</option>
+      <option>sizing</option><option>rails</option><option>analysis</option><option>execution</option></select>
+    <select id="decAction"><option value="">all actions</option><option>executed</option><option>skipped</option>
+      <option>shadow</option><option>stand_aside</option><option>no_setup</option></select>
+    <input type="text" id="decSymbol" placeholder="symbol">
+    <select id="decHours"><option>24</option><option selected>72</option><option>168</option></select>
+    <button class="act ghost" onclick="loadDecisions()">Apply</button>
+  </div>
+  <h2>Rejections by stage <span class="note" id="funnelTotal"></span></h2>
+  <div class="chartbox" id="funnelBars"></div>
+  <h2>Recent decisions</h2>
+  <table id="decTable"><thead><tr><th>Time</th><th>Strat</th><th>Symbol</th><th>Stage</th>
+    <th>Action</th><th>Session</th><th>Reason</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view controls" id="v-controls">
+  <h2>Control token</h2>
+  <div class="row"><input type="text" id="token" placeholder="X-Dashboard-Token">
+    <span class="note">from <code>state/dashboard_token</code> (or DASHBOARD_TOKEN env) — controls only, kept in this browser</span></div>
+
+  <h2>Risk parameters <span class="note">(server enforces bounds + code ceilings)</span></h2>
+  <div id="paramRows"></div>
+
+  <h2>Kill switch</h2>
+  <div class="row">
+    <button class="act danger" onclick="halt(true)">HALT new entries</button>
+    <button class="act ghost" onclick="halt(false)">Resume</button>
+    <span class="note" id="haltState"></span>
+  </div>
+
+  <h2>Parameter changes <span class="note">(agent/sanity changes need your ack)</span></h2>
+  <table id="pcTable"><thead><tr><th>Time</th><th>Origin</th><th>Key</th>
+    <th>Old → New</th><th>Why / data</th><th></th></tr></thead><tbody></tbody></table>
+
+  <h2>Live trading</h2>
+  <div id="liveBox"><span class="note">loading…</span></div>
+</section>
+
+</main>
+<script>
+const $=q=>document.querySelector(q), fmt=(x,d=2)=>x==null?'—':Number(x).toFixed(d);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago=t=>{if(!t)return '—';const s=Math.max(0,Date.now()/1000-t);
+  return s<90?`${s|0}s`:s<5400?`${s/60|0}m`:s<172800?`${(s/3600).toFixed(1)}h`:`${(s/86400).toFixed(1)}d`;};
+const tok=()=>$('#token').value.trim();
+$('#token').value=localStorage.getItem('dashTok')||'';
+$('#token').addEventListener('change',()=>localStorage.setItem('dashTok',tok()));
+async function GET(u){const r=await fetch(u);if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
+async function POST(u,body){const r=await fetch(u,{method:'POST',
+  headers:{'Content-Type':'application/json','X-Dashboard-Token':tok()},
+  body:body?JSON.stringify(body):null});
+  const j=await r.json().catch(()=>({}));
+  if(r.status===401){alert('Control token missing/invalid — set it in Controls.');throw new Error('401');}
+  return j;}
+
+/* ---------- nav ---------- */
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
+  $('#v-'+b.dataset.v).classList.add('on');
+  ({health:loadHealth,perf:loadPerf,exposure:loadExposure,regime:loadRegime,
+    drawdown:loadDrawdown,promotion:loadPromotion,decisions:loadDecisions,
+    controls:loadControls})[b.dataset.v]();
+});
+
+/* ---------- shared renderers ---------- */
+function statCard(label,val,sub,color){return `<div class="card"><div class="label">${esc(label)}</div>
+  <div class="val" ${color?`style="color:${color}"`:''}>${val}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;}
+function statsRow(name,st){const e=st.expectancy_r;return `<tr><td>${esc(name)}</td>
+  <td class="num">${st.n}</td><td class="num">${fmt(st.win_rate,1)}</td>
+  <td class="num ${e>0?'pos':e<0?'negt':''}">${fmt(e,3)}</td></tr>`;}
+/* diverging horizontal bars around a zero midline (blue=+ / red=−), with an
+   optional cap marker. One measure -> one hue per sign; labels wear ink. */
+function divergingBars(el,entries,cap){
+  const max=Math.max(cap||0,...entries.map(e=>Math.abs(e.v)),0.1)*1.15;
+  el.innerHTML=entries.map(e=>{const pct=Math.abs(e.v)/max*50;
+    const side=e.v>=0?`left:50%;width:${pct}%`:`right:50%;width:${pct}%`;
+    const capHtml=cap?`<span class="capline" style="left:${50+cap/max*50}%"></span>
+                       <span class="capline" style="left:${50-cap/max*50}%"></span>`:'';
+    return `<div class="barrow"><span class="lbl">${esc(e.k)}</span>
+      <span class="bartrack"><span class="mid"></span>${capHtml}
+      <span class="bar ${e.v<0?'neg':''}" style="${side};background:${e.v>=0?'var(--s1)':'var(--neg)'}"></span></span>
+      <span class="v">${fmt(e.v,2)}</span></div>`;}).join('')||'<span class="note">nothing open</span>';}
+function plainBars(el,entries){const max=Math.max(...entries.map(e=>e.v),1);
+  el.innerHTML=entries.map(e=>`<div class="barrow"><span class="lbl">${esc(e.k)}</span>
+    <span class="bartrack"><span class="bar plain" style="left:0;width:${e.v/max*100}%"></span></span>
+    <span class="v">${e.v}</span></div>`).join('')||'<span class="note">no data</span>';}
+
+/* ---------- health ---------- */
+async function loadHealth(){
+  const h=await GET('/api/health');
+  const okc=(b,inv)=>b?(inv?'var(--crit)':'var(--good)'):(inv?'var(--good)':'var(--crit)');
+  $('#healthCards').innerHTML=
+    statCard('Engine',h.engine_alive?'RUNNING':'DOWN',h.engine_last_seen_s!=null?`last cycle ${h.engine_last_seen_s}s ago`:'no equity rows yet',okc(h.engine_alive))+
+    statCard('Mode',esc(String(h.trading_mode).toUpperCase()),'',h.trading_mode==='live'?'var(--warn)':'var(--s2)')+
+    statCard('New entries',h.halt_new_entries?'HALTED':'allowed','',okc(!h.halt_new_entries))+
+    statCard('DB integrity',h.db_integrity_suspect?'SUSPECT':'ok',esc(h.db_integrity_suspect||''),okc(!h.db_integrity_suspect))+
+    statCard('Open trades',h.open_trades,`${h.open_shadow} shadow`)+
+    statCard('Unacked changes',h.unacked_param_changes,'agent/sanity tuning',h.unacked_param_changes?'var(--warn)':undefined);
+  $('#unackBadge').style.display=h.unacked_param_changes?'':'none';
+  $('#unackBadge').textContent=h.unacked_param_changes;
+  const ft=$('#freshTable tbody');ft.innerHTML='';
+  const lim={crypto:2*3600,forex:2*3600,metals:2*3600,indices:2*3600,energies:2*3600};
+  Object.entries(h.newest_bar_age_s_by_class||{}).forEach(([c,a])=>{
+    const bad=a>(lim[c]||7200)*2;
+    ft.insertAdjacentHTML('beforeend',`<tr><td>${esc(c)}</td><td class="num">${ago(Date.now()/1000-a)}</td>
+      <td><span class="status"><span class="dot" style="background:${bad?'var(--crit)':'var(--good)'}"></span>${bad?'stale':'fresh'}</span></td></tr>`);});
+  const cal=h.news_calendar||{};
+  $('#calBox').innerHTML=`blackout policy on stale: <b>${esc(cal.on_stale||'?')}</b> ·
+    calendar ${cal.calendar_stale?'<span class="negt">STALE</span>':'fresh'} ·
+    last fetch ${cal.last_fetch_ok?'ok':('failed: '+esc(cal.last_fetch_error||'never'))} ·
+    ${cal.upcoming_48h??'?'} events next 48h`;
+  try{const c=await GET('/api/news_calendar?hours=48');const tb=$('#calTable tbody');tb.innerHTML='';
+    (c.upcoming||[]).slice(0,25).forEach(ev=>tb.insertAdjacentHTML('beforeend',
+      `<tr><td>${new Date(ev.t*1000).toISOString().slice(5,16).replace('T',' ')}</td>
+       <td><span class="pill">${esc(ev.impact)}</span></td><td>${esc((ev.entities||[]).join(', '))}</td>
+       <td>${esc(ev.title)}</td></tr>`));}catch(e){}
+}
+
+/* ---------- performance ---------- */
+async function loadPerf(){
+  const m=$('#perfMode').value,d=$('#perfDays').value;
+  const p=await GET(`/api/performance?mode=${m}${d?`&days=${d}`:''}`);
+  const t=p.total||{n:0};
+  $('#perfCards').innerHTML=statCard('Closed trades',t.n||0)+
+    statCard('Win rate',t.n?fmt(t.win_rate,1)+'%':'—')+
+    statCard('Expectancy',t.n?fmt(t.expectancy_r,3)+' R':'—','per trade',t.expectancy_r>0?'var(--good)':t.expectancy_r<0?'var(--crit)':undefined)+
+    statCard('Total',t.n?fmt(t.total_r,1)+' R':'—',fmt(t.pnl,2)+' P&L')+
+    statCard('Profit factor',t.profit_factor??'—');
+  const tb=$('#perfCells tbody');tb.innerHTML='';
+  (p.by_strategy_class||[]).forEach(r=>tb.insertAdjacentHTML('beforeend',
+    `<tr><td>${esc(r.strategy)}</td><td>${esc(r.asset_class||'?')}</td><td class="num">${r.n}</td>
+     <td class="num">${fmt(r.win_rate,1)}</td>
+     <td class="num ${r.expectancy_r>0?'pos':r.expectancy_r<0?'negt':''}">${fmt(r.expectancy_r,3)}</td>
+     <td class="num">${fmt(r.pnl,2)}</td></tr>`));
+  const ex=await GET('/api/studies/exposure?mode='+m);const ot=$('#openTable tbody');ot.innerHTML='';
+  (ex.positions||[]).forEach(x=>ot.insertAdjacentHTML('beforeend',
+    `<tr><td>${x.id}</td><td>${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${esc(x.asset_class)}</td>
+     <td>${esc(x.grade??'')}</td><td class="num">${fmt(x.risk_pct,2)}</td>
+     <td class="note">${esc(Object.entries(x.factors).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' '))}</td></tr>`));
+  if(!(ex.positions||[]).length)ot.innerHTML='<tr><td colspan="7" class="note">no open positions</td></tr>';
+}
+
+/* ---------- exposure ---------- */
+async function loadExposure(){
+  const ex=await GET('/api/studies/exposure?mode=paper');
+  divergingBars($('#bucketBars'),Object.entries(ex.buckets||{}).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
+    .map(([k,v])=>({k,v})),ex.cap);
+  plainBars($('#classBars'),Object.entries(ex.by_class||{}).map(([k,v])=>({k,v})));
+}
+
+/* ---------- regime & session ---------- */
+async function loadRegime(){
+  const m=$('#rsMode').value,d=$('#rsDays').value;
+  const r=await GET(`/api/studies/regime_session?mode=${m}${d?`&days=${d}`:''}`);
+  $('#sessTable tbody').innerHTML=Object.entries(r.by_session||{}).map(([k,v])=>statsRow(k,v)).join('')
+    ||'<tr><td colspan="4" class="note">no closed trades yet</td></tr>';
+  $('#regTable tbody').innerHTML=Object.entries(r.by_regime||{}).map(([k,v])=>statsRow(k,v)).join('')
+    ||'<tr><td colspan="4" class="note">no closed trades yet</td></tr>';
+  $('#clsTable tbody').innerHTML=Object.entries(r.by_asset_class||{}).map(([k,v])=>
+    `<tr><td>${esc(k)}</td><td class="num">${v.n}</td><td class="num">${fmt(v.win_rate,1)}</td>
+     <td class="num ${v.expectancy_r>0?'pos':v.expectancy_r<0?'negt':''}">${fmt(v.expectancy_r,3)}</td>
+     <td class="num">${fmt(v.total_r,1)}</td></tr>`).join('')
+    ||'<tr><td colspan="5" class="note">no closed trades yet</td></tr>';
+}
+
+/* ---------- drawdown ---------- */
+let eqData=[];
+async function loadDrawdown(){
+  const d=await GET('/api/studies/drawdown?mode='+$('#ddMode').value);
+  if(!d.n){$('#ddCards').innerHTML='<span class="note">no closed trades yet</span>';
+    eqData=[];drawEq();['#lossSym','#lossCls'].forEach(s=>$(s+' tbody').innerHTML='');return;}
+  $('#ddCards').innerHTML=statCard('Max drawdown',fmt(d.max_drawdown_r,2)+' R','peak→trough','var(--serious)')+
+    statCard('Worst losing streak',d.worst_losing_streak,'consecutive')+
+    statCard('Wick-out losers',`${d.wickout_losers.n}/${d.wickout_losers.of_losers}`,'reached +0.5R first — stop tightness')+
+    statCard('Spread-induced stops',d.spread_induced_stops);
+  eqData=d.equity_curve_r||[];drawEq();
+  $('#lossSym tbody').innerHTML=Object.entries(d.loss_concentration.by_symbol).map(([k,v])=>
+    `<tr><td>${esc(k)}</td><td class="num">${v.losses}</td><td class="num negt">${fmt(v.lost_r,2)}</td></tr>`).join('');
+  $('#lossCls tbody').innerHTML=
+    Object.entries(d.loss_concentration.by_class).map(([k,v])=>
+      `<tr><td>${esc(k)}</td><td class="num">${v.losses}</td><td class="num negt">${fmt(v.lost_r,2)}</td></tr>`).join('')+
+    Object.entries(d.loss_concentration.by_grade).map(([k,v])=>
+      `<tr><td>grade ${esc(k)}</td><td class="num">${v.losses}</td><td class="num negt">${fmt(v.lost_r,2)}</td></tr>`).join('');
+}
+function drawEq(){
+  const cv=$('#eq'),dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=220;
+  cv.width=W*dpr;cv.height=H*dpr;const g=cv.getContext('2d');g.scale(dpr,dpr);
+  g.clearRect(0,0,W,H);
+  if(eqData.length<2){g.fillStyle='#898781';g.font='12px system-ui';g.fillText('not enough closed trades',12,24);return;}
+  const xs=eqData.map(p=>p.t),ys=eqData.map(p=>p.cum_r);
+  const x0=Math.min(...xs),x1=Math.max(...xs),ylo=Math.min(0,...ys),yhi=Math.max(0,...ys);
+  const pad={l:44,r:10,t:10,b:22};
+  /* trades bunched into a tiny time window (fresh DB, backfills) would
+     collapse the x-axis — fall back to even index spacing there */
+  const byIndex=(x1-x0)<60;
+  const X=byIndex
+    ?(t,i)=>pad.l+i/((eqData.length-1)||1)*(W-pad.l-pad.r)
+    :t=>pad.l+(t-x0)/((x1-x0)||1)*(W-pad.l-pad.r);
+  const Y=v=>pad.t+(yhi-v)/((yhi-ylo)||1)*(H-pad.t-pad.b);
+  g.strokeStyle='#2c2c2a';g.lineWidth=1;g.font='11px system-ui';g.fillStyle='#898781';
+  const steps=4;for(let i=0;i<=steps;i++){const v=ylo+(yhi-ylo)*i/steps,y=Y(v);
+    g.beginPath();g.moveTo(pad.l,y);g.lineTo(W-pad.r,y);g.stroke();
+    g.fillText(v.toFixed(1),6,y+4);}
+  g.strokeStyle='#383835';g.beginPath();g.moveTo(pad.l,Y(0));g.lineTo(W-pad.r,Y(0));g.stroke();
+  g.strokeStyle='#3987e5';g.lineWidth=2;g.beginPath();
+  eqData.forEach((p,i)=>{const x=X(p.t,i),y=Y(p.cum_r);i?g.lineTo(x,y):g.moveTo(x,y);});g.stroke();
+  cv.onmousemove=e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left;
+    let best=0,bd=1e18;eqData.forEach((p,i)=>{const d=Math.abs(X(p.t,i)-mx);if(d<bd){bd=d;best=i;}});
+    const p=eqData[best],tip=$('#eqtip');
+    tip.style.display='block';tip.style.left=Math.min(X(p.t,best)+14,W-160)+'px';tip.style.top=(Y(p.cum_r)-8)+'px';
+    tip.innerHTML=`<b>${p.cum_r.toFixed(2)} R</b> · ${esc(p.symbol)} #${p.id}<br>
+      <span class="note">${new Date(p.t*1000).toISOString().slice(0,16).replace('T',' ')}</span>`;};
+  cv.onmouseleave=()=>$('#eqtip').style.display='none';
+}
+
+/* ---------- promotion ---------- */
+async function loadPromotion(){
+  const p=await GET('/api/studies/promotion');
+  const cells=Object.values(p.cells||{});
+  $('#promoCells').innerHTML=cells.length?cells.map(c=>{
+    const rows=Object.entries(c.checks).map(([k,ch])=>{
+      const col=ch.pass?'var(--good)':'var(--crit)';
+      return `<tr><td><span class="check"><span class="dot" style="background:${col}"></span>${esc(k.replaceAll('_',' '))}</span></td>
+        <td>${esc(String(ch.value??'—'))}${ch.required?` / ${ch.required}`:''}</td>
+        <td class="note">${esc(ch.note||'')}</td></tr>`;}).join('');
+    return `<h2>${esc(c.strategy)} × ${esc(c.asset_class)} —
+      <span style="color:${c.gate_open?'var(--good)':'var(--serious)'}">${c.gate_open?'GATE OPEN':'gate closed'}</span>
+      <span class="note">n=${c.stats.n}, exp ${fmt(c.stats.expectancy_r,3)}R</span></h2>
+      <table><thead><tr><th>Check</th><th>Value</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  }).join(''):'<p class="note">no closed paper trades attributed yet — cells appear as strategy×class samples accumulate</p>';
+}
+
+/* ---------- decisions ---------- */
+async function loadDecisions(){
+  const q=new URLSearchParams({hours:$('#decHours').value,limit:200});
+  if($('#decStage').value)q.set('stage',$('#decStage').value);
+  if($('#decAction').value)q.set('action',$('#decAction').value);
+  if($('#decSymbol').value)q.set('symbol',$('#decSymbol').value.toUpperCase());
+  const d=await GET('/api/decisions?'+q);
+  $('#funnelTotal').textContent=`(${d.funnel.total} decisions, last ${d.funnel.since_hours}h)`;
+  plainBars($('#funnelBars'),(d.funnel.by_stage||[]).map(r=>({k:`${r.stage}/${r.action}`,v:r.n})));
+  const tb=$('#decTable tbody');tb.innerHTML='';
+  (d.recent||[]).forEach(r=>tb.insertAdjacentHTML('beforeend',
+    `<tr><td>${new Date(r.t*1000).toISOString().slice(5,16).replace('T',' ')}</td>
+     <td>${esc(r.strategy||'—')}</td><td>${esc(r.symbol)}</td>
+     <td><span class="pill">${esc(r.stage)}</span></td><td>${esc(r.action)}</td>
+     <td class="note">${esc(r.session||'')}</td><td class="note">${esc(r.reason||'')}</td></tr>`));
+  if(!(d.recent||[]).length)tb.innerHTML='<tr><td colspan="7" class="note">no decisions recorded for this filter</td></tr>';
+}
+
+/* ---------- controls ---------- */
+const PARAMS=['risk_pct','b_setup_risk_factor','min_rr','atr_buffer','max_concurrent',
+  'max_concurrent_per_class','max_correlated','max_bucket_exposure','daily_stop_pct',
+  'weekly_stop_pct','max_spread_frac','vol_mult'];
+async function loadControls(){
+  const s=await GET('/api/settings');
+  $('#paramRows').innerHTML=PARAMS.map(k=>{
+    const b=s.bounds[k]||[null,null];
+    return `<div class="row"><span style="width:200px;color:var(--ink2)">${k}</span>
+      <input type="number" step="0.05" id="p_${k}" value="${s.settings[k]??''}">
+      <span class="note">bounds [${b[0]}, ${b[1]}]</span></div>`;}).join('')+
+    `<div class="row"><button class="act" onclick="saveParams()">Apply (bounded)</button>
+     <span class="note" id="paramMsg"></span></div>`;
+  $('#haltState').textContent=s.settings.halt_new_entries?'currently HALTED':'currently allowing entries';
+  const pc=await GET('/api/param_changes?limit=40');
+  $('#pcTable tbody').innerHTML=(pc.changes||[]).map(c=>{
+    let trig='';try{trig=JSON.parse(c.trigger_data||'{}').reason||'';}catch(e){}
+    return `<tr ${c.accepted?'':'style="opacity:.55"'}><td>${new Date(c.t*1000).toISOString().slice(5,16).replace('T',' ')}</td>
+     <td><span class="pill">${esc(c.origin)}${c.accepted?'':' · REFUSED'}</span></td><td>${esc(c.key)}</td>
+     <td class="num">${esc(c.old)} → ${esc(c.new)}</td><td class="note">${esc(trig)}</td>
+     <td>${(!c.ack&&c.origin!=='human')?`<button class="act ghost" onclick="ack(${c.id})">ack</button>`:''}</td></tr>`;
+  }).join('')||'<tr><td colspan="6" class="note">no parameter changes recorded</td></tr>';
+  loadLive();
+}
+async function saveParams(){
+  const body={};PARAMS.forEach(k=>{const v=$('#p_'+k).value;if(v!=='')body[k]=parseFloat(v);});
+  const r=await POST('/api/params',body);
+  $('#paramMsg').textContent=Object.keys(r.rejected||{}).length
+    ?('rejected: '+Object.entries(r.rejected).map(([k,v])=>`${k}: ${v}`).join(' · '))
+    :('applied: '+Object.keys(r.changed||{}).join(', '));
+  $('#paramMsg').style.color=Object.keys(r.rejected||{}).length?'var(--serious)':'var(--good)';
+}
+async function halt(on){await POST(on?'/api/halt':'/api/resume');loadControls();}
+async function ack(id){await POST('/api/param_changes/ack/'+id);loadControls();}
+
+/* ---------- live switch (Phase 5 module; degrades if absent) ---------- */
+async function loadLive(){
+  const box=$('#liveBox');
+  try{
+    const s=await GET('/api/live/status');
+    const mode=esc(String(s.trading_mode).toUpperCase());
+    box.innerHTML=`<div class="row">Current mode: <b style="color:${s.trading_mode==='live'?'var(--warn)':'var(--s2)'}">${mode}</b></div>
+      ${s.trading_mode==='live'
+        ?`<div class="row"><button class="act ghost" onclick="liveOff()">Switch back to PAPER</button></div>`
+        :`<div class="row"><button class="act danger" onclick="liveReq()">Request LIVE…</button>
+           <span class="note">two-step: request → confirm within 60s; requires an open promotion gate
+           AND the EA's AllowTradeExecution switch</span></div>`}
+      <div class="note" id="liveMsg"></div>`;
+  }catch(e){box.innerHTML='<span class="note">live switch module not mounted</span>';}
+}
+async function liveReq(){
+  const r=await POST('/api/live/request',{});
+  if(!r.ok){$('#liveMsg').textContent='refused: '+esc(r.reason||'');$('#liveMsg').style.color='var(--serious)';return;}
+  const phrase=prompt(`Promotion gate: ${r.gate_cell}\n\nType exactly:  ${r.confirm_phrase}\n\nto confirm switching to LIVE (expires in ${r.expires_in_s}s)`);
+  if(phrase==null)return;
+  const c=await POST('/api/live/confirm',{token:r.confirm_token,phrase});
+  $('#liveMsg').textContent=c.ok?'LIVE enabled — EA AllowTradeExecution is the final gate':'refused: '+esc(c.reason||'');
+  $('#liveMsg').style.color=c.ok?'var(--warn)':'var(--serious)';
+  loadLive();
+}
+async function liveOff(){await POST('/api/live/paper',{});loadLive();}
+
+/* ---------- boot ---------- */
+setInterval(()=>{$('#clock').textContent=new Date().toISOString().slice(0,19).replace('T',' ')+' UTC';},1000);
+setInterval(()=>{if($('#v-health').classList.contains('on'))loadHealth();},15000);
+['perfMode','perfDays'].forEach(id=>$('#'+id).onchange=loadPerf);
+['rsMode','rsDays'].forEach(id=>$('#'+id).onchange=loadRegime);
+$('#ddMode').onchange=loadDrawdown;
+window.addEventListener('resize',()=>drawEq());
+loadHealth();
+</script>
+</body>
+</html>
