@@ -82,17 +82,21 @@ def main():
         fails.append("DB integrity NOT ok (%s…) — agent stats are unreliable" % integ[:40])
 
     # 2. freshness — clamp clock skew (broker bars can be timestamped ahead of
-    # this machine's clock; a negative age means skew, not freshness)
-    mt = c.execute("SELECT MAX(t) FROM bars").fetchone()[0] or 0
-    age_h = max(0.0, (time.time() - mt) / 3600.0)
+    # this machine's clock; a negative age means skew, not freshness). Only
+    # numeric rows count: real DBs have been seen with stray TEXT timestamps,
+    # and a single string row makes an unguarded MAX() return a string.
+    mt = c.execute("SELECT MAX(t) FROM bars "
+                   "WHERE typeof(t) IN ('integer','real')").fetchone()[0] or 0
+    age_h = max(0.0, (time.time() - float(mt)) / 3600.0)
     info["newest_bar_age_h"] = round(age_h, 1)
     if age_h > FRESH_HRS:
         warns.append("newest bar is %.1fh old (>%dh) — feed may be stale" % (age_h, FRESH_HRS))
     # crypto trades 24/7 — a gap there is a dead feed, not a weekend
     like = " OR ".join("symbol LIKE '%s%%'" % p for p in CRYPTO_PREFIXES)
-    mt_c = c.execute("SELECT MAX(t) FROM bars WHERE %s" % like).fetchone()[0]
+    mt_c = c.execute("SELECT MAX(t) FROM bars WHERE typeof(t) IN "
+                     "('integer','real') AND (%s)" % like).fetchone()[0]
     if mt_c:
-        age_c = max(0.0, (time.time() - mt_c) / 3600.0)
+        age_c = max(0.0, (time.time() - float(mt_c)) / 3600.0)
         info["newest_crypto_bar_age_h"] = round(age_c, 1)
         if age_c > CRYPTO_FRESH_HRS:
             warns.append("newest CRYPTO bar is %.1fh old (>%dh) — 24/7 feed gap"

@@ -148,6 +148,28 @@ def test_health_process_independent():
     assert "engine_alive" in h and "newest_bar_age_s_by_class" in h
 
 
+def test_health_survives_string_timestamps_in_real_dbs():
+    """Regression: a real user DB contained equity rows whose t column was
+    TEXT; strings sort above numbers so MAX(t) returned a string and
+    health() crashed with TypeError. Poison both tables and verify every
+    reader stays numeric."""
+    storage.execute("INSERT INTO equity(t,mode,balance,equity) "
+                    "VALUES('2026-06-01T10:00:00',?,?,?)", ("paper", 1.0, 1.0))
+    storage.execute("INSERT OR REPLACE INTO bars(symbol,tf,t,o,h,l,c,v) "
+                    "VALUES('EURUSD','1h','garbage',1,1,1,1,1)")
+    storage.execute("INSERT INTO equity(t,mode,balance,equity) VALUES(?,?,?,?)",
+                    (int(time.time()), "paper", 2.0, 2.0))
+    try:
+        h = analysis.health()                      # must not raise
+        assert h["engine_alive"] is True, \
+            "the NUMERIC max (just written) must drive liveness, not the string row"
+        d = analysis.drawdown_forensics("paper")   # must not raise either
+        assert d["n"] >= 1
+    finally:
+        storage.execute("DELETE FROM equity WHERE typeof(t)='text'")
+        storage.execute("DELETE FROM bars WHERE typeof(t)='text'")
+
+
 # ---------------------------------------------------------------- API
 def test_read_endpoints_respond():
     for url in ("/api/health", "/api/performance?mode=paper",

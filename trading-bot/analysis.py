@@ -39,12 +39,30 @@ def _closed(mode: Optional[str] = None, days: Optional[int] = None,
         tuple(args))
 
 
+def _num(v: Any) -> Optional[float]:
+    """Defensive numeric coercion for values read from historical DBs —
+    SQLite columns are dynamically typed and real user databases have been
+    seen holding string timestamps (a single string row makes MAX() return
+    a string, since strings sort above numbers)."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(rows)
     if n == 0:
         return {"n": 0}
-    rs = [r["r_multiple"] or 0 for r in rows]
-    pnls = [r["pnl"] or 0 for r in rows]
+    rs = [_num(r["r_multiple"]) or 0 for r in rows]
+    pnls = [_num(r["pnl"]) or 0 for r in rows]
     wins = [x for x in rs if x > 0]
     gains = sum(p for p in pnls if p > 0)
     losses = -sum(p for p in pnls if p < 0)
@@ -142,8 +160,8 @@ def drawdown_forensics(mode: str = "paper",
         return {"mode": mode, "n": 0}
     curve, cum = [], 0.0
     for tr in rows:
-        cum += tr["r_multiple"] or 0
-        curve.append({"t": tr["exit_time"], "cum_r": round(cum, 2),
+        cum += _num(tr["r_multiple"]) or 0
+        curve.append({"t": _num(tr["exit_time"]) or 0, "cum_r": round(cum, 2),
                       "id": tr["id"], "symbol": tr["symbol"]})
     peak, max_dd, dd_start, dd_trough, cur_peak_i = -1e18, 0.0, None, None, 0
     for i, pt in enumerate(curve):
@@ -154,13 +172,13 @@ def drawdown_forensics(mode: str = "paper",
             max_dd, dd_start, dd_trough = dd, cur_peak_i, i
     worst_streak, streak = 0, 0
     for tr in rows:
-        if (tr["r_multiple"] or 0) < 0:
+        if (_num(tr["r_multiple"]) or 0) < 0:
             streak += 1
             worst_streak = max(worst_streak, streak)
         else:
             streak = 0
-    losers = [t for t in rows if (t["r_multiple"] or 0) < 0]
-    wickouts = [t for t in losers if (t["mfe"] or 0) >= 0.5]
+    losers = [t for t in rows if (_num(t["r_multiple"]) or 0) < 0]
+    wickouts = [t for t in losers if (_num(t["mfe"]) or 0) >= 0.5]
     spread_stops = [t for t in rows
                     if "spread-induced" in (t["exit_reason"] or "")]
     def _conc(key_fn):
@@ -270,13 +288,17 @@ def health() -> Dict[str, Any]:
             continue
         cls = row["asset_class"]
         newest = storage.query_one(
-            "SELECT MAX(t) m FROM bars WHERE symbol=?", (row["symbol"],))
-        age = (now - newest["m"]) if newest and newest["m"] else None
+            "SELECT MAX(t) m FROM bars WHERE symbol=? "
+            "AND typeof(t) IN ('integer','real')", (row["symbol"],))
+        m = _num(newest["m"]) if newest else None
+        age = (now - m) if m else None
         cur = per_class_fresh.get(cls)
         if age is not None and (cur is None or age < cur):
             per_class_fresh[cls] = age
-    eq = storage.query_one("SELECT MAX(t) m FROM equity")
-    engine_age = (now - eq["m"]) if eq and eq["m"] else None
+    eq = storage.query_one("SELECT MAX(t) m FROM equity "
+                           "WHERE typeof(t) IN ('integer','real')")
+    m = _num(eq["m"]) if eq else None
+    engine_age = (now - m) if m else None
     try:
         import news_calendar
         cal = news_calendar.status()
