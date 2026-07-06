@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -400,6 +401,11 @@ class NewsAgent:
             **DEFAULT_CFG,
             **raw_cfg.get("news_agent", {}),
         }
+        # SLC_SERVER_URL env var overrides config — pairs with server.py's
+        # SLC_PORT so a parallel instance needs no tracked-file edits
+        env_url = os.environ.get("SLC_SERVER_URL")
+        if env_url:
+            self.cfg["server_url"] = env_url
 
         self.live_mode: bool = bool(self.cfg["live_mode"])
         self.poll_seconds: int = int(self.cfg["poll_seconds"])

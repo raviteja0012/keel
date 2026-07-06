@@ -615,7 +615,11 @@ if __name__ == "__main__":
     threading.Thread(target=agent.agent_loop,
                      args=(CFG["agent"], notifier.send), daemon=True).start()
 
-    host, port = CFG["server"]["host"], CFG["server"]["port"]
+    # SLC_HOST / SLC_PORT env vars override config.yaml — lets a second
+    # instance run in parallel with an existing bot without editing tracked
+    # files (e.g. SLC_PORT=8768 python3 server.py)
+    host = os.environ.get("SLC_HOST", CFG["server"]["host"])
+    port = int(os.environ.get("SLC_PORT", CFG["server"]["port"]))
     print("=" * 60)
     print(" SLC Trading Bot")
     print(" Dashboard : http://localhost:%d" % port)
