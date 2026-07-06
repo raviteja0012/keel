@@ -256,8 +256,14 @@ function plainBars(el,entries){const max=Math.max(...entries.map(e=>e.v),1);
 async function loadHealth(){
   const h=await GET('/api/health');
   const okc=(b,inv)=>b?(inv?'var(--crit)':'var(--good)'):(inv?'var(--good)':'var(--crit)');
+  const engSub=h.engine_alive
+    ?(h.ea_connected?`cycle ${h.engine_last_seen_s}s ago`:'up — waiting for EA feed')
+    :(h.engine_last_seen_s!=null?`last seen ${ago(Date.now()/1000-h.engine_last_seen_s)} ago`:'never seen — is server.py running?');
   $('#healthCards').innerHTML=
-    statCard('Engine',h.engine_alive?'RUNNING':'DOWN',h.engine_last_seen_s!=null?`last cycle ${h.engine_last_seen_s}s ago`:'no equity rows yet',okc(h.engine_alive))+
+    statCard('Engine',h.engine_alive?'RUNNING':'DOWN',engSub,okc(h.engine_alive))+
+    statCard('EA feed',h.ea_connected?'LIVE':'NO FEED',
+      h.ea_feed_age_s!=null?`last push ${ago(Date.now()/1000-h.ea_feed_age_s)} ago`:'nothing received on this port yet',
+      okc(h.ea_connected))+
     statCard('Mode',esc(String(h.trading_mode).toUpperCase()),'',h.trading_mode==='live'?'var(--warn)':'var(--s2)')+
     statCard('New entries',h.halt_new_entries?'HALTED':'allowed','',okc(!h.halt_new_entries))+
     statCard('DB integrity',h.db_integrity_suspect?'SUSPECT':'ok',esc(h.db_integrity_suspect||''),okc(!h.db_integrity_suspect))+

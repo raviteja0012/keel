@@ -299,6 +299,13 @@ def health() -> Dict[str, Any]:
                            "WHERE typeof(t) IN ('integer','real')")
     m = _num(eq["m"]) if eq else None
     engine_age = (now - m) if m else None
+    # engines running this build write an explicit heartbeat every cycle even
+    # while standing aside without data; prefer it over the equity proxy
+    hb = _num(storage.get_setting("engine_heartbeat_t", 0)) or 0
+    if hb:
+        engine_age = now - hb
+    feed_t = _num(storage.get_setting("ea_last_feed_t", 0)) or 0
+    feed_age = (now - feed_t) if feed_t else None
     try:
         import news_calendar
         cal = news_calendar.status()
@@ -307,6 +314,8 @@ def health() -> Dict[str, Any]:
     return {
         "engine_alive": engine_age is not None and engine_age < 180,
         "engine_last_seen_s": round(engine_age) if engine_age is not None else None,
+        "ea_feed_age_s": round(feed_age) if feed_age is not None else None,
+        "ea_connected": feed_age is not None and feed_age < 60,
         "db_integrity_suspect": storage.integrity_suspect() or None,
         "halt_new_entries": bool(storage.get_setting("halt_new_entries", False)),
         "trading_mode": storage.get_setting("trading_mode", "paper"),

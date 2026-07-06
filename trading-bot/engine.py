@@ -848,6 +848,17 @@ def engine_loop(poll_seconds: int = 20) -> None:
     print("engine: started (poll %ds)" % poll_seconds)
     while True:
         try:
+            # heartbeat EVERY cycle — even while standing aside waiting for
+            # the EA feed — so the dashboard can distinguish "engine process
+            # down" from "engine up, no data" (both matter, differently)
+            try:
+                storage.set_setting("engine_heartbeat_t", int(time.time()))
+                if feed_state.get("last_feed_t"):
+                    storage.set_setting("ea_last_feed_t",
+                                        int(feed_state["last_feed_t"]))
+            except Exception:
+                pass
+
             p = params()
 
             # No fresh EA feed -> no live prices -> analyzing would only

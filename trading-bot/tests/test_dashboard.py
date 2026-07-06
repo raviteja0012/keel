@@ -148,6 +148,21 @@ def test_health_process_independent():
     assert "engine_alive" in h and "newest_bar_age_s_by_class" in h
 
 
+def test_health_distinguishes_engine_from_feed():
+    """An engine standing aside with no EA feed must read alive-but-no-feed,
+    not DOWN (the state a fresh parallel deployment sits in)."""
+    storage.set_setting("engine_heartbeat_t", int(time.time()))
+    storage.set_setting("ea_last_feed_t", 0)
+    h = analysis.health()
+    assert h["engine_alive"] is True
+    assert h["ea_connected"] is False and h["ea_feed_age_s"] is None
+    storage.set_setting("ea_last_feed_t", int(time.time()))
+    h = analysis.health()
+    assert h["ea_connected"] is True
+    storage.set_setting("engine_heartbeat_t", 0)
+    storage.set_setting("ea_last_feed_t", 0)
+
+
 def test_health_survives_string_timestamps_in_real_dbs():
     """Regression: a real user DB contained equity rows whose t column was
     TEXT; strings sort above numbers so MAX(t) returned a string and
