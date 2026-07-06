@@ -81,6 +81,7 @@ button.act:disabled{opacity:.45;cursor:default}
   <nav id="nav">
     <button data-v="health" class="on">Health</button>
     <button data-v="perf">Performance</button>
+    <button data-v="trades">Trades</button>
     <button data-v="exposure">Exposure</button>
     <button data-v="regime">Regime &amp; session</button>
     <button data-v="drawdown">Drawdown</button>
@@ -114,6 +115,24 @@ button.act:disabled{opacity:.45;cursor:default}
   <h2>Open positions</h2>
   <table id="openTable"><thead><tr><th>#</th><th>Symbol</th><th>Side</th><th>Class</th>
     <th>Grade</th><th class="num">Risk %</th><th>Factors</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view" id="v-trades">
+  <h2>Engine analysis right now <span class="note" id="anWindow"></span></h2>
+  <table id="anTable"><thead><tr><th>Symbol</th><th>Speed</th><th>Stage</th>
+    <th>Action</th><th>Age</th><th>Note</th></tr></thead><tbody></tbody></table>
+  <h2>Trade history</h2>
+  <div class="filters">
+    <select id="trMode"><option value="">all modes</option><option selected>paper</option>
+      <option>live</option><option>shadow</option></select>
+    <input type="text" id="trSymbol" placeholder="symbol">
+    <select id="trStatus"><option value="">open + closed</option><option>open</option><option>closed</option></select>
+    <select id="trDays"><option value="">all time</option><option>7</option><option>30</option><option>90</option></select>
+    <button class="act ghost" onclick="loadTrades()">Apply</button>
+  </div>
+  <table id="trTable"><thead><tr><th>Opened</th><th>Symbol</th><th>Side</th><th>Strat</th>
+    <th>Class</th><th>Grade</th><th class="num">Entry</th><th class="num">Exit</th>
+    <th class="num">R</th><th class="num">P&amp;L</th><th>Status</th><th>Exit reason</th></tr></thead><tbody></tbody></table>
 </section>
 
 <section class="view" id="v-exposure">
@@ -224,9 +243,9 @@ document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
   $('#v-'+b.dataset.v).classList.add('on');
-  ({health:loadHealth,perf:loadPerf,exposure:loadExposure,regime:loadRegime,
-    drawdown:loadDrawdown,promotion:loadPromotion,decisions:loadDecisions,
-    controls:loadControls})[b.dataset.v]();
+  ({health:loadHealth,perf:loadPerf,trades:loadTrades,exposure:loadExposure,
+    regime:loadRegime,drawdown:loadDrawdown,promotion:loadPromotion,
+    decisions:loadDecisions,controls:loadControls})[b.dataset.v]();
 });
 
 /* ---------- shared renderers ---------- */
@@ -311,6 +330,37 @@ async function loadPerf(){
      <td>${esc(x.grade??'')}</td><td class="num">${fmt(x.risk_pct,2)}</td>
      <td class="note">${esc(Object.entries(x.factors).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' '))}</td></tr>`));
   if(!(ex.positions||[]).length)ot.innerHTML='<tr><td colspan="7" class="note">no open positions</td></tr>';
+}
+
+/* ---------- trades + live analysis ---------- */
+async function loadTrades(){
+  const a=await GET('/api/analysis_now');
+  $('#anWindow').textContent=`(latest per symbol × speed, last ${a.window_min} min — empty until the EA feed is live)`;
+  const at=$('#anTable tbody');at.innerHTML='';
+  (a.rows||[]).forEach(r=>at.insertAdjacentHTML('beforeend',
+    `<tr><td>${esc(r.symbol)}</td><td>${esc(r.trade_mode)}</td>
+     <td><span class="pill">${esc(r.stage)}</span></td><td>${esc(r.action)}</td>
+     <td class="note">${ago(r.t)}</td><td class="note">${esc(r.reason||'')}</td></tr>`));
+  if(!(a.rows||[]).length)at.innerHTML=
+    '<tr><td colspan="6" class="note">no engine activity in the window — engine analyzes only while the EA feed is live</td></tr>';
+  const q=new URLSearchParams({limit:200});
+  if($('#trMode').value)q.set('mode',$('#trMode').value);
+  if($('#trSymbol').value)q.set('symbol',$('#trSymbol').value.toUpperCase());
+  if($('#trStatus').value)q.set('status',$('#trStatus').value);
+  if($('#trDays').value)q.set('days',$('#trDays').value);
+  const d=await GET('/api/trades?'+q);
+  const tb=$('#trTable tbody');tb.innerHTML='';
+  (d.trades||[]).forEach(t=>{const r=t.r_multiple;
+    tb.insertAdjacentHTML('beforeend',
+    `<tr><td>${new Date(t.entry_time*1000).toISOString().slice(2,16).replace('T',' ')}</td>
+     <td>${esc(t.symbol)}</td><td>${esc(t.side)}</td><td>${esc(t.strategy||'slc')}</td>
+     <td>${esc(t.asset_class||'')}</td><td>${esc(t.grade||'')}</td>
+     <td class="num">${fmt(t.entry,5)}</td><td class="num">${t.exit_price!=null?fmt(t.exit_price,5):'—'}</td>
+     <td class="num ${r>0?'pos':r<0?'negt':''}">${r!=null?fmt(r,2):'—'}</td>
+     <td class="num ${t.pnl>0?'pos':t.pnl<0?'negt':''}">${t.status==='closed'?fmt(t.pnl,2):'—'}</td>
+     <td><span class="pill">${esc(t.mode)} ${esc(t.status)}</span></td>
+     <td class="note">${esc(t.exit_reason||'')}</td></tr>`);});
+  if(!(d.trades||[]).length)tb.innerHTML='<tr><td colspan="12" class="note">no trades match this filter</td></tr>';
 }
 
 /* ---------- exposure ---------- */

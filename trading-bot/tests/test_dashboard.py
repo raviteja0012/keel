@@ -192,7 +192,7 @@ def test_read_endpoints_respond():
                 "/api/studies/drawdown", "/api/studies/promotion",
                 "/api/decisions?limit=10", "/api/param_changes",
                 "/api/instruments", "/api/news_calendar", "/api/trades?limit=5",
-                "/api/settings"):
+                "/api/analysis_now", "/api/settings"):
         r = client.get(url)
         assert r.status_code == 200, (url, r.status_code, r.text[:200])
 

@@ -19,6 +19,7 @@ Security model:
 Run:  python3 dashboard_api.py         # http://127.0.0.1:8767
 """
 import os
+import time
 from typing import Any, Dict, Optional
 
 import yaml
@@ -148,11 +149,24 @@ def api_trades(mode: Optional[str] = None, symbol: Optional[str] = None,
             args.append(v)
     if days:
         where.append("entry_time >= ?")
-        args.append(int(__import__("time").time()) - days * 86400)
+        args.append(int(time.time()) - days * 86400)
     args.append(limit)
     return {"trades": storage.query(
         "SELECT * FROM trades WHERE %s ORDER BY entry_time DESC LIMIT ?"
         % " AND ".join(where), tuple(args))}
+
+
+@app.get("/api/analysis_now")
+def api_analysis_now(minutes: int = 90):
+    """What the engine is looking at right now: the latest decision row per
+    symbol×speed within the window (analysis notes, stand-asides, skips,
+    executions alike). Empty until the engine is cycling with a live feed."""
+    since = int(time.time()) - minutes * 60
+    rows = storage.query(
+        "SELECT d.* FROM decisions d JOIN (SELECT symbol, trade_mode, MAX(id) mid "
+        "FROM decisions WHERE t>=? GROUP BY symbol, trade_mode) x ON d.id=x.mid "
+        "ORDER BY d.symbol, d.trade_mode", (since,))
+    return {"rows": rows, "window_min": minutes}
 
 
 @app.get("/api/settings")
