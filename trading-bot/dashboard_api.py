@@ -46,13 +46,18 @@ def _load_cfg() -> Dict[str, Any]:
     return {"host": d.get("host", "127.0.0.1"), "port": int(d.get("port", 8767))}
 
 
-app = FastAPI(title="SLC multi-asset dashboard", docs_url=None, redoc_url=None)
+from contextlib import asynccontextmanager
 
 
-@app.on_event("startup")
-def _startup() -> None:
+@asynccontextmanager
+async def _lifespan(_app):
     storage.init()
     instruments.seed_defaults()
+    yield
+
+
+app = FastAPI(title="SLC multi-asset dashboard", docs_url=None, redoc_url=None,
+              lifespan=_lifespan)
 
 
 # ---------------------------------------------------------------- pages
