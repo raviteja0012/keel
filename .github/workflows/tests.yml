@@ -6,12 +6,16 @@ name: tests
 
 on:
   push:
-    branches: ["**"]
-  pull_request:
+    branches: [main]     # branch pushes are covered by pull_request; running
+  pull_request:          # both duplicated every check on the same commit
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:             # a newer commit supersedes an in-flight run
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rails:
