@@ -48,6 +48,7 @@ when code and playbook disagree, the playbook is the intended behavior and the g
 | `trading-bot/backtest.py`, `sanity_check.py` | replay + parameter sweep |
 | `trading-bot/tests/` | risk-rail / circuit-breaker / promotion-gate suites — keep green (`python3 tests/<file>.py`) |
 | `trading-bot/config.yaml` | startup defaults (DB values win after first run) |
+| `install-multiasset-services.sh` | launchd install/status/uninstall for the multi-asset stack (`com.slcmulti.*`) |
 | `SLCDataBridge.mq5` / `.original.mq5` | MT5 data-bridge EA (v2.30) and baseline |
 | `slc-*.skill` | four Cowork skills to operate the bot conversationally |
 | `*-REPORT.md`, `*.patch`, `*.diff`, `volume_gate_shadow.py`, `recover-db.sh`, `hallucination_check.py` | experiments, validation, ops tooling |
