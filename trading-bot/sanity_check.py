@@ -87,9 +87,13 @@ def run_grid(symbols: List[str], modes: List[str], base: Dict,
 
 
 # Bounded auto-tuning: a parameter variant is applied only if it beats the
-# baseline by >=15% total swing R (with n>=30) on TWO consecutive daily runs,
-# and only inside these hard bounds. Never touches risk %, stops, mode.
-APPLY_BOUNDS = {"min_rr": (1.8, 3.0), "atr_buffer": (0.25, 0.60)}
+# baseline by >=15% total swing R (with n>=30) on TWO consecutive daily runs.
+# Bounds come from params_store — the same source of truth the agent and the
+# hallucination check use — and the write itself goes through set_param
+# (origin='sanity'), so the whitelist/bounds/human-pin rules are enforced at
+# the write layer, not by this script's discipline.
+import params_store
+APPLY_BOUNDS = {k: params_store.BOUNDS[k] for k in ("min_rr", "atr_buffer")}
 
 
 def auto_apply(results: List[Dict], recs: List[str]) -> None:
@@ -124,9 +128,21 @@ def auto_apply(results: List[Dict], recs: List[str]) -> None:
     lo, hi = APPLY_BOUNDS[key]
     val = max(lo, min(hi, val))
     if prev.get("name") == best["name"]:
-        # confirmed on a second consecutive run -> apply
+        # confirmed on a second consecutive run -> apply (through the guarded
+        # write layer; a refusal is reported, never silently forced)
         old = storage.get_setting(key, None)
-        storage.set_setting(key, val)
+        try:
+            params_store.set_param(
+                key, val, origin="sanity",
+                reason="sanity auto-tune: variant '%s' beat baseline 2 days running"
+                       % best["name"],
+                trigger_data={"variant": best["name"],
+                              "variant_swing": best["swing"],
+                              "baseline_swing": baseline})
+        except params_store.ParamRejected as e:
+            recs.insert(0, "REFUSED by write layer: %s" % e)
+            json.dump({}, open(path, "w"))
+            return
         storage.log_agent("change", key,
                           "sanity auto-tune: %s -> %s (variant '%s' beat baseline "
                           "2 days running)" % (old, val, best["name"]))

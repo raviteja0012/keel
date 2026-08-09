@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -73,6 +74,20 @@ GENERAL_FEEDS = [
     "https://news.google.com/rss/search?q=interest+rate+decision+inflation&hl=en&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=gdp+employment+cpi+economic+data&hl=en&gl=US&ceid=US:en",
 ]
+
+# Asset-class feeds beyond forex, fetched only when the watched universe
+# includes that entity (crypto pairs -> crypto feeds, index CFDs -> equity
+# feeds, metals -> gold feed). Keyed by the news entity _parse_symbol yields.
+ENTITY_FEEDS: Dict[str, str] = {
+    "BTC": "https://news.google.com/rss/search?q=bitcoin+crypto+market&hl=en&gl=US&ceid=US:en",
+    "ETH": "https://news.google.com/rss/search?q=ethereum+crypto&hl=en&gl=US&ceid=US:en",
+    "XAU": "https://news.google.com/rss/search?q=gold+price+safe+haven&hl=en&gl=US&ceid=US:en",
+    "OIL": "https://news.google.com/rss/search?q=oil+price+opec+crude&hl=en&gl=US&ceid=US:en",
+    "SPX": "https://news.google.com/rss/search?q=us+stock+market+wall+street&hl=en&gl=US&ceid=US:en",
+    "NAS": "https://news.google.com/rss/search?q=nasdaq+tech+stocks&hl=en&gl=US&ceid=US:en",
+    "DOW": "https://news.google.com/rss/search?q=dow+jones+us+stocks&hl=en&gl=US&ceid=US:en",
+    "DAX": "https://news.google.com/rss/search?q=dax+european+stocks&hl=en&gl=US&ceid=US:en",
+}
 
 # Per-currency feed for the market-wide alert scan (filled with the currency
 # code). Fetched for every currency present in the dashboard-enabled pairs,
@@ -386,6 +401,11 @@ class NewsAgent:
             **DEFAULT_CFG,
             **raw_cfg.get("news_agent", {}),
         }
+        # SLC_SERVER_URL env var overrides config — pairs with server.py's
+        # SLC_PORT so a parallel instance needs no tracked-file edits
+        env_url = os.environ.get("SLC_SERVER_URL")
+        if env_url:
+            self.cfg["server_url"] = env_url
 
         self.live_mode: bool = bool(self.cfg["live_mode"])
         self.poll_seconds: int = int(self.cfg["poll_seconds"])
@@ -460,10 +480,12 @@ class NewsAgent:
     # ── Headline collection ──────────────────────────────────────────────────
 
     def _collect_items(self, positions: List[dict],
-                       watch_currencies: List[str]) -> List[dict]:
+                       watch_currencies: List[str],
+                       watch_entities: Optional[List[str]] = None) -> List[dict]:
         """Fetch all relevant RICH news items: general macro feeds, one feed
-        per watched currency (for market-wide alerts), and pair-specific feeds
-        for open positions. Deduplicated by title, order preserved."""
+        per watched currency (for market-wide alerts), asset-class entity
+        feeds (crypto/metals/indices/oil in the watched universe), and
+        pair-specific feeds for open positions. Deduplicated by title."""
         all_items: List[dict] = []
         seen_urls: set = set()
 
@@ -484,19 +506,27 @@ class NewsAgent:
         for cur in watch_currencies:
             _pull(CURRENCY_FEED_TEMPLATE.format(cur=cur), cur)
 
-        # Pair-specific feeds for open positions
+        # Asset-class entity feeds (crypto/metals/indices/oil)
+        for ent in (watch_entities or []):
+            if ent in ENTITY_FEEDS:
+                _pull(ENTITY_FEEDS[ent], ent)
+
+        # Pair-specific feeds for open positions. Entities come from the same
+        # parser the evaluator scores with — no more naive [:3]/[3:6] slicing
+        # that mangled indices (US500 -> "US5"/"00") and crypto symbols.
         pairs_done: set = set()
         for pos in positions:
-            sym = pos.get("symbol", "").upper()
-            sym_clean = sym.rstrip("._-Rr")
-            base = sym_clean[:3] if len(sym_clean) >= 3 else sym_clean
-            quote = sym_clean[3:6] if len(sym_clean) >= 6 else ""
+            sym = pos.get("symbol", "").upper().rstrip("._-Rr")
+            base, quote = _parse_symbol(sym)
             pair_key = f"{base}{quote}"
             if pair_key in pairs_done:
                 continue
             pairs_done.add(pair_key)
-            for tmpl in PAIR_FEED_TEMPLATES:
-                _pull(tmpl.format(base=base, quote=quote), pair_key)
+            if base in ENTITY_FEEDS:
+                _pull(ENTITY_FEEDS[base], pair_key)
+            elif base in MAJORS and quote in MAJORS:
+                for tmpl in PAIR_FEED_TEMPLATES:
+                    _pull(tmpl.format(base=base, quote=quote), pair_key)
 
         # Deduplicate by title preserving order
         seen_text: set = set()
@@ -549,9 +579,14 @@ class NewsAgent:
                            "AUDUSD", "NZDUSD", "USDCAD"]
         watch_currencies = sorted({c for pair in watch_pairs
                                    for c in _parse_symbol(pair) if c in MAJORS})
+        # non-FX entities in the watched universe get their own feeds so
+        # crypto/metals/index alerts fire even with zero positions open
+        watch_entities = sorted({c for pair in watch_pairs
+                                 for c in _parse_symbol(pair)
+                                 if c in ENTITY_FEEDS})
 
         # 2. Collect rich news items across all feeds
-        items = self._collect_items(positions, watch_currencies)
+        items = self._collect_items(positions, watch_currencies, watch_entities)
         headlines = [it["title"] for it in items]
         log.info("Unique headlines fetched: %d (age ≤ %sh)",
                  len(headlines), self.max_age_hours)

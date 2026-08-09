@@ -26,15 +26,29 @@ when code and playbook disagree, the playbook is the intended behavior and the g
 | Path | Role |
 |---|---|
 | `SLC-Price-Action-Playbook.md` | the strategy this code implements (north star) |
-| `trading-bot/server.py` | Flask app, EA endpoints, serves dashboard, starts threads |
-| `trading-bot/engine.py` | SLC signal execution, paper broker, live command queue, trade mgmt, spread window |
+| `docs/MULTI-ASSET-ARCHITECTURE.md` | multi-asset architecture (Phase 1 proposal + inventory) |
+| `docs/LIVE-EXECUTION-VPS.md` | live topology runbook: Mac ↔ Windows-VPS EA split |
+| `trading-bot/server.py` | Flask app, EA endpoints, serves legacy dashboard, starts threads |
+| `trading-bot/engine.py` | execution choke point (ALL rails), paper broker, live command queue, trade mgmt, spread window |
 | `trading-bot/strategy.py` | pure SLC + chart-pattern logic (structure, liquidity, sweep, confirmation) |
-| `trading-bot/storage.py` | SQLite (WAL), runtime settings **including credentials** |
-| `trading-bot/agent.py` | bounded self-tuning (whitelisted params only) |
+| `trading-bot/strategies/` | strategy-plugin registry (SLC = plugin #1) |
+| `trading-bot/storage.py` | SQLite (WAL), additive migrations, hardened command queue, runtime settings **including credentials** |
+| `trading-bot/instruments.py` | per-symbol registry: asset class, factor exposures, calendars, news entities |
+| `trading-bot/sessions.py` | per-class market calendars, day/week boundaries, crypto weekend risk factor |
+| `trading-bot/exposure.py` | cross-asset factor-bucket exposure ledger + gate (lesson: correlated bets stack) |
+| `trading-bot/params_store.py` | the ONLY parameter write path: per-origin whitelists, bounds, code ceilings, structured audit |
+| `trading-bot/decisions.py` | decision audit — every decision incl. decisions NOT to trade |
+| `trading-bot/news_calendar.py` | scheduled-event blackouts per asset class; fails safe when the calendar is stale |
+| `trading-bot/analysis.py` | importable studies: regime/session perf, exposure, drawdown forensics, promotion-gate status |
+| `trading-bot/dashboard_api.py` + `dashboard/multiasset.html` | localhost-only FastAPI control dashboard (port 8767) |
+| `trading-bot/live_switch.py`, `dash_auth.py` | two-step, promotion-gated live switch — the ONLY path to live |
+| `trading-bot/agent.py` | bounded self-tuning (writes only via params_store) |
 | `trading-bot/notifier.py`, `telegram_notifier.py` | dual-channel Telegram + Discord |
 | `trading-bot/news_agent.py`, `news_evaluator.py` | RSS news monitor + SL management (separate process) |
 | `trading-bot/backtest.py`, `sanity_check.py` | replay + parameter sweep |
+| `trading-bot/tests/` | risk-rail / circuit-breaker / promotion-gate suites — keep green (`python3 tests/<file>.py`) |
 | `trading-bot/config.yaml` | startup defaults (DB values win after first run) |
+| `install-multiasset-services.sh` | launchd install/status/uninstall for the multi-asset stack (`com.slcmulti.*`) |
 | `SLCDataBridge.mq5` / `.original.mq5` | MT5 data-bridge EA (v2.30) and baseline |
 | `slc-*.skill` | four Cowork skills to operate the bot conversationally |
 | `*-REPORT.md`, `*.patch`, `*.diff`, `volume_gate_shadow.py`, `recover-db.sh`, `hallucination_check.py` | experiments, validation, ops tooling |
@@ -47,8 +61,10 @@ when code and playbook disagree, the playbook is the intended behavior and the g
 ```bash
 cd trading-bot
 pip install -r requirements.txt
-python3 server.py          # prints dashboard URL + LAN IP; dashboard at http://localhost:8766
+python3 server.py          # EA endpoints + engine + legacy dashboard at http://localhost:8766
 python3 news_agent.py      # separate process; restart after changing notification settings
+python3 dashboard_api.py   # multi-asset control dashboard at http://127.0.0.1:8767 (localhost only)
+for t in tests/test_*.py; do python3 "$t"; done   # rails/gate suites — must stay green
 ```
 
 Then attach the `SLCDataBridge` EA in MT5 and allow-list the WebRequest URL — see

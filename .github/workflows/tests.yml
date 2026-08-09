@@ -1,0 +1,64 @@
+name: tests
+
+# The risk-rail and circuit-breaker suites are the code that must not fail
+# (CLAUDE.md safety invariants). Run them on every push and PR so a rail can
+# never be weakened silently.
+
+on:
+  push:
+    branches: [main]     # branch pushes are covered by pull_request; running
+  pull_request:          # both duplicated every check on the same commit
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:             # a newer commit supersedes an in-flight run
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rails:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: trading-bot
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: trading-bot/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip -r requirements.txt
+
+      - name: Risk rails and circuit breakers
+        run: python tests/test_risk_rails.py
+
+      - name: Execution flow through the shared rails
+        run: python tests/test_execution_flow.py
+
+      - name: Live-promotion gate
+        run: python tests/test_live_switch.py
+
+      - name: Regime and news adaptation
+        run: python tests/test_news_regime.py
+
+      - name: Dashboard and analysis library
+        run: python tests/test_dashboard.py
+
+      - name: Strategy plugin registry
+        run: python tests/test_strategy_registry.py
+
+      - name: External-signal webhook
+        run: python tests/test_tv_webhook.py
+
+      - name: Compile-check every module
+        run: python -m compileall -q . ../hallucination_check.py

@@ -74,6 +74,37 @@ CURRENCY_KEYWORDS: Dict[str, List[str]] = {
     "SPX": [
         "s&p", "sp500", "s&p 500", "us stocks", "wall street", "us equities",
     ],
+    "DOW": [
+        "dow", "dow jones", "us stocks", "wall street", "us equities",
+        "industrial average",
+    ],
+    "DAX": [
+        "dax", "german stocks", "european stocks", "frankfurt", "eu equities",
+    ],
+    "FTSE": [
+        "ftse", "uk stocks", "london stocks", "british equities",
+    ],
+    "NIKKEI": [
+        "nikkei", "japanese stocks", "tokyo stocks", "japan equities",
+    ],
+    # Crypto — the asset class the old lexicon didn't know existed. BTC terms
+    # deliberately include broad crypto/regulation vocabulary since BTC sets
+    # the regime for the class (playbook §9).
+    "BTC": [
+        "bitcoin", "btc", "crypto", "cryptocurrency", "crypto market",
+        "digital asset", "bitcoin etf", "crypto etf", "halving",
+        "sec crypto", "crypto regulation", "crypto ban", "stablecoin",
+        "coinbase", "binance", "crypto exchange", "blockchain",
+    ],
+    "ETH": [
+        "ethereum", "eth", "ether", "crypto", "cryptocurrency",
+        "ethereum etf", "defi", "smart contract", "staking",
+        "crypto regulation", "digital asset",
+    ],
+    "ADA": ["cardano", "ada", "crypto", "cryptocurrency", "altcoin"],
+    "DOGE": ["dogecoin", "doge", "crypto", "cryptocurrency", "altcoin", "meme coin"],
+    "LINK": ["chainlink", "link token", "crypto", "cryptocurrency", "defi", "altcoin"],
+    "BCH": ["bitcoin cash", "bch", "crypto", "cryptocurrency", "altcoin"],
 }
 
 # ── Sentiment phrase scoring ─────────────────────────────────────────────────
@@ -232,10 +263,26 @@ class TradeDecision:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+# entity pair per instrument for sentiment scoring; consulted before the
+# string heuristics so indices/crypto stop being sliced like FX pairs
+# (US500 -> base "US5"/quote "00" was the legacy failure mode)
+_NAMED_ENTITIES: Dict[str, Tuple[str, str]] = {
+    "US30": ("DOW", "USD"), "NAS100": ("NAS", "USD"), "US100": ("NAS", "USD"),
+    "SP500": ("SPX", "USD"), "US500": ("SPX", "USD"), "SPX500": ("SPX", "USD"),
+    "GER40": ("DAX", "EUR"), "DE40": ("DAX", "EUR"),
+    "UK100": ("FTSE", "GBP"), "JPN225": ("NIKKEI", "JPY"),
+    "BTCUSD": ("BTC", "USD"), "ETHUSD": ("ETH", "USD"),
+    "ADAUSD": ("ADA", "USD"), "DOGUSD": ("DOGE", "USD"),
+    "LINKUSD": ("LINK", "USD"), "BCHUSD": ("BCH", "USD"),
+}
+
+
 def _parse_symbol(symbol: str) -> Tuple[str, str]:
-    """Return (base_currency, quote_currency) for a trading symbol."""
+    """Return (base_entity, quote_entity) for a trading symbol."""
     # Strip common broker suffixes: .r, _SB, m, etc.
     sym = re.sub(r'[._-].*$', '', symbol.upper()).strip()
+    if sym in _NAMED_ENTITIES:
+        return _NAMED_ENTITIES[sym]
     if len(sym) < 3:
         return sym, "USD"
     # Named commodities / indices
@@ -369,9 +416,18 @@ def calculate_be_sl(position: dict, be_buffer_pips: float = 2.0) -> Optional[flo
     if entry == 0:
         return None
 
-    # Pip size by symbol
+    # Break-even buffer unit by symbol/asset class. The old table was
+    # forex-only: a 2-"pip" buffer on BTCUSD was 0.0002 USD (meaningless).
+    # Absolute per-class units, scaled by be_buffer_pips as a multiplier:
     sym = symbol.upper()
-    if "JPY" in sym:
+    if sym.startswith(("BTC", "ETH")):
+        pip = 10.0                       # majors quote in thousands of USD
+    elif sym.startswith(("ADA", "DOG", "LINK", "BCH", "SOL", "XRP", "LTC")):
+        pip = 0.05
+    elif sym in ("US30", "NAS100", "US100", "SP500", "US500", "SPX500",
+                 "GER40", "DE40", "UK100", "JPN225"):
+        pip = 1.0                        # one index point
+    elif "JPY" in sym:
         pip = 0.01
     elif any(x in sym for x in ("XAU", "GOLD")):
         pip = 0.10
