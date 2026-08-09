@@ -1,0 +1,124 @@
+name: guard
+
+# Catches the two mistakes that cost the most and are easiest to make quietly:
+#   1. a secret committed to the repo
+#   2. a rail changed without anyone noticing it was a rail
+#
+# This runs on EVERY pull request, not only automated ones. A human in a hurry and a
+# model in a loop make the same mistakes, so the check does not care which one opened
+# the PR. It does not block a rail change: it labels it and says so in a comment, so
+# the change gets read by a person instead of skimmed.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Runtime state must never be committed
+        run: |
+          bad=$(git ls-files | grep -E '^trading-bot/(data|state)/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Runtime state is tracked in git. These hold live credentials."
+            echo "$bad"
+            exit 1
+          fi
+          echo "ok: no runtime state tracked"
+
+      - name: Scan the diff for secrets
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          [ -z "$base" ] && base=$(git rev-parse HEAD~1)
+          added=$(git diff "$base" "$head" --unified=0 | grep -E '^\+' | grep -v '^\+\+\+' || true)
+
+          fail=0
+          check() {
+            hits=$(printf '%s\n' "$added" | grep -nE "$1" || true)
+            if [ -n "$hits" ]; then
+              echo "::error::possible $2 added in this PR"
+              printf '%s\n' "$hits" | head -5
+              fail=1
+            fi
+          }
+          # Telegram bot token: digits:base64ish
+          check '[0-9]{8,12}:[A-Za-z0-9_-]{30,}'            'Telegram bot token'
+          check 'discord(app)?\.com/api/webhooks/[0-9]+/'   'Discord webhook'
+          check '(sk|pk|gh[pousr])_[A-Za-z0-9]{20,}'        'API key or GitHub token'
+          check '-----BEGIN [A-Z ]*PRIVATE KEY-----'        'private key'
+          # secret-looking assignments, excluding obvious placeholders
+          check '(api[_-]?key|secret|passwd|password|token)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9/+_-]{16,}' 'hardcoded credential'
+
+          if [ "$fail" = "1" ]; then
+            echo "If this is a false positive, say so in the PR and a reviewer can override."
+            exit 1
+          fi
+          echo "ok: no secrets detected in the diff"
+
+      - name: Flag changes to the rails
+        id: rails
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          [ -z "$base" ] && base=$(git rev-parse HEAD~1)
+          changed=$(git diff --name-only "$base" "$head")
+
+          # Files where a mistake reaches money. See CONTRIBUTING.md.
+          protected=$(printf '%s\n' "$changed" | grep -E \
+            '^(trading-bot/(engine|params_store|live_switch|analysis|storage)\.py|SLCDataBridge\.mq5|CLAUDE\.md)$' || true)
+
+          if [ -n "$protected" ]; then
+            echo "This PR changes files that enforce the safety invariants:"
+            printf '%s\n' "$protected"
+            {
+              echo "hit=true"
+              echo "files<<EOF"
+              printf '%s\n' "$protected"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "ok: no rail files touched"
+          fi
+
+      - name: Say so on the pull request
+        if: steps.rails.outputs.hit == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FILES: ${{ steps.rails.outputs.files }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr edit "$PR" --add-label "touches-rails" 2>/dev/null || true
+          gh pr comment "$PR" --body "$(cat <<EOF
+          **This PR changes files that enforce the safety invariants.**
+
+          \`\`\`
+          $FILES
+          \`\`\`
+
+          Not a problem, just not a skim. Before merging, confirm:
+
+          - no rail moved out of \`engine.py\` into a strategy or an adapter
+          - no risk multiplier that can raise risk (every factor guarded \`if factor < 1.0\`)
+          - no new path to \`trading_mode = live\` beside \`live_switch\`
+          - uncertainty still fails **closed**
+          - if an existing test changed, the PR says which and why the old expectation was wrong
+
+          \`CLAUDE.md\` asks that the PR name the file and the invariant it was checked against.
+          EOF
+          )"
