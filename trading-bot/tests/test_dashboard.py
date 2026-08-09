@@ -137,7 +137,13 @@ def test_promotion_gate_math():
     assert "slc|forex" in cells and "slc|crypto" in cells, list(cells)
     fx = cells["slc|forex"]
     assert fx["checks"]["sample_size"]["pass"] is False   # n=4 < 50
-    assert fx["checks"]["positive_expectancy"]["pass"] is True
+    # positive_expectancy used to pass here on a 4-trade sample: the check tested
+    # only the sign of the mean and ignored how many trades produced it. Four
+    # trades cannot support a claim about expectancy, so it now carries the same
+    # sample floor. It stays a SEPARATE check from sample_size because they
+    # report separately and fail for different reasons.
+    assert fx["checks"]["positive_expectancy"]["pass"] is False
+    assert "not yet meaningful" in fx["checks"]["positive_expectancy"]["reason"]
     assert fx["checks"]["manual_signoff"]["pass"] is False
     assert fx["gate_open"] is False, "gate must NOT open on a 4-trade sample"
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SLC — multi-asset control</title>
+<title>Keel — multi-asset control</title>
 <style>
 /* Dark-committed (matches the bot's existing pages). Palette: validated
    dark-surface steps — series blue #3987e5, diverging blue↔red with neutral
@@ -77,7 +77,7 @@ button.act:disabled{opacity:.45;cursor:default}
 </head>
 <body>
 <header>
-  <h1>SLC · multi-asset</h1>
+  <h1>Keel · multi-asset</h1>
   <nav id="nav">
     <button data-v="health" class="on">Health</button>
     <button data-v="perf">Performance</button>
@@ -87,6 +87,7 @@ button.act:disabled{opacity:.45;cursor:default}
     <button data-v="drawdown">Drawdown</button>
     <button data-v="promotion">Promotion gate</button>
     <button data-v="decisions">Decisions</button>
+    <button data-v="venues">Venues</button>
     <button data-v="controls">Controls<span id="unackBadge" class="badge" style="display:none"></span></button>
   </nav>
   <span class="note" id="clock"></span>
@@ -133,6 +134,49 @@ button.act:disabled{opacity:.45;cursor:default}
   <table id="trTable"><thead><tr><th>Opened</th><th>Symbol</th><th>Side</th><th>Strat</th>
     <th>Class</th><th>Grade</th><th class="num">Entry</th><th class="num">Exit</th>
     <th class="num">R</th><th class="num">P&amp;L</th><th>Status</th><th>Exit reason</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view" id="v-venues">
+  <p class="note">Credentials are stored in the runtime DB and never in the repo. Every exchange ccxt
+    supports is offered here: which ones answer depends on where this bot runs, not on this list
+    (binance.com refuses US traffic with 451 and works from India). Add a venue read-only first,
+    confirm it authenticates, then arm it for execution as a separate act.</p>
+
+  <h2>Connected venues</h2>
+  <table id="venTable"><thead><tr><th>Venue</th><th>Kind</th><th>Reachable</th><th>Auth</th>
+    <th class="num">Latency</th><th class="num">Clock skew</th><th>Execution</th><th>Balances</th><th></th></tr></thead>
+    <tbody></tbody></table>
+  <div id="venDetail" class="note" style="margin-top:8px"></div>
+
+  <h2>Add or update a venue</h2>
+  <div class="controls">
+    <div class="row">
+      <select id="vKind"><option value="ccxt">ccxt exchange</option><option value="3commas">3Commas router</option></select>
+      <input type="text" id="vName" placeholder="name (e.g. binanceus-main)">
+      <select id="vExchange" style="width:170px"></select>
+      <select id="vMarket"><option value="spot">spot</option><option value="swap">swap</option><option value="future">future</option></select>
+    </div>
+    <div class="row">
+      <input type="text" id="vKey" placeholder="API key" style="width:230px">
+      <input type="password" id="vSecret" placeholder="API secret" style="width:230px">
+      <input type="password" id="vPass" placeholder="passphrase (okx, kucoin)" style="width:180px">
+    </div>
+    <div class="row" id="v3cRow" style="display:none">
+      <input type="text" id="vAccount" placeholder="3Commas account_id">
+      <label class="note"><input type="checkbox" id="vManaged" style="width:auto"> 3Commas bots also manage this account</label>
+    </div>
+    <div class="row">
+      <button class="act" onclick="saveVenue()">Save read-only</button>
+      <button class="act ghost" onclick="probeVenue()">Test reachability only</button>
+      <span class="note" id="vMsg"></span>
+    </div>
+    <p class="note">Leave key and secret blank when updating to keep the stored ones. Saving never
+      arms execution: use the Execution toggle on the row above, which is logged separately.</p>
+  </div>
+
+  <h2>Venue positions <span class="note">what the venues say we hold, for reconciliation</span></h2>
+  <table id="venPos"><thead><tr><th>Venue</th><th>Symbol</th><th>Side</th>
+    <th class="num">Qty</th><th class="num">Entry</th><th class="num">Unrealised</th></tr></thead><tbody></tbody></table>
 </section>
 
 <section class="view" id="v-exposure">
@@ -245,8 +289,136 @@ document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
   $('#v-'+b.dataset.v).classList.add('on');
   ({health:loadHealth,perf:loadPerf,trades:loadTrades,exposure:loadExposure,
     regime:loadRegime,drawdown:loadDrawdown,promotion:loadPromotion,
-    decisions:loadDecisions,controls:loadControls})[b.dataset.v]();
+    decisions:loadDecisions,venues:loadVenues,controls:loadControls})[b.dataset.v]();
 });
+
+/* ---------- venues ---------- */
+let _exchangesLoaded=false;
+
+async function loadVenues(){
+  const d=await GET('/api/venues');
+  if(!_exchangesLoaded && d.exchanges && d.exchanges.length){
+    $('#vExchange').innerHTML=d.exchanges.map(e=>
+      `<option${e==='binanceus'?' selected':''}>${esc(e)}</option>`).join('');
+    _exchangesLoaded=true;
+  }
+  const byName={}; (d.health||[]).forEach(h=>byName[h.name]=h);
+
+  const tb=$('#venTable tbody');
+  if(!(d.venues||[]).length){
+    tb.innerHTML='<tr><td colspan="9" class="note">No venues configured. '+
+      'Add one below; it is read-only until you arm it.</td></tr>';
+  }else{
+    tb.innerHTML=d.venues.map(v=>{
+      const h=byName[v.name]||{};
+      const bal=(h.balances||[]).slice(0,4)
+        .map(b=>`${esc(b.currency)} ${Number(b.total).toFixed(4)}`).join(', ')||'—';
+      const skew=h.clock_skew_s==null?'—':Number(h.clock_skew_s).toFixed(2)+'s';
+      const skewBad=h.clock_skew_s!=null&&Math.abs(h.clock_skew_s)>2;
+      return `<tr>
+        <td><b>${esc(v.name)}</b>${v.exchange?`<div class="note">${esc(v.exchange)}${v.market_type?' · '+esc(v.market_type):''}</div>`:''}</td>
+        <td><span class="pill">${esc(v.kind)}</span></td>
+        <td>${h.reachable?'<span class="pos">yes</span>':'<span class="negt">no</span>'}</td>
+        <td>${h.authenticated?'<span class="pos">yes</span>':(v.api_key?'<span class="negt">failed</span>':'<span class="note">no key</span>')}</td>
+        <td class="num">${h.latency_ms??'—'}${h.latency_ms?'ms':''}</td>
+        <td class="num"${skewBad?' class="negt"':''}>${skew}</td>
+        <td>${v.read_only
+              ? `<span class="pill">read-only</span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',true)">Arm</button>`
+              : `<span class="negt"><b>ARMED</b></span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',false)">Disarm</button>`}</td>
+        <td class="note">${esc(bal)}</td>
+        <td><button class="act ghost" onclick="testVenue('${esc(v.name)}')">Test</button>
+            <button class="act danger" onclick="delVenue('${esc(v.name)}')">×</button></td>
+      </tr>`;}).join('');
+  }
+  const problems=(d.health||[]).filter(h=>h.detail);
+  $('#venDetail').innerHTML=problems.map(h=>
+    `<div><b>${esc(h.name)}</b>: ${esc(h.detail)}</div>`).join('');
+
+  try{
+    const p=await GET('/api/venues/positions');
+    const pb=$('#venPos tbody');
+    pb.innerHTML=(p.positions||[]).length
+      ? p.positions.map(r=>r.error
+          ? `<tr><td>${esc(r.venue)}</td><td colspan="5" class="negt">${esc(r.error)}</td></tr>`
+          : `<tr><td>${esc(r.venue)}</td><td>${esc(r.symbol)}</td><td>${esc(r.side)}</td>
+             <td class="num">${r.qty}</td><td class="num">${r.entry_price}</td>
+             <td class="num ${r.unrealized_pnl>=0?'pos':'negt'}">${Number(r.unrealized_pnl).toFixed(2)}</td></tr>`).join('')
+      : '<tr><td colspan="6" class="note">No open positions reported by any venue.</td></tr>';
+  }catch(e){}
+}
+
+$('#vKind').addEventListener('change',()=>{
+  const is3c=$('#vKind').value==='3commas';
+  $('#v3cRow').style.display=is3c?'flex':'none';
+  $('#vExchange').style.display=is3c?'none':'';
+  $('#vMarket').style.display=is3c?'none':'';
+});
+
+function venueBody(){
+  const kind=$('#vKind').value;
+  const b={name:$('#vName').value.trim(),kind:kind,
+           api_key:$('#vKey').value.trim(),api_secret:$('#vSecret').value.trim()};
+  if(kind==='ccxt'){
+    b.exchange=$('#vExchange').value;
+    b.market_type=$('#vMarket').value;
+    if($('#vPass').value.trim()) b.password=$('#vPass').value.trim();
+  }else{
+    if($('#vAccount').value.trim()) b.account_id=$('#vAccount').value.trim();
+    b.manages_positions=$('#vManaged').checked;
+  }
+  return b;
+}
+
+async function saveVenue(){
+  const b=venueBody();
+  if(!b.name){ $('#vMsg').textContent='name is required'; return; }
+  $('#vMsg').textContent='saving…';
+  const r=await POST('/api/venues',b);
+  if(!r){ $('#vMsg').textContent='needs the control token'; return; }
+  const h=r.health||{};
+  $('#vMsg').textContent = h.authenticated ? 'saved and authenticated'
+    : h.reachable ? 'saved; reachable but not authenticated — '+(h.detail||'check the key')
+    : 'saved; NOT reachable — '+(h.detail||'').slice(0,120);
+  ['vKey','vSecret','vPass'].forEach(i=>$('#'+i).value='');
+  loadVenues();
+}
+
+async function probeVenue(){
+  // Reachability with no credentials: answers "is this exchange usable from
+  // where the bot runs" before anyone pastes a key.
+  const b=venueBody(); b.name='__probe'; b.api_key=''; b.api_secret='';
+  $('#vMsg').textContent='probing…';
+  const r=await POST('/api/venues',b);
+  if(!r){ $('#vMsg').textContent='needs the control token'; return; }
+  const h=r.health||{};
+  $('#vMsg').textContent = h.reachable
+    ? `reachable, ${h.latency_ms}ms from here`
+    : `NOT reachable from here: ${(h.detail||'').slice(0,140)}`;
+  await POST('/api/venues/__probe/delete');
+  loadVenues();
+}
+
+async function testVenue(n){
+  $('#vMsg').textContent='testing '+n+'…';
+  const r=await POST('/api/venues/'+encodeURIComponent(n)+'/test');
+  if(r){ const h=r.health||{};
+    $('#vMsg').textContent=`${n}: reachable=${h.reachable} auth=${h.authenticated} ${h.latency_ms||'—'}ms ${h.detail||''}`; }
+  loadVenues();
+}
+
+async function armVenue(n,enable){
+  if(enable && !confirm(
+    `Arm ${n} for execution?\n\nThe engine will be able to place real orders on this venue.\n`+
+    `Every rail still applies, and the promotion gate still governs live mode.`)) return;
+  await POST('/api/venues/'+encodeURIComponent(n)+'/trading',{enabled:!!enable});
+  loadVenues();
+}
+
+async function delVenue(n){
+  if(!confirm('Remove venue '+n+'? Stored credentials are deleted.')) return;
+  await POST('/api/venues/'+encodeURIComponent(n)+'/delete');
+  loadVenues();
+}
 
 /* ---------- shared renderers ---------- */
 function statCard(label,val,sub,color){return `<div class="card"><div class="label">${esc(label)}</div>

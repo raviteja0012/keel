@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# SLC Bot watchdog — keeps server.py and news_agent.py running.
+# Keel watchdog — keeps server.py and news_agent.py running.
 #
 #   ./watchdog-install.sh          install + start (auto-restart on crash,
 #                                  auto-start at login, Mac kept awake)

@@ -1,4 +1,4 @@
-# SLC Trading Bot
+# Keel
 
 Automated implementation of the SLC price action playbook (`../SLC-Price-Action-Playbook.md`)
 with paper/live trading through MetaTrader 5, a self-tuning agent, a news agent, an optional

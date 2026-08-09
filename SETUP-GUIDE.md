@@ -103,7 +103,7 @@ Your existing MT5DataBridge/8765 system is not touched by anything below.
    1. Telegram → search **@BotFather** → `/newbot` → name it → copy the **token**.
    2. Open your new bot's chat and send it any message (required once, so it may reply).
    3. Search **@userinfobot** → it replies with your numeric **chat ID**.
-   4. Dashboard → Telegram panel → paste both → toggle **Enabled** → **Save** → **Send test message** → check Telegram for "✅ SLC Trading Bot — Telegram connected."
+   4. Dashboard → Telegram panel → paste both → toggle **Enabled** → **Save** → **Send test message** → check Telegram for "✅ Keel — Telegram connected."
 4. Trading mode in the header is **PAPER** already — leave it.
 
 ---

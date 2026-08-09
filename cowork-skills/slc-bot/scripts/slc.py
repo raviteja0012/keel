@@ -56,7 +56,7 @@ def cmd_status():
     acct = feed.get("account", {}) or {}
     eq = acct.get("equity", bal)
     opn = st.get("open_trades", []) or []
-    print("📊 SLC Bot — %s | EA: %s"
+    print("📊 Keel — %s | EA: %s"
           % ("LIVE" if bal is None else "paper",
              "connected" if st.get("ea_connected") else "NOT connected"))
     print("   Balance %s | Equity %s | Open PnL %s | Shadow tracking %s"

@@ -1,4 +1,4 @@
-"""TradingView Context Module — SLC Bot
+"""TradingView Context Module — Keel
 
 Fetches daily indicator snapshot from TradingView's public scanner API
 for all enabled + watch pairs. Cached to state/tv_context.json and

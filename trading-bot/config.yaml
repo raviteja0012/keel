@@ -1,5 +1,5 @@
 # ===================================================================
-# SLC Trading Bot — configuration
+# Keel — configuration
 # Values here are STARTUP defaults. Anything also shown in the
 # dashboard Settings panel is runtime-tunable and stored in the DB;
 # the DB value wins after first run.

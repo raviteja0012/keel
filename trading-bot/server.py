@@ -1,4 +1,4 @@
-"""SLC Trading Bot server.
+"""Keel server.
 
   python server.py            # that's it — one process runs everything:
     - HTTP endpoints for the SLCDataBridge EA (feed, bars, pairs, commands)
@@ -621,7 +621,7 @@ if __name__ == "__main__":
     host = os.environ.get("SLC_HOST", CFG["server"]["host"])
     port = int(os.environ.get("SLC_PORT", CFG["server"]["port"]))
     print("=" * 60)
-    print(" SLC Trading Bot")
+    print(" Keel")
     print(" Dashboard : http://localhost:%d" % port)
     print(" EA target : http://<this-machine-ip>:%d" % port)
     print("=" * 60)

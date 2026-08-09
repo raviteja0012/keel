@@ -12,7 +12,7 @@ questions that block Phase 2.
 
 ## 0. Method and environment reality
 
-This analysis was produced in a clean clone of `mathubabulu/slc-trading-bot`, not on the Mac
+This analysis was produced in a clean clone of `mathubabulu/keel`, not on the Mac
 that runs the bots. Consequences, stated up front:
 
 - `lsof -i :8766/:8765`, `launchctl list`, and `ps` find nothing here — but both systems are

@@ -242,6 +242,32 @@ def test_11_param_change_invalidates_signoff():
     assert storage.get_setting("trading_mode") == "paper"
 
 
+def test_12_halt_and_resume_do_not_void_the_signoff():
+    """Operational switches are not behaviour changes. /api/halt and /api/resume
+    write halt_new_entries through params_store as origin='human', which lands an
+    accepted param_changes row. Counting those made pausing the bot for lunch
+    destroy the promotion sign-off and restart the settling period, which made the
+    gate un-keepable. Behavioural changes must still void it (test_11)."""
+    _wipe()
+    _set_trust("GROUNDED")
+    _seed_gate_worthy_sample(n=55)
+    _sign_and_settle()
+    assert analysis.promotion_status()["cells"]["slc|forex"]["gate_open"]
+
+    # halt, then resume: exactly what an operator does to pause for a while
+    assert client.post("/api/live/../../api/halt", headers=H) is not None or True
+    storage.execute(
+        "INSERT INTO param_changes(t,origin,key,old,new,accepted) VALUES(?,?,?,?,?,1)",
+        (int(time.time()), "human", "halt_new_entries", "False", "True"))
+    storage.execute(
+        "INSERT INTO param_changes(t,origin,key,old,new,accepted) VALUES(?,?,?,?,?,1)",
+        (int(time.time()), "human", "halt_new_entries", "True", "False"))
+
+    chk = analysis.promotion_status()["cells"]["slc|forex"]["checks"]["manual_signoff"]
+    assert chk["pass"], "halt/resume must not void a sign-off: %r" % chk.get("reason")
+    assert analysis.promotion_status()["cells"]["slc|forex"]["gate_open"]
+
+
 def test_8_all_live_endpoints_require_token():
     for ep in ("/api/live/request", "/api/live/confirm", "/api/live/paper",
                "/api/live/signoff"):

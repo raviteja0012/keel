@@ -50,3 +50,7 @@ secrets.*
 # legacy build runtime (reference build is code+docs+dataset only)
 legacy/pattern-strategy-fastapi/trading-bot/state/
 legacy/pattern-strategy-fastapi/trading-bot/data/
+
+# Integrity-check log: runtime evidence. A committed GROUNDED line would
+# satisfy the data-trust gate forever.
+hallucination_check.jsonl

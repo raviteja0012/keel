@@ -6,9 +6,9 @@ name: tests
 
 on:
   push:
-    branches: [main]     # branch pushes are covered by pull_request; running
-  pull_request:          # both duplicated every check on the same commit
-  workflow_dispatch:
+    branches: [main, dev]  # dev is the integration branch: work lands there
+  pull_request:            # first, so it has to be verified there too. Feature
+  workflow_dispatch:       # branches are covered by pull_request.
 
 permissions:
   contents: read

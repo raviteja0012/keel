@@ -1,4 +1,4 @@
-# SLC Price Action Trading Bot
+# Keel
 
 Automated implementation of the **SLC price-action playbook** (*Structure · Liquidity · Confirmation*)
 for Forex, metals and crypto. A single Python process ingests live data from MetaTrader 5, runs the

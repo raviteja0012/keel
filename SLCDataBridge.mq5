@@ -986,7 +986,7 @@ string BuildPayload()
 
       if(i > 0) j += ",";
       j += "{";
-      j += "\"ticket\":"         + IntegerToString((int)ticket)                                           + ",";
+      j += "\"ticket\":"         + IntegerToString((long)ticket)                                           + ",";
       j += "\"symbol\":\""       + EscapeJSON(PositionGetString(POSITION_SYMBOL))                         + "\",";
       j += "\"side\":\""         + side                                                                   + "\",";
       j += "\"lots\":"           + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2)                  + ",";
@@ -1028,8 +1028,8 @@ string BuildPayload()
       firstDeal = false;
 
       j += "{";
-      j += "\"ticket\":"      + IntegerToString((int)dTicket)                                           + ",";
-      j += "\"position_id\":" + IntegerToString((int)HistoryDealGetInteger(dTicket, DEAL_POSITION_ID))  + ",";
+      j += "\"ticket\":"      + IntegerToString((long)dTicket)                                           + ",";
+      j += "\"position_id\":" + IntegerToString((long)HistoryDealGetInteger(dTicket, DEAL_POSITION_ID))  + ",";
       j += "\"symbol\":\""    + EscapeJSON(HistoryDealGetString(dTicket, DEAL_SYMBOL))                  + "\",";
       j += "\"side\":\""      + side                                                                    + "\",";
       j += "\"lots\":"        + DoubleToString(HistoryDealGetDouble(dTicket, DEAL_VOLUME), 2)           + ",";

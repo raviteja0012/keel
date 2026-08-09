@@ -26,7 +26,7 @@ Project name / description / instructions.
 | Extra docs | strategy-study corpus + 100+ validation PNGs | LICENSE, SECURITY, ONBOARDING, dev-history |
 
 They share **zero identical files**. The dev-history confirms the bot was rebranded
-"SLC Bot → Pattern Strategy" — same strategy, two independent implementations. **Do not
+"Keel → Pattern Strategy" — same strategy, two independent implementations. **Do not
 file-merge the two `trading-bot/` trees** (Flask+SQLite vs FastAPI+JSON would break both).
 
 ---
@@ -90,7 +90,7 @@ Split a strategy into its own repo only if it ever needs a separate release cade
 The repo content is the scrubbed **`slc-trading-bot_github-ready.zip`** (already has README,
 LICENSE, SECURITY, a clean `.gitignore`, and an initial commit). Set these in the GitHub UI:
 
-- **Repository name:** `slc-trading-bot`  *(alt if you go full multi-strategy platform later: `proaxive-trading-system`)*
+- **Repository name:** `keel`  *(alt if you go full multi-strategy platform later: `proaxive-trading-system`)*
 - **Visibility:** **Private — required.** `LICENSE.md` is proprietary (© Proaxive / Shakeeb Ahmed) and the original DB held live creds.
 - **Description (About):**
   > SLC (Structure · Liquidity · Confirmation) price-action trading bot for FX, metals & crypto — MT5 data bridge, Flask dashboard, Telegram/Discord alerts, bounded self-tuning + news agents. Paper now, built to go live.
@@ -100,8 +100,8 @@ LICENSE, SECURITY, a clean `.gitignore`, and an initial commit). Set these in th
 
 **Push it** (the zip is already a git repo with a commit):
 ```bash
-unzip slc-trading-bot_github-ready.zip && cd slc-trading-bot
-git remote add origin git@github.com:<you-or-org>/slc-trading-bot.git
+unzip slc-trading-bot_github-ready.zip && cd keel
+git remote add origin git@github.com:<you-or-org>/keel.git
 git branch -M main && git push -u origin main
 ```
 > Note: GitHub's web "Upload files" commits *files*, not a `.zip` (a zip just lands as a binary).
@@ -124,7 +124,7 @@ FX, metals *and* crypto). Recommended:
 Both paragraphs you wrote are accurate against the playbook and rails — they only repeat each
 other. Use this single version:
 
-> We're building the **SLC Price Action Trading Bot** toward live trading. It's a Python + MT5
+> We're building the **Keel** toward live trading. It's a Python + MT5
 > system trading FX, metals and crypto on a pure price-action playbook (Structure · Liquidity ·
 > Confirmation), currently running in **paper mode**. The objective: develop and harden the
 > strategy, validate it forward in paper until it clears the go-live gate (**≥50 closed trades
@@ -134,7 +134,7 @@ other. Use this single version:
 > with new strategies, and make the go-live call. **North star: `SLC-Price-Action-Playbook.md`.**
 
 ### Instructions — your current doc is accurate; add three things
-The `SLC Trading Bot — Project Instructions` you're using checks out against the canonical SLC
+The `Keel — Project Instructions` you're using checks out against the canonical SLC
 build (port 8766, `SLCDataBridge` v2.30 magic 770001, Flask/engine/strategy/storage/agent, paper
 / swing / 1% / RR 2.5 / ATR 0.35 / −2% / −5% / vol_mult 1.0 / 22 pairs, secrets in DB+state,
 clean `config.yaml`, the 7 rails, open items). Keep all of it. Add these to match where you're
@@ -147,7 +147,7 @@ taking it:
    > *Scope is expanding to multiple strategies. SLC is strategy #1. New strategies are added as isolated modules behind the shared engine and the GLOBAL risk rails — never duplicate or fork the rails per strategy, and never let one strategy's tuning affect another. Each new strategy clears its own ≥50-trade positive-expectancy paper gate before live.*
 
 3. **A canonical-source note:**
-   > *The `slc-trading-bot` GitHub repo (the SLC/Flask/SQLite build, port 8766) is the source of truth. The older FastAPI/8765 `Pattern-Strategy` snapshot is superseded — don't merge its code; only its labeled dataset + validation gallery are kept as reference.*
+   > *The `keel` GitHub repo (the SLC/Flask/SQLite build, port 8766) is the source of truth. The older FastAPI/8765 `Pattern-Strategy` snapshot is superseded — don't merge its code; only its labeled dataset + validation gallery are kept as reference.*
 
 ---
 

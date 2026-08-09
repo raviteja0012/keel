@@ -57,7 +57,7 @@ async def _lifespan(_app):
     yield
 
 
-app = FastAPI(title="SLC multi-asset dashboard", docs_url=None, redoc_url=None,
+app = FastAPI(title="Keel multi-asset dashboard", docs_url=None, redoc_url=None,
               lifespan=_lifespan)
 
 
@@ -179,6 +179,68 @@ def api_settings():
     return {"settings": s, "bounds": {k: list(v) for k, v in params_store.BOUNDS.items()}}
 
 
+# -------------------------------------------------------------- venues
+# Reads are open like every other read view. Everything that changes a venue,
+# and above all arming one for execution, is token-gated.
+@app.get("/api/venues")
+def api_venues():
+    """Every ccxt exchange is offered, deliberately. Which ones are reachable
+    depends on where the bot is running, not on this code: binance.com is 451
+    from the US and fine from India. The health check reports per-location
+    reality; nothing here is allow-listed by geography."""
+    import venues
+    import brokers
+    exchanges = []
+    try:
+        import ccxt
+        exchanges = sorted(ccxt.exchanges)
+    except ImportError:
+        pass
+    return {"venues": venues.list_venues(), "kinds": brokers.kinds(),
+            "exchanges": exchanges, "health": venues.health_all()}
+
+
+@app.get("/api/venues/positions")
+def api_venue_positions():
+    """What the VENUES say we hold, for reconciliation against the local book."""
+    import venues
+    return {"positions": venues.positions_all()}
+
+
+@app.post("/api/venues", dependencies=[Depends(require_token)])
+def api_venue_upsert(body: Dict[str, Any] = Body(...)):
+    import venues
+    try:
+        v = venues.upsert(body)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "venue": v, "health": venues.health(v["name"])}
+
+
+@app.post("/api/venues/{name}/test", dependencies=[Depends(require_token)])
+def api_venue_test(name: str):
+    import venues
+    return {"health": venues.health(name)}
+
+
+@app.post("/api/venues/{name}/trading", dependencies=[Depends(require_token)])
+def api_venue_trading(name: str, body: Dict[str, Any] = Body(...)):
+    """Arm or disarm execution on a venue. Separate from adding it on purpose:
+    pasting an API key must never be the same act as enabling live orders."""
+    import venues
+    try:
+        return {"ok": True, "venue": venues.set_trading_enabled(
+            name, bool(body.get("enabled", False)))}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/venues/{name}/delete", dependencies=[Depends(require_token)])
+def api_venue_delete(name: str):
+    import venues
+    return {"ok": venues.remove(name)}
+
+
 # ------------------------------------------------------------- controls
 @app.post("/api/params", dependencies=[Depends(require_token)])
 def api_set_params(body: Dict[str, Any] = Body(...)):
@@ -252,7 +314,7 @@ if __name__ == "__main__":
     cfg = _load_cfg()
     tok = get_token()
     print("=" * 60)
-    print(" SLC multi-asset dashboard")
+    print(" Keel multi-asset dashboard")
     print(" URL   : http://%s:%d" % (cfg["host"], cfg["port"]))
     print(" Token : %s (controls only; env DASHBOARD_TOKEN overrides)"
           % (_TOKEN_FILE if not os.environ.get("DASHBOARD_TOKEN") else "from env"))
