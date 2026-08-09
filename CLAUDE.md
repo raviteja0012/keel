@@ -1,4 +1,4 @@
-# CLAUDE.md — SLC Trading Bot
+# CLAUDE.md — Keel
 
 Canonical instructions for Claude Code (and any AI agent) working in this repo. Read this
 before touching anything. The chat-side Claude Project mirrors these rules; this file is the

@@ -97,7 +97,7 @@ def send_test() -> dict:
             r = requests.post(
                 "https://api.telegram.org/bot%s/sendMessage" % token,
                 json={"chat_id": chat_id, "parse_mode": "HTML",
-                      "text": HEADER + "✅ <b>SLC Trading Bot</b> — Telegram connected."},
+                      "text": HEADER + "✅ <b>Keel</b> — Telegram connected."},
                 timeout=10,
             )
             j = r.json()
@@ -110,7 +110,7 @@ def send_test() -> dict:
     if url:
         try:
             r = requests.post(url, json={
-                "content": "⚡ **[SLC BOT]**\n✅ **SLC Trading Bot** — Discord connected."},
+                "content": "⚡ **[SLC BOT]**\n✅ **Keel** — Discord connected."},
                 timeout=10)
             results.append("Discord ✅" if r.status_code in (200, 204)
                            else "Discord ❌ HTTP %s" % r.status_code)

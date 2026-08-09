@@ -16,7 +16,7 @@ description: >
 
 ---
 
-# SLC Trading Bot — operate & develop
+# Keel — operate & develop
 
 This skill drives the project's trading bot. It has three **sectors**; read only the
 reference file for the sector you need (progressive disclosure keeps this fast and cheap):

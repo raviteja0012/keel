@@ -1,4 +1,4 @@
-# SLC Price Action Trading Bot — Development History
+# Keel — Development History
 
 *Reconstructed from the project's Cowork chat sessions and repository files. Dates and figures
 are taken from the chats, reports, and file timestamps; where the chats disagreed with each
@@ -9,7 +9,7 @@ than resolved.*
 
 ## What this project is
 
-The **SLC Price Action Trading Bot** is an automated implementation of a hand-written trading
+The **Keel** is an automated implementation of a hand-written trading
 playbook, the *SLC System — Structure · Liquidity · Confirmation* (`SLC-Price-Action-Playbook.md`).
 The strategy is "pure price action": it never asks *why* price moved, only *where structure broke,
 where liquidity sits, and whether the market confirmed intent*. One rule set runs at three speeds
@@ -32,7 +32,7 @@ news_agent.py (separate process)  ── Google-News RSS monitor → SL manageme
 
 Later additions include four Cowork "skills" for operating the bot conversationally, several
 scheduled guardian jobs, and a number of strategy refinements validated forward in shadow/paper
-before any live use. The system was rebranded part-way through from "SLC Bot" to **"Pattern
+before any live use. The system was rebranded part-way through from "Keel" to **"Pattern
 Strategy"** (a notification header and the addition of explicit chart-pattern detection), though
 the underlying SLC engine stayed the same.
 

@@ -57,7 +57,7 @@ async def _lifespan(_app):
     yield
 
 
-app = FastAPI(title="SLC multi-asset dashboard", docs_url=None, redoc_url=None,
+app = FastAPI(title="Keel multi-asset dashboard", docs_url=None, redoc_url=None,
               lifespan=_lifespan)
 
 
@@ -314,7 +314,7 @@ if __name__ == "__main__":
     cfg = _load_cfg()
     tok = get_token()
     print("=" * 60)
-    print(" SLC multi-asset dashboard")
+    print(" Keel multi-asset dashboard")
     print(" URL   : http://%s:%d" % (cfg["host"], cfg["port"]))
     print(" Token : %s (controls only; env DASHBOARD_TOKEN overrides)"
           % (_TOKEN_FILE if not os.environ.get("DASHBOARD_TOKEN") else "from env"))

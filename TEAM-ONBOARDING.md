@@ -16,7 +16,7 @@ is just an honest implementation of it.
 
 ```bash
 unzip SLC-Trading-Bot-team-archive.zip
-cd slc-trading-bot/trading-bot
+cd keel/trading-bot
 pip install -r requirements.txt
 python3 server.py
 ```
