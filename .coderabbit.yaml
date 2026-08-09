@@ -1,0 +1,92 @@
+# CodeRabbit review config, ported from it-pylon and retuned for a system that
+# places trades. The generic value of an AI reviewer is catching sloppiness; the
+# specific value here is catching a weakened rail, so the path_instructions below
+# point it at the six files where a mistake reaches money.
+language: en-US
+
+reviews:
+  profile: assertive
+  high_level_summary: true
+  auto_review:
+    enabled: true
+    drafts: false
+  finishing_touches:
+    docstrings:
+      enabled: true
+    unit_tests:
+      enabled: true
+
+  auto_title_instructions: |
+    Generate titles as Conventional Commits: type(scope): description, using only
+    these types: feat, fix, perf, revert, chore, docs, style, refactor, test, ci,
+    build.
+
+  pre_merge_checks:
+    title:
+      mode: error
+      requirements: |
+        PR title must be a Conventional Commit: type(scope): description
+        (scope optional; "!" before the colon marks a breaking change).
+
+  path_instructions:
+    - path: "trading-bot/engine.py"
+      instructions: |
+        This is the SOLE execution choke point. Every risk rail lives here.
+        Flag as blocking if the change:
+          - moves any rail into a strategy or a venue adapter
+          - introduces a risk multiplier that can RAISE risk (every factor must
+            be guarded `if factor < 1.0`)
+          - makes an uncertainty path fail OPEN instead of standing aside
+          - widens or loosens a stop under any condition
+          - reads a value that could be NULL and treats the null case as the
+            permissive branch (this exact bug shipped once in loss_governor)
+
+    - path: "trading-bot/params_store.py"
+      instructions: |
+        The only parameter write path. Whitelists and hard code ceilings.
+        Flag as blocking if a change widens a whitelist, raises a ceiling
+        constant, or lets an origin write a key it could not write before.
+        The agent whitelist must never gain risk_pct, stops, max_concurrent,
+        or trading_mode.
+
+    - path: "trading-bot/live_switch.py"
+      instructions: |
+        The only path to live trading. Two-step, promotion-gated, token-gated.
+        Flag as blocking if a change removes a confirmation step, lengthens the
+        confirm TTL, skips re-validation at confirm time, or creates any second
+        route to trading_mode = live. De-escalation back to simulated must never
+        become harder than escalation.
+
+    - path: "trading-bot/analysis.py"
+      instructions: |
+        Contains the promotion gate. Every check must fail CLOSED. Flag if a
+        check can pass on missing or malformed data, if a sign-off can satisfy
+        the gate without ageing, or if a sign-off survives a later parameter
+        or strategy-version change.
+
+    - path: "trading-bot/brokers/**"
+      instructions: |
+        Venue adapters. An adapter transmits; it never decides.
+        Flag as blocking if an adapter sizes a position, applies or skips a risk
+        check, or overrides a stop. Also flag if place_order is not idempotent on
+        client_order_id: a dropped response must be safe to retry, and a blind
+        retry that could double-fill is the most expensive bug in this codebase.
+        Symbol metadata (tick size, lot step, min notional) must be read from the
+        venue, never guessed or defaulted.
+
+    - path: "trading-bot/tests/**"
+      instructions: |
+        If an EXISTING test was changed rather than added, say so prominently and
+        ask why the old expectation was wrong. A test relaxed to let new behaviour
+        through is how a rail gets weakened quietly. New tests for new refusals
+        are good; loosened assertions on existing refusals are suspicious.
+
+    - path: "SLCDataBridge.mq5"
+      instructions: |
+        MT5 expert advisor. AllowTradeExecution defaults false and is half of the
+        double gate to live. Flag any change to that default, to MaxLotsPerTrade,
+        to MaxOpenPositions, or to the EA-side refusal of stop changes that loosen
+        a stop.
+
+chat:
+  auto_reply: true

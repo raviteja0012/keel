@@ -1,0 +1,47 @@
+# Git hooks, ported from it-pylon and adapted for Python. Install with:
+#   lefthook install
+#
+# The point is not lint. It is that the two most expensive mistakes in this repo
+# (a committed credential, a rail changed without a test) are caught before the
+# commit exists rather than after it is pushed. Same checks CI runs, just earlier.
+output:
+  - summary
+  - failure
+
+pre-commit:
+  parallel: true
+  commands:
+    no-runtime-state:
+      # data/ holds the SQLite DB with live credentials; state/ holds logs.
+      # Neither may ever enter git. This is the single highest-cost mistake here.
+      run: |
+        bad=$(echo "{staged_files}" | tr ' ' '\n' | grep -E 'trading-bot/(data|state)/' || true)
+        if [ -n "$bad" ]; then
+          echo "REFUSED: runtime state is staged. These hold live credentials."
+          echo "$bad"; exit 1
+        fi
+
+    no-secrets:
+      run: bash scripts/guard-secrets.sh {staged_files}
+
+    rails-need-tests:
+      # Not a block: a prompt. Changing a rail without touching a test is
+      # usually a miss, and the moment to notice is now, not in review.
+      glob: "trading-bot/{engine,params_store,live_switch,analysis,storage}.py"
+      run: bash scripts/guard-rails-tested.sh {staged_files}
+
+    compile:
+      glob: "*.py"
+      run: python -m py_compile {staged_files}
+
+pre-push:
+  commands:
+    suite:
+      # The full suite is seconds, so there is no excuse for pushing it red.
+      run: |
+        cd trading-bot
+        fail=0
+        for t in tests/test_*.py; do
+          python "$t" >/dev/null 2>&1 || { echo "FAILED: $t"; fail=1; }
+        done
+        [ "$fail" = "0" ] && echo "all suites green" || exit 1
