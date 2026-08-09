@@ -54,3 +54,15 @@ legacy/pattern-strategy-fastapi/trading-bot/data/
 # Integrity-check log: runtime evidence. A committed GROUNDED line would
 # satisfy the data-trust gate forever.
 hallucination_check.jsonl
+
+# Backups written by scripts/deploy/keel-backup.sh. These contain trading.db
+# (whose settings table holds venue api_key/api_secret in cleartext) and
+# state/dashboard_token (the live control-plane credential). The deploy path
+# makes the trading host a git checkout, so one 'git add -A' on that host would
+# push both to the remote. '*.db' does not match '*.db.gz', which is how this
+# was missed.
+backups/
+*.db.gz
+*.db-*.gz
+keel-db-*.gz
+keel-state-*.tar.gz
