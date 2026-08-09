@@ -595,7 +595,10 @@ sys.exit(3)
 
     Write-Output ''
     Write-Output ($pass.ToString() + ' passed, ' + $fail.ToString() + ' failed')
+    # Explicit, both ways: a child process above left its own code in
+    # $LASTEXITCODE and the script would otherwise exit with that.
     if ($fail -gt 0) { exit 1 }
+    exit 0
 }
 
 

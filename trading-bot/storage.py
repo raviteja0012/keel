@@ -139,6 +139,11 @@ CREATE INDEX IF NOT EXISTS idx_news_events_t ON news_events(t);
 _MIGRATIONS = [
     ("trades", "strategy", "TEXT"),
     ("trades", "asset_class", "TEXT"),
+    # Round-turn cost deducted from a paper close: commission, taker fee and
+    # slippage. Recorded rather than merely subtracted so the gross and net
+    # numbers stay reconcilable, and so a suspicious cost is visible in the
+    # trade row instead of hiding inside the P&L.
+    ("trades", "costs", "REAL DEFAULT 0"),
     ("signals", "strategy", "TEXT"),
     ("commands", "expires_at", "INTEGER"),   # honored by next_command
     ("commands", "sent_t", "INTEGER"),

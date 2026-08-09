@@ -234,6 +234,47 @@ def open_pnl_total() -> float:
 
 
 # ----------------------------------------------------- loss limits
+def round_turn_cost(tr: Dict[str, Any], price: float) -> float:
+    """What the round turn costs, in account currency. Never negative.
+
+    Paper P&L was pure price movement while live P&L reads profit + commission +
+    swap off the broker deal. So the 50-trade sample that opens the promotion gate
+    was measured GROSS and the live results it is meant to predict are NET. At a
+    profit factor near 1.1 that difference is the whole edge, and the gate would
+    happily certify a strategy whose net expectancy is negative.
+
+    Three components, because the venues charge differently:
+      per-lot commission   how MT5 brokers usually bill FX and metals
+      taker fee on notional  how every crypto exchange bills, 0.10% to 1.20%
+      slippage             a fixed haircut per side; entering and exiting at the
+                           mid price is a fiction no live account gets
+
+    Defaults are deliberately non-zero. A cost model that defaults to free is the
+    same bug in a nicer suit."""
+    s = storage.all_settings()
+    p = feed_state["prices"].get(tr["symbol"], {})
+    tick_size = p.get("tick_size") or 0
+    tick_value = p.get("tick_value") or 0
+    lots = float(tr.get("lots") or 0)
+
+    commission = float(s.get("paper_commission_per_lot", 7.0)) * lots
+
+    taker = float(s.get("paper_taker_fee_pct", 0.0))
+    notional = 0.0
+    if taker and tick_size > 0 and tick_value > 0:
+        # value of a 1.0 price move, scaled to the traded price on both sides
+        per_price_unit = tick_value / tick_size * lots
+        notional = (abs(tr.get("entry") or 0) + abs(price or 0)) * per_price_unit
+    fee = notional * taker / 100.0
+
+    slip_pts = float(s.get("paper_slippage_points", 1.0))
+    slippage = 0.0
+    if slip_pts and tick_size > 0 and tick_value > 0:
+        slippage = 2 * slip_pts * tick_value * lots      # entry side and exit side
+
+    return round(max(0.0, commission + fee + slippage), 4)
+
+
 def tp1_partial_taken(tr: Dict[str, Any]) -> bool:
     """Was half the position ACTUALLY banked at TP1, or only the stop moved?
 
@@ -680,13 +721,24 @@ def _close_paper(tr: Dict, price: float, reason: str) -> None:
     if tp1_partial_taken(tr):
         banked = abs(tr["entry"] - tr["initial_sl"]) / tick_size * tick_value * tr["lots"]
         pnl = pnl * 0.5 + banked * 0.5
+    # Costs come off BEFORE the R-multiple is taken, because R is what the
+    # promotion gate reads. A gate measuring gross R while live pays net is a gate
+    # that certifies strategies which lose money.
+    cost = round_turn_cost(tr, price)
+    pnl -= cost
+
     risk_dist = abs(tr["entry"] - tr["initial_sl"])
-    r_mult = (move / risk_dist) if risk_dist > 0 else 0
-    if tp1_partial_taken(tr):
-        r_mult = 0.5 * 1.0 + 0.5 * r_mult
+    risk_amt = abs(risk_dist / tick_size * tick_value * tr["lots"]) if tick_size > 0 else 0
+    if risk_amt > 0:
+        r_mult = pnl / risk_amt                  # net R, straight from net money
+    else:
+        r_mult = (move / risk_dist) if risk_dist > 0 else 0
+        if tp1_partial_taken(tr):
+            r_mult = 0.5 * 1.0 + 0.5 * r_mult
     storage.update_trade(tr["id"], {
         "status": "closed", "exit_time": int(time.time()), "exit_price": price,
         "pnl": round(pnl, 2), "r_multiple": round(r_mult, 2), "exit_reason": reason,
+        "costs": cost,
     })
     if tr["mode"] == "shadow":
         return                                  # silent sample collection
