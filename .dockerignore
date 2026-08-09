@@ -1,0 +1,69 @@
+# Docker build context filter — deny-all, then allow.
+#
+# WHY deny-all instead of a list of exclusions: the build context does NOT read
+# .gitignore. `trading-bot/data/` holds trading.db, whose `settings` table
+# carries venue api_key/api_secret/password in cleartext (venues.py
+# _SECRET_FIELDS), and `trading-bot/state/` holds `dashboard_token` (0600) and
+# the news-agent logs. A deny-list leaks the day someone adds a new secret path
+# and forgets to come back here. With deny-all, a file that nobody has
+# explicitly allowed cannot enter a layer, so the failure mode of forgetting is
+# a missing file at build time — loud — instead of a credential in an image
+# layer — silent, and permanent once pushed.
+#
+# An image layer is forever: `docker history` and any registry copy keep it
+# even after a later layer deletes the file. Treat every line below as a
+# decision about what is safe to publish.
+
+# ---- deny everything at the root -------------------------------------------
+*
+
+# ---- allow only what the runtime imports -----------------------------------
+!trading-bot
+
+# The container's PID 1, its healthcheck and the dashboard launcher are COPYed
+# from here. Only this subdirectory: scripts/windows/ is PowerShell for the
+# retired MT5 host and has no business in a Linux image.
+!scripts/deploy
+
+# ---- ...minus the parts of trading-bot/ that must never ship ----------------
+# Runtime state. data/ = the SQLite DB (credentials, trade history).
+# state/ = dashboard_token, logs, decision traces.
+trading-bot/data
+trading-bot/state
+trading-bot/.backups
+
+# trading-bot/tests/ is deliberately KEPT. It is a few KB of pure Python with
+# no network and no venue, and shipping it is what lets the runbook prove the
+# image itself is sound (`docker compose run --rm engine python
+# tests/test_risk_rails.py`) rather than trusting that a green CI run on a
+# GitHub runner says anything about this artefact.
+
+# Bytecode compiled against another platform's Python.
+**/__pycache__
+**/*.py[cod]
+
+# Belt and braces: even if one of the directory rules above is ever edited
+# away, no database, log, token or dotenv file can ride along.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.corrupt-*
+**/*.bad-*
+**/*.log
+**/.env
+**/*.env
+**/secrets.*
+**/*secret*.yaml
+**/*secret*.yml
+**/dashboard_token
+**/hallucination_check.jsonl
+
+# config.yaml ships (it is startup defaults only, and CLAUDE.md forbids
+# secrets in it). config.example.yaml is the committed template — redundant
+# inside the image.
+trading-bot/config.example.yaml
+
+# The MT5 leg is retired as the primary path (docs/DEPLOYMENT-LINUX.md §1).
+# The EA is a Windows/MQL5 artefact that a Linux container can never run;
+# 90 KB of it in every layer buys nothing.
+**/*.mq5

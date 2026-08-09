@@ -1,6 +1,13 @@
-"""SLC engine: consumes MT5 feed/bars, generates signals, executes them
-on the paper broker or via live EA commands, and manages open trades
-(TP1 -> break-even -> structure trail).
+"""SLC engine: consumes prices from every configured source, generates
+signals, executes them on the paper broker or via live EA commands, and
+manages open trades (TP1 -> break-even -> structure trail).
+
+Prices arrive two ways and are merged into one book: pushed by the MT5 EA
+(`ingest_feed`) and polled from venue adapters (`refresh_venue_prices`).
+Each quote carries the source that produced it and the instant it was true,
+because staleness belongs to a SOURCE — the MT5 EA going quiet must cost you
+the symbols it quotes and nothing else, and a deployment with no MT5 at all
+must never wait for one.
 
 Runs as a daemon thread started by server.py. All mutable runtime
 parameters come from storage.settings (dashboard- and agent-tunable).
@@ -29,6 +36,11 @@ try:
     _NEWS_CAL_AVAILABLE = True
 except ImportError:
     _NEWS_CAL_AVAILABLE = False
+try:
+    import venues as _venues                   # venue registry (credentials in the DB)
+    _VENUES_AVAILABLE = True
+except ImportError:                            # optional: no venue kind installed
+    _VENUES_AVAILABLE = False
 
 # Smallest position that can actually be halved at TP1. The live path already
 # gates its partial close on this (0.01 lots cannot be split), so paper must model
@@ -39,20 +51,42 @@ MIN_PARTIAL_LOTS = 0.02
 TF_SECONDS = {"15m": 900, "30m": 1800, "1h": 3600,
               "2h": 7200, "4h": 14400, "1d": 86400}
 
+# Price provenance and staleness.
+#
+# The loop used to read "the MT5 EA has not posted for 60s" as "the world has
+# stopped" and skipped the whole cycle — including stop management on positions
+# it had opened itself somewhere else entirely. Staleness is a property of a
+# SOURCE, never of the engine, so it is recorded per source and judged per
+# symbol at the point of use. MT5 is now one source among several
+# (docs/ARCHITECTURE-V3.md), and on a node that has none the engine must not
+# spend its life waiting for a feed that is never coming.
+MT5_SOURCE = "mt5"
+MT5_PRICE_MAX_AGE_S = 60        # the EA pushes every 5s; 12 missed pushes is dead
+VENUE_PRICE_MAX_AGE_S = 90      # venues are polled at the engine's own cadence
+
 # --------------------------------------------------------------------
-# Shared live state pushed by the EA (guarded by _feed_lock)
+# Shared live state: pushed by the EA, polled from venues (guarded by
+# _feed_lock). "sources" is the per-source health the staleness rails read.
 # --------------------------------------------------------------------
 _feed_lock = threading.Lock()
 feed_state: Dict[str, Any] = {
     "account": {}, "open_positions": [], "closed_today": [],
     "prices": {}, "terminal": {}, "last_feed_t": 0, "last_bars_t": 0,
+    "sources": {},
 }
 
+_stop = threading.Event()   # graceful shutdown; the loop exits after this cycle
 _notify = None          # set by server.py -> notifier.send
 _recent_keys: Dict[str, float] = {}   # signal dedup: key -> expiry ts
 _last_info: Dict[str, Dict] = {}      # symbol|mode -> last analysis info
 _tv_ctx: Dict[str, Any] = {}          # TradingView context snapshot (cached)
 _tv_ctx_t: float = 0                  # timestamp of last TV context load
+
+
+def stop() -> None:
+    """Ask the loop to finish this cycle and exit. Nothing about stopping may
+    close a position or move a stop: the venue keeps the stop it already has."""
+    _stop.set()
 
 
 def set_notifier(fn) -> None:
@@ -113,16 +147,83 @@ def _log_spread_event(tr: Dict[str, Any], max_spr: float,
         print("spread-trace log error:", e)
 
 
+# ------------------------------------------------- price sources
+def _source_rec_locked(name: str, kind: str) -> Dict[str, Any]:
+    """The health row for one price source. Caller holds _feed_lock."""
+    srcs = feed_state.setdefault("sources", {})
+    rec = srcs.get(name)
+    if rec is None:
+        rec = srcs[name] = {
+            "name": name, "kind": kind, "last_t": 0.0, "reachable": False,
+            "detail": "", "symbols": 0,
+            "max_age_s": MT5_PRICE_MAX_AGE_S if kind == "mt5"
+            else VENUE_PRICE_MAX_AGE_S,
+        }
+    rec["kind"] = kind
+    return rec
+
+
+def _set_source(name: str, kind: str, **fields: Any) -> Dict[str, Any]:
+    with _feed_lock:
+        rec = _source_rec_locked(name, kind)
+        rec.update(fields)
+        return dict(rec)
+
+
+def _write_price_locked(rec: Dict[str, Any], source: str, src_t: float,
+                        kind: str = "venue") -> bool:
+    """The ONLY writer of feed_state["prices"]. Caller holds _feed_lock.
+
+    Every quote is stamped with the source it came from and the instant it was
+    true. A rail that cannot tell WHERE a price came from cannot tell whether
+    it is still worth acting on, and stamping at the write layer is the only
+    way the answer does not depend on every caller remembering to."""
+    sym = rec.get("symbol")
+    bid, ask = rec.get("bid"), rec.get("ask")
+    if not sym or bid is None or ask is None:
+        return False
+    prev = feed_state["prices"].get(sym)
+    # An older print never overwrites a newer one, whatever source it arrived
+    # from. This is exactly how a stale venue quote would masquerade as fresh:
+    # by landing on top of a good one and inheriting its recency.
+    if prev is not None and float(prev.get("src_t") or 0) > float(src_t):
+        return False
+    p = dict(rec)
+    p["src"], p["src_t"], p["src_kind"] = source, float(src_t), kind
+    feed_state["prices"][sym] = p
+    _accum_px_window(p)              # capture intra-cycle spread + extremes
+    return True
+
+
+def merge_prices(records: List[Dict[str, Any]], source: str,
+                 kind: str = "venue") -> int:
+    """Merge quotes from a non-EA source into the same structure the EA writes,
+    so every rail downstream sees one book and cannot tell (or care) which
+    venue quoted it. Returns how many were accepted."""
+    now = time.time()
+    n = 0
+    with _feed_lock:
+        for r in records:
+            t = r.get("src_t") or now
+            if _write_price_locked(r, source, min(float(t), now), kind):
+                n += 1
+    return n
+
+
 def ingest_feed(data: Dict[str, Any]) -> None:
+    now = time.time()
     with _feed_lock:
         feed_state["account"] = data.get("account", {})
         feed_state["open_positions"] = data.get("open_positions", [])
         feed_state["closed_today"] = data.get("closed_today", [])
         feed_state["terminal"] = data.get("terminal", {})
+        n = 0
         for p in data.get("prices", []):
-            feed_state["prices"][p["symbol"]] = p
-            _accum_px_window(p)          # capture intra-cycle spread + extremes
-        feed_state["last_feed_t"] = time.time()
+            if _write_price_locked(p, MT5_SOURCE, now, kind="mt5"):
+                n += 1
+        feed_state["last_feed_t"] = now
+        rec = _source_rec_locked(MT5_SOURCE, "mt5")
+        rec.update({"last_t": now, "reachable": True, "detail": "", "symbols": n})
 
 
 def ingest_bars(data: Dict[str, Any]) -> None:
@@ -142,6 +243,244 @@ def get_feed() -> Dict[str, Any]:
 
 def get_last_info() -> List[Dict]:
     return list(_last_info.values())
+
+
+# ------------------------------------------------- staleness, per source
+def source_state(name: str, now: Optional[float] = None) -> Dict[str, Any]:
+    """Health of one price source: has it reported, how long ago, is it
+    answering. A source nobody has ever heard from is not healthy — it is
+    unknown, and unknown fails closed."""
+    now = time.time() if now is None else now
+    rec = (feed_state.get("sources") or {}).get(name)
+    if rec is None:
+        return {"name": name, "known": False, "fresh": False, "reachable": False,
+                "age": None, "reason": "%s has never reported" % name}
+    age = now - float(rec.get("last_t") or 0)
+    lim = float(rec.get("max_age_s") or MT5_PRICE_MAX_AGE_S)
+    fresh = bool(rec.get("last_t")) and age <= lim
+    reason = ""
+    if not rec.get("last_t"):
+        reason = "%s has never reported" % name
+    elif not fresh:
+        reason = "%s feed stale (%.0fs old, limit %.0fs)" % (name, age, lim)
+    elif not rec.get("reachable"):
+        reason = "%s unreachable: %s" % (name, rec.get("detail") or "no detail")
+    return {"name": name, "known": True, "fresh": fresh,
+            "reachable": bool(rec.get("reachable")), "age": age,
+            "kind": rec.get("kind"), "detail": rec.get("detail") or "",
+            "symbols": rec.get("symbols") or 0, "reason": reason}
+
+
+def price_state(symbol: str, now: Optional[float] = None) -> Dict[str, Any]:
+    """What we know about the quote for one symbol, and how much of it we are
+    entitled to believe."""
+    now = time.time() if now is None else now
+    p = feed_state["prices"].get(symbol)
+    if not p:
+        return {"price": None, "source": None, "age": None, "fresh": False,
+                "reachable": False, "reason": "no live price"}
+    src = p.get("src")
+    rec = (feed_state.get("sources") or {}).get(src) if src else None
+    src_t = float(p.get("src_t") or 0)
+    if not src_t:
+        # A quote written straight into feed_state carries no clock of its own,
+        # so there is nothing to age it against. Every writer in this module
+        # stamps; this branch exists for prices injected by a test fixture.
+        return {"price": p, "source": src, "age": None, "fresh": True,
+                "reachable": True, "reason": ""}
+    age = now - src_t
+    max_age = float((rec or {}).get("max_age_s") or MT5_PRICE_MAX_AGE_S)
+    fresh = age <= max_age
+    reachable = True if rec is None else bool(rec.get("reachable"))
+    reason = ""
+    if not fresh:
+        reason = "%s price stale (%.0fs old, limit %.0fs)" % (
+            src or "feed", age, max_age)
+    elif not reachable:
+        reason = "%s unreachable: %s" % (src, (rec or {}).get("detail") or "no detail")
+    return {"price": p, "source": src, "age": age, "fresh": fresh,
+            "reachable": reachable, "reason": reason}
+
+
+def price_if_fresh(symbol: str, now: Optional[float] = None):
+    """The quote to MANAGE an open position with. Recency is the only test: a
+    source that has since gone unreachable still told the truth about the last
+    print it gave us, and a stop breached at that print was breached."""
+    st = price_state(symbol, now)
+    return (st["price"] if st["fresh"] else None), st["reason"]
+
+
+def price_for_entry(symbol: str, now: Optional[float] = None):
+    """The quote to OPEN on. Fresh AND from a source that is still answering:
+    a venue we cannot reach is a venue we cannot trade, whatever its last
+    print said."""
+    st = price_state(symbol, now)
+    if st["fresh"] and st["reachable"]:
+        return st["price"], ""
+    return None, st["reason"] or "no live price"
+
+
+def mt5_configured() -> bool:
+    """Is there an MT5 EA in this deployment at all?
+
+    MT5 is no longer the primary path. On a Linux node there is no EA and never
+    will be, so "wait for the EA" is not a safe default there — it is a
+    permanent halt. An explicit setting wins; otherwise a feed that has ever
+    arrived, in this process or a previous one, is the evidence."""
+    try:
+        flag = storage.get_setting("mt5_enabled", None)
+    except Exception:
+        flag = None
+    if flag is not None:
+        return bool(flag)
+    if feed_state.get("last_feed_t"):
+        return True
+    try:
+        return bool(storage.get_setting("ea_last_feed_t", 0))
+    except Exception:
+        return False
+
+
+def feed_report(now: Optional[float] = None) -> Dict[str, Any]:
+    """Per-source feed health — what replaced the single question "is the EA
+    talking?" that used to gate the entire engine."""
+    now = time.time() if now is None else now
+    srcs = [source_state(n, now) for n in sorted(feed_state.get("sources") or {})]
+    healthy = [s["name"] for s in srcs if s["fresh"] and s["reachable"]]
+    degraded = [s for s in srcs if not (s["fresh"] and s["reachable"])]
+    has_mt5 = mt5_configured()
+    if has_mt5 and not any(s["name"] == MT5_SOURCE for s in srcs):
+        degraded.append(source_state(MT5_SOURCE, now))
+    if not srcs and not has_mt5:
+        note = "no price source has reported yet (no MT5 configured)"
+    elif not degraded:
+        note = "sources ok: %s" % (", ".join(healthy) or "none")
+    else:
+        note = "; ".join([s["reason"] for s in degraded if s["reason"]]) or "degraded"
+        if healthy:
+            note = "%s (still live: %s)" % (note, ", ".join(healthy))
+    return {"sources": srcs, "healthy": healthy,
+            "degraded": [s["name"] for s in degraded],
+            "mt5_configured": has_mt5, "note": note}
+
+
+# ------------------------------------------------- venue-sourced prices
+_venue_meta_cache: Dict[str, Dict[str, Any]] = {}
+_VENUE_META_TTL_S = 3600
+
+
+def _match_back(want: Dict[str, str], venue_symbol: str) -> Optional[str]:
+    """Venue spelling -> engine symbol (BTC/USDT -> BTCUSD)."""
+    if venue_symbol in want:
+        return want[venue_symbol]
+    norm = venue_symbol.replace("/", "").replace("-", "").upper()
+    for k, v in want.items():
+        if k.replace("/", "").replace("-", "").upper() == norm:
+            return v
+    return None
+
+
+def _venue_tick_meta(vname: str, adapter: Any, symbol: str) -> Dict[str, Any]:
+    """tick_size / tick_value for a venue symbol, so calc_lots sizes a venue
+    fill with the same arithmetic it uses for an MT5 fill. Metadata we cannot
+    get is left absent rather than guessed: calc_lots then returns zero lots
+    and the entry is refused, which is the honest answer to "I cannot size
+    this"."""
+    key = "%s|%s" % (vname, symbol)
+    hit = _venue_meta_cache.get(key)
+    if hit and time.time() - hit["t"] < _VENUE_META_TTL_S:
+        return dict(hit["meta"])
+    meta: Dict[str, Any] = {}
+    try:
+        m = adapter.symbol_meta(symbol)
+        ts = float(getattr(m, "tick_size", 0) or 0)
+        if ts > 0:
+            meta = {"tick_size": ts, "point": ts,
+                    "tick_value": ts * float(getattr(m, "contract_size", 1.0) or 1.0)}
+    except Exception:
+        meta = {}
+    _venue_meta_cache[key] = {"t": time.time(), "meta": meta}
+    return dict(meta)
+
+
+def venue_symbol_map(symbols: List[str]) -> Dict[str, Dict[str, str]]:
+    """{venue_name: {venue_symbol: engine_symbol}}.
+
+    Two declared routes, no inference: the instruments registry's `venue`
+    column, and an optional `symbols` list on the venue's own config row
+    ("BTCUSD" or "BTCUSD:BTC/USDT"). A symbol nobody routed stays where it
+    was — inventing a venue for it would be the engine guessing where an
+    order goes."""
+    out: Dict[str, Dict[str, str]] = {}
+    if not _VENUES_AVAILABLE or not symbols:
+        return out
+    try:
+        cfgs = {v.get("name"): v for v in _venues.list_venues()}
+    except Exception as e:
+        print("venue registry read error:", e)
+        return out
+    if not cfgs:
+        return out
+    want = set(symbols)
+    for sym in symbols:
+        meta = instruments.get(sym) or {}
+        vname = meta.get("venue") or MT5_SOURCE
+        if vname in cfgs:
+            out.setdefault(vname, {})[meta.get("venue_symbol") or sym] = sym
+    for name, cfg in cfgs.items():
+        for entry in (cfg.get("symbols") or []):
+            sym, _, vsym = str(entry).partition(":")
+            if sym in want:
+                out.setdefault(name, {})[vsym or sym] = sym
+    return out
+
+
+def refresh_venue_prices(symbols: List[str]) -> Dict[str, str]:
+    """Poll every configured venue that quotes one of `symbols` and merge the
+    result into the shared book with provenance attached.
+
+    Failures are contained to the venue that failed: an exchange that is down
+    costs you the symbols it quotes and nothing else. Returns {venue: error}."""
+    errors: Dict[str, str] = {}
+    for vname, want in venue_symbol_map(symbols).items():
+        try:
+            ad = _venues.adapter(vname)
+            ticks = list(ad.stream_prices(list(want)))
+        except Exception as e:
+            errors[vname] = str(e)[:200]
+            _set_source(vname, "venue", reachable=False,
+                        detail="unreachable: %s" % errors[vname])
+            continue
+        now = time.time()
+        recs: List[Dict[str, Any]] = []
+        for t in ticks:
+            sym = _match_back(want, str(getattr(t, "symbol", "") or ""))
+            if not sym:
+                continue
+            try:
+                bid, ask = float(t.bid), float(t.ask)
+            except (TypeError, ValueError):
+                continue
+            if bid <= 0 or ask <= 0 or ask < bid:
+                continue
+            rec: Dict[str, Any] = {"symbol": sym, "bid": bid, "ask": ask,
+                                   "src_t": float(getattr(t, "ts", 0) or now)}
+            rec.update(_venue_tick_meta(vname, ad, sym))
+            pt = float(rec.get("point") or 0)
+            rec["spread"] = int(round((ask - bid) / pt)) if pt > 0 else 0
+            recs.append(rec)
+        n = merge_prices(recs, vname, kind="venue")
+        if n:
+            _set_source(vname, "venue", reachable=True, detail="",
+                        symbols=n, last_t=now)
+        else:
+            # A venue that answers with nothing is a venue we cannot price
+            # against. Standing aside on its symbols costs an opportunity;
+            # trading them off the last print it gave us costs money.
+            errors[vname] = "no quotes returned"
+            _set_source(vname, "venue", reachable=False,
+                        detail="no quotes returned")
+    return errors
 
 
 # ----------------------------------------------------------- params
@@ -476,9 +815,11 @@ def try_execute(sig: Dict, p: Dict) -> None:
     if lim:
         return skip(lim, track=True, stage="loss_limit")
 
-    price = feed_state["prices"].get(symbol)
+    # Provenance-blind on purpose: this rail asks whether the quote is fresh and
+    # its source is answering, never which venue it came from.
+    price, px_reason = price_for_entry(symbol)
     if not price:
-        return skip("no live price")
+        return skip(px_reason, stage="feed")
     entry = price["ask"] if sig["side"] == "buy" else price["bid"]
     stop_dist = abs(entry - sig["sl"])
     spread = abs(price["ask"] - price["bid"])
@@ -607,7 +948,7 @@ def ingest_external_signal(symbol: str, fields: Dict[str, Any],
     if trade_mode not in MODE_TFS:
         trade_mode = "swing"
 
-    price_info = feed_state["prices"].get(symbol)
+    price_info, _ = price_for_entry(symbol)
     live = None
     if price_info:
         live = price_info["ask"] if side == "buy" else price_info["bid"]
@@ -679,7 +1020,7 @@ def try_execute_shadow(sig: Dict, p: Dict) -> None:
     now = time.time()
     if _recent_keys.get(sig["key"], 0) > now:
         return
-    price = feed_state["prices"].get(symbol)
+    price, _ = price_for_entry(symbol)
     if not price:
         return
     entry = price["ask"] if sig["side"] == "buy" else price["bid"]
@@ -763,11 +1104,19 @@ def _mtf_trail_level(tr: Dict) -> Optional[float]:
 
 
 def manage_open_trades(p: Dict) -> None:
+    """Runs EVERY cycle, per position, judged against the source that quotes
+    THAT position. One venue going quiet must never suspend the stops on a
+    position held somewhere else: standing aside from a new entry costs an
+    opportunity, abandoning a stop costs the account."""
     open_trs = storage.open_trades()
     for tr in open_trs:
-        price_info = feed_state["prices"].get(tr["symbol"])
+        st = price_state(tr["symbol"])
+        price_info = st["price"]
         if not price_info:
             continue
+        # A stale quote drops management into de-risk-only: the stop may still
+        # act on it, nothing else may (docs/ARCHITECTURE-V3.md §2).
+        derisk_only = not st["fresh"]
         bid, ask = price_info["bid"], price_info["ask"]
         cur = bid if tr["side"] == "buy" else ask          # exit side
         direction = 1 if tr["side"] == "buy" else -1
@@ -776,12 +1125,14 @@ def manage_open_trades(p: Dict) -> None:
             continue
         r_now = (cur - tr["entry"]) * direction / risk_dist
 
-        # track MFE / MAE in R
+        # track MFE / MAE in R — excursion measured off a dead quote is not an
+        # excursion, it is the same number written down again
         upd: Dict[str, Any] = {}
-        if r_now > (tr["mfe"] or 0):
-            upd["mfe"] = round(r_now, 2)
-        if r_now < (tr["mae"] or 0):
-            upd["mae"] = round(r_now, 2)
+        if not derisk_only:
+            if r_now > (tr["mfe"] or 0):
+                upd["mfe"] = round(r_now, 2)
+            if r_now < (tr["mae"] or 0):
+                upd["mae"] = round(r_now, 2)
 
         if tr["mode"] in ("paper", "shadow"):
             # Dynamic-spread stop: evaluate against the WORST exit-side price
@@ -813,6 +1164,14 @@ def manage_open_trades(p: Dict) -> None:
                                  if spread_induced else "")
                 _close_paper(tr, tr["sl"], reason)
                 continue
+            if derisk_only:
+                # Everything below books something OFF this quote: a TP2 fill, a
+                # TP1 partial, a trail level recomputed from bars that stopped
+                # arriving with it. All three flatter the sample the promotion
+                # gate reads, and none of them can be confirmed until the source
+                # comes back. The stop above is the exception because a breach
+                # already printed and exits at tr["sl"] either way.
+                continue
             if hit_tp2:
                 if upd:
                     storage.update_trade(tr["id"], upd)
@@ -835,6 +1194,12 @@ def manage_open_trades(p: Dict) -> None:
                 storage.update_trade(tr["id"], upd)
 
         else:  # live: EA holds the position; we mirror + issue SL commands
+            # The drop copy this branch reasons over (open_positions,
+            # closed_today) is MT5's, so it is only as good as the MT5 feed. On
+            # a stale one the "position is gone -> it closed at the broker" leg
+            # below would invent an exit for a trade that is still open.
+            if not source_state(MT5_SOURCE)["fresh"]:
+                continue
             pos = next((x for x in feed_state["open_positions"]
                         if "SLC#%d" % tr["id"] in (x.get("comment") or "")
                         or x.get("ticket") == tr["ticket"]), None)
@@ -923,11 +1288,12 @@ def manual_close(trade_id: int) -> bool:
 # -------------------------------------------------------------- loop
 def engine_loop(poll_seconds: int = 20) -> None:
     print("engine: started (poll %ds)" % poll_seconds)
-    while True:
+    _stop.clear()
+    while not _stop.is_set():
         try:
-            # heartbeat EVERY cycle — even while standing aside waiting for
-            # the EA feed — so the dashboard can distinguish "engine process
-            # down" from "engine up, no data" (both matter, differently)
+            # heartbeat EVERY cycle — even with every source dark — so the
+            # dashboard can distinguish "engine process down" from "engine up,
+            # no data" (both matter, differently)
             try:
                 storage.set_setting("engine_heartbeat_t", int(time.time()))
                 if feed_state.get("last_feed_t"):
@@ -938,18 +1304,23 @@ def engine_loop(poll_seconds: int = 20) -> None:
 
             p = params()
 
-            # No fresh EA feed -> no live prices -> analyzing would only
-            # produce "no live price" skips and 30-min zone locks (classic
-            # right after a server restart). Manage nothing, signal nothing,
-            # just wait for the feed.
-            feed_age = time.time() - (feed_state.get("last_feed_t") or 0)
-            if feed_age > 60:
-                _last_info.clear()
-                _last_info["feed"] = {"symbol": "—", "trade_mode": "—",
-                                      "note": "waiting for EA feed (last push %s)"
-                                      % ("never" if feed_age > 1e9 else "%.0fs ago" % feed_age)}
-                time.sleep(poll_seconds)
-                continue
+            tradable = [s for s in p["enabled_pairs"] if s not in p["agent_disabled_pairs"]]
+            shadow_only = [s for s in p["watch_pairs"] if s not in p["enabled_pairs"]]
+            symbols = tradable + shadow_only
+
+            # Pull venue quotes BEFORE anything reads a price. Positions on a
+            # symbol that has since been disabled still need managing, so they
+            # get priced too — a pair leaving the watchlist must not strand the
+            # stop on a position it opened.
+            held = {t["symbol"] for t in storage.open_trades()}
+            refresh_venue_prices(sorted(set(symbols) | held))
+
+            # Feed health is now a per-source report, not one global verdict.
+            # The loop never waits on it: work proceeds for every source that is
+            # healthy, and the unhealthy ones lose their own symbols below.
+            report = feed_report()
+            _last_info["feed"] = {"symbol": "—", "trade_mode": "—",
+                                  "note": report["note"]}
 
             manage_open_trades(p)
 
@@ -970,16 +1341,24 @@ def engine_loop(poll_seconds: int = 20) -> None:
             # Pre-warm TV context once per hour (non-blocking: uses cache if fresh)
             _get_tv_ctx()
 
-            tradable = [s for s in p["enabled_pairs"] if s not in p["agent_disabled_pairs"]]
-            shadow_only = [s for s in p["watch_pairs"] if s not in p["enabled_pairs"]]
-            symbols = tradable + shadow_only
             modes = [m for m in p["modes"] if m not in p["agent_disabled_modes"]]
             for symbol in symbols:
+                # Per-symbol stand-aside, judged against the source that quotes
+                # THIS symbol. Analyzing without a price it can be filled at only
+                # produces "no live price" skips and 30-min zone locks, so the
+                # symbol is dropped for this cycle — and only this symbol.
+                price_info, feed_why = price_for_entry(symbol)
+                if price_info is None:
+                    note = "%s — standing aside on %s" % (feed_why, symbol)
+                    for m in modes:
+                        _last_info["%s|%s" % (symbol, m)] = {
+                            "symbol": symbol, "trade_mode": m, "note": note}
+                        decisions.record_state(None, symbol, m, "feed", note)
+                    continue
                 bars_by_tf = {tf: storage.get_bars(symbol, tf, 320)
                               for tf in ("15m", "30m", "1h", "2h", "4h", "1d")}
-                price_info = feed_state["prices"].get(symbol)
-                spread = abs((price_info["ask"] - price_info["bid"])) if price_info else 0.0
-                live_mid = ((price_info["ask"] + price_info["bid"]) / 2) if price_info else None
+                spread = abs(price_info["ask"] - price_info["bid"])
+                live_mid = (price_info["ask"] + price_info["bid"]) / 2
                 for m in modes:
                     # don't analyze stale data: the newest setup-TF bar must
                     # have closed within the staleness limit for the symbol's
@@ -1029,4 +1408,5 @@ def engine_loop(poll_seconds: int = 20) -> None:
             import traceback
             traceback.print_exc()
             print("engine error:", e)
-        time.sleep(poll_seconds)
+        _stop.wait(poll_seconds)
+    print("engine: stopped")

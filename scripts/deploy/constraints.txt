@@ -1,0 +1,55 @@
+# Keel — pinned dependency set for the Linux container image.
+#
+# trading-bot/requirements.txt uses `>=`. Two nodes provisioned a week apart
+# would then run different ccxt against the same exchange, which is a venue
+# behaviour difference the promotion-gate sample cannot see and cannot control
+# for (ARCHITECTURE-V3 §5 item 25). This file pins the fully resolved set
+# WITHOUT editing requirements.txt.
+#
+# Resolved for: CPython 3.12, manylinux2014_x86_64, wheels only.
+# Regenerate:   scripts/deploy/keel-freeze.sh
+#
+# Read the diff when you regenerate. A ccxt bump changes how orders reach a
+# venue; a cryptography bump does not. They are not the same review.
+aiodns==3.6.1
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+attrs==26.1.0
+blinker==1.9.0
+ccxt==4.5.64
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.4.9
+click==8.4.2
+colorama==0.4.6
+cryptography==50.0.0
+fastapi==0.141.1
+flask==3.1.3
+frozenlist==1.8.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+itsdangerous==2.2.0
+jinja2==3.1.6
+markupsafe==3.0.3
+multidict==6.7.1
+propcache==0.5.2
+pycares==4.9.0
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pyyaml==6.0.3
+requests==2.34.2
+setuptools==84.0.0
+starlette==1.6.0
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+uvicorn==0.52.1
+werkzeug==3.1.8
+yarl==1.24.5
