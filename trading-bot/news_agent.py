@@ -28,11 +28,30 @@ Recommended first run: start with live_mode: false (default) and monitor
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
 import re
 import sys
+
+
+@functools.lru_cache(maxsize=1)
+def _control_token() -> str:
+    """The token /api/commands requires. Shared with the dashboard rather than
+    invented here: one secret on the host, one file, one thing to rotate.
+
+    Cached because this is called on every command post and the token does not
+    change while the process lives. Returns "" if unavailable, which produces a
+    clean 401 and a loud log line rather than a confusing crash."""
+    try:
+        from dash_auth import get_token
+        return get_token()
+    except Exception as exc:                       # pragma: no cover
+        logging.getLogger("news_agent").error(
+            "cannot read the control token (%s); stop management will be "
+            "refused by the server", exc)
+        return ""
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -374,11 +393,22 @@ class CommandClient:
             "expires_at": expires_at,
         }
         try:
+            # /api/commands is authenticated: it can close a live position and
+            # the server listens on 0.0.0.0. Same token the dashboard uses, read
+            # from state/dashboard_token on this host, so there is one secret to
+            # manage rather than two.
             resp = self.session.post(
                 f"{self.base}/api/commands",
                 json=cmd,
+                headers={"X-Dashboard-Token": _control_token()},
                 timeout=self.timeout,
             )
+            if resp.status_code == 401:
+                log.error("Command POST refused: the news agent could not "
+                          "authenticate to the server. Stop management is NOT "
+                          "running. Check state/dashboard_token is readable, or "
+                          "set DASHBOARD_TOKEN for both processes.")
+                return False
             if resp.status_code == 200:
                 return True
             log.warning("Command POST returned %s: %s", resp.status_code, resp.text[:200])

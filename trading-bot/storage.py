@@ -182,10 +182,17 @@ def _attempt_recover() -> bool:
     Never raises — the caller degrades gracefully if this returns False."""
     global _conn
     import subprocess, shutil
-    sqlite_bin = shutil.which("sqlite3") or "/usr/bin/sqlite3"
-    if not os.path.exists(sqlite_bin) and shutil.which("sqlite3") is None:
-        print("[storage] cannot auto-recover: sqlite3 CLI not found")
-        return False
+    # The CLI is the better tool: ".recover" salvages rows out of damaged pages
+    # that a normal read cannot reach. But stock Windows ships no sqlite3.exe and
+    # the old fallback was the literal path /usr/bin/sqlite3, so this whole
+    # function returned False on the ONLY operating system that can host MT5 —
+    # invariant 7's recovery arm was dead code exactly where it was needed.
+    #
+    # So: use the CLI when it exists, and fall back to a pure-Python rebuild via
+    # iterdump when it does not. The fallback salvages less, and says so.
+    sqlite_bin = shutil.which("sqlite3")
+    if sqlite_bin is None and os.path.exists("/usr/bin/sqlite3"):
+        sqlite_bin = "/usr/bin/sqlite3"
     now = time.time()
     if _recover["in_progress"] or (now - _recover["last"] < _RECOVER_THROTTLE_S):
         return False
@@ -202,13 +209,46 @@ def _attempt_recover() -> bool:
         tmp = _DB_PATH + ".recovered"
         if os.path.exists(tmp):
             os.remove(tmp)
-        p1 = subprocess.Popen([sqlite_bin, _DB_PATH, ".recover"], stdout=subprocess.PIPE)
-        p2 = subprocess.Popen([sqlite_bin, tmp], stdin=p1.stdout)
-        p1.stdout.close()
-        p2.communicate(timeout=180)
-        if p2.returncode != 0:
-            print("[storage] .recover failed (rc=%s)" % p2.returncode)
-            return False
+        if sqlite_bin:
+            print("[storage] rebuilding with the sqlite3 CLI (.recover)")
+            p1 = subprocess.Popen([sqlite_bin, _DB_PATH, ".recover"],
+                                  stdout=subprocess.PIPE)
+            p2 = subprocess.Popen([sqlite_bin, tmp], stdin=p1.stdout)
+            p1.stdout.close()
+            p2.communicate(timeout=180)
+            if p2.returncode != 0:
+                print("[storage] .recover failed (rc=%s)" % p2.returncode)
+                return False
+        else:
+            # No CLI: rebuild from whatever the Python driver can still read.
+            # iterdump stops at the first unreadable page rather than salvaging
+            # around it, so this recovers less than .recover would. Partial is
+            # still better than latching suspect and refusing to trade, and the
+            # integrity_check below is the same gate either way.
+            print("[storage] no sqlite3 CLI on PATH — pure-Python rebuild "
+                  "(salvages less than .recover; install sqlite3 for a fuller "
+                  "recovery)")
+            src = sqlite3.connect(_DB_PATH)
+            dst = sqlite3.connect(tmp)
+            salvaged, stopped = 0, None
+            try:
+                with dst:
+                    for stmt in src.iterdump():
+                        try:
+                            dst.execute(stmt)
+                            salvaged += 1
+                        except sqlite3.DatabaseError as e:
+                            stopped = str(e)
+                            break
+            except sqlite3.DatabaseError as e:
+                stopped = str(e)
+            finally:
+                src.close()
+                dst.close()
+            print("[storage] salvaged %d statements%s"
+                  % (salvaged, "" if not stopped else "; stopped at: %s" % stopped[:120]))
+            if salvaged == 0:
+                return False
         chk = sqlite3.connect(tmp)
         ok = chk.execute("PRAGMA integrity_check").fetchone()[0]
         chk.close()
@@ -368,18 +408,44 @@ def enqueue_command(cmd_type: str, payload: Dict[str, Any],
 
 
 def next_command() -> Optional[Dict[str, Any]]:
+    """Claim the next command for the EA. ATOMIC.
+
+    This used to be three statements — expire, select, claim — each taking and
+    releasing the module lock on its own. server.py runs Flask with
+    threaded=True, so two EA polls arriving together could both complete the
+    SELECT before either ran the claiming UPDATE, and both would be handed the
+    same row. For a trail_sl that is a harmless duplicate. For an open_trade it
+    is two positions where the engine sized one, and no rail downstream can
+    undo a fill that already happened.
+
+    Holding the lock across all three statements closes it: the claim is
+    conditional on the row still being claimable, and a losing racer gets
+    rowcount 0 and simply returns nothing. It will poll again in a second."""
     now = int(time.time())
-    execute("UPDATE commands SET status='expired' "
-            "WHERE status IN ('pending','sent') AND expires_at IS NOT NULL "
-            "AND expires_at < ?", (now,))
-    row = query_one(
-        "SELECT * FROM commands WHERE status='pending' "
-        "OR (status='sent' AND sent_t IS NOT NULL AND sent_t < ?) "
-        "ORDER BY id LIMIT 1", (now - RESEND_GRACE_S,))
-    if row is None:
-        return None
-    execute("UPDATE commands SET status='sent', sent_t=? WHERE id=?",
-            (now, row["id"]))
+    with _lock:
+        c = _c()
+        c.execute("UPDATE commands SET status='expired' "
+                  "WHERE status IN ('pending','sent') AND expires_at IS NOT NULL "
+                  "AND expires_at < ?", (now,))
+        cur = c.execute(
+            "SELECT * FROM commands WHERE status='pending' "
+            "OR (status='sent' AND sent_t IS NOT NULL AND sent_t < ?) "
+            "ORDER BY id LIMIT 1", (now - RESEND_GRACE_S,))
+        row = cur.fetchone()
+        if row is None:
+            c.commit()
+            return None
+        # Conditional claim: re-assert the state the SELECT saw. Belt and braces
+        # given the lock, and the thing that keeps this correct if the lock is
+        # ever relaxed or a second process appears.
+        claimed = c.execute(
+            "UPDATE commands SET status='sent', sent_t=? "
+            "WHERE id=? AND (status='pending' "
+            "OR (status='sent' AND sent_t IS NOT NULL AND sent_t < ?))",
+            (now, row["id"], now - RESEND_GRACE_S))
+        c.commit()
+        if claimed.rowcount != 1:
+            return None                    # somebody else took it; poll again
     payload = json.loads(row["payload"])
     payload["id"] = str(row["id"])
     payload["type"] = row["type"]

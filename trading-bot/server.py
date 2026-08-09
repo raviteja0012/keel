@@ -9,6 +9,7 @@
 """
 import json
 import os
+import secrets
 import threading
 import time
 
@@ -20,6 +21,7 @@ import decisions
 import engine
 import exposure
 import instruments
+from dash_auth import get_token
 import news_calendar
 import notifier
 import params_store
@@ -145,7 +147,19 @@ def status():
 def commands_post():
     """Accept SL-management commands from the news agent and enqueue them
     for the EA. Only stop-tightening commands are allowed from here —
-    open/close stay exclusive to the engine."""
+    open/close stay exclusive to the engine.
+
+    AUTHENTICATED, because this route can close a live position and rewrite a
+    live stop, and server.host is 0.0.0.0 so the EA can reach it from another
+    machine. Unauthenticated, anything on the same network could flatten the
+    book. The EA is unaffected and needs no recompile: it polls
+    /api/commands/next and acks on /api/commands/ack, neither of which is this
+    route. The news agent shares the dashboard token, which already exists on
+    this host at state/dashboard_token."""
+    supplied = request.headers.get("X-Dashboard-Token", "")
+    if not supplied or not secrets.compare_digest(supplied, get_token()):
+        return jsonify({"ok": False,
+                        "error": "missing/invalid X-Dashboard-Token"}), 401
     body = request.get_json(force=True, silent=True) or {}
     cmd_type = body.get("type")
     if cmd_type not in ("trail_sl", "move_sl_be", "close_trade"):
