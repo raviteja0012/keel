@@ -227,6 +227,11 @@ SIGNOFF_MAX_AGE_S = 30 * 86400      # and expires after 30 days
 # parameter still voids the sign-off.
 OPERATIONAL_KEYS = {"halt_new_entries"}
 
+# How stale a hallucination_check verdict may be and still satisfy the gate.
+# The file is append-only, so without this a single GROUNDED line written months
+# ago certifies the database forever.
+DATA_TRUST_MAX_AGE_H = 24
+
 
 def _data_trust() -> Dict[str, Any]:
     """Latest hallucination_check verdict (the data-trust gate). Read-only;
@@ -308,10 +313,29 @@ def promotion_status() -> Dict[str, Any]:
         checks = {
             "sample_size": {"pass": st["n"] >= GATE_MIN_TRADES,
                             "value": st["n"], "required": GATE_MIN_TRADES},
-            "positive_expectancy": {"pass": st.get("expectancy_r", 0) > 0,
-                                    "value": st.get("expectancy_r")},
-            "data_trust": {"pass": trust["verdict"] == "GROUNDED",
-                           "value": trust["verdict"]},
+            # Expectancy on a handful of trades is noise, and this check passed
+            # at n=1. It is a separate gate from sample_size on purpose (they
+            # report separately) but it must not certify a number it cannot
+            # support, so it carries the same floor.
+            "positive_expectancy": {
+                "pass": (st.get("expectancy_r", 0) or 0) > 0
+                        and st["n"] >= GATE_MIN_TRADES,
+                "value": st.get("expectancy_r"),
+                "reason": (None if st["n"] >= GATE_MIN_TRADES
+                           else "expectancy over %d trades is not yet meaningful"
+                                % st["n"])},
+            # A GROUNDED verdict from months ago says nothing about the DB today.
+            # _data_trust already computes age_h and the gate discarded it.
+            "data_trust": {
+                "pass": (trust["verdict"] == "GROUNDED"
+                         and trust.get("age_h") is not None
+                         and trust["age_h"] < DATA_TRUST_MAX_AGE_H),
+                "value": trust["verdict"],
+                "reason": (None if trust.get("age_h") is None
+                           or trust["age_h"] < DATA_TRUST_MAX_AGE_H
+                           else "integrity check is %.0fh old (max %dh) - re-run "
+                                "hallucination_check.py"
+                                % (trust["age_h"], DATA_TRUST_MAX_AGE_H))},
             "rails_exercised": {
                 "pass": bool({"loss_limit", "exposure", "concurrency"} & rails_seen),
                 "value": sorted(rails_seen),

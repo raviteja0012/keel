@@ -390,8 +390,12 @@ def try_execute(sig: Dict, p: Dict) -> None:
             return
 
     all_open = storage.open_trades(mode)
-    open_same = [t for t in all_open if t["trade_mode"] == sig["trade_mode"]]
-    if len(open_same) >= p["max_concurrent"]:
+    # max_concurrent is a PORTFOLIO limit, not a per-speed one. Counting only
+    # trades of the same trade_mode meant intraday and swing each got their own
+    # allowance: max_concurrent=2 with both speeds enabled permitted four open
+    # positions, so 4% of open heat against a -2% daily stop. The kill switch
+    # would fire before the concurrency rail ever did, which is backwards.
+    if len(all_open) >= p["max_concurrent"]:
         return skip("max concurrent (%d) reached" % p["max_concurrent"],
                     track=True, stage="concurrency")
     if any(t["symbol"] == symbol for t in all_open):
