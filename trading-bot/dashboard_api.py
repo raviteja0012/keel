@@ -19,6 +19,7 @@ Security model:
 Run:  python3 dashboard_api.py         # http://127.0.0.1:8767
 """
 import os
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -169,14 +170,34 @@ def api_analysis_now(minutes: int = 90):
     return {"rows": rows, "window_min": minutes}
 
 
+# Anything whose KEY looks like a credential is masked, wherever it appears in the
+# structure. The previous version masked a hardcoded list of four names, which was
+# fine until venue credentials arrived nested inside the "venues" setting: exchange
+# api_key and api_secret were returned in plaintext by this endpoint, which is an
+# open GET. A name list only protects the names someone remembered to add. This
+# fails the other way - a new secret is masked before anyone thinks about it, and
+# the cost of over-masking is a dull dashboard field, not a drained account.
+_SECRET_NAME = re.compile(
+    r"(?i)(api[_-]?key|api[_-]?secret|secret|token|password|passwd|passphrase"
+    r"|webhook|credential|private[_-]?key)")
+
+
+def _redact(value: Any, key: str = "") -> Any:
+    if isinstance(value, dict):
+        return {k: _redact(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v, key) for v in value]
+    if value in (None, "", 0, False):
+        return value                       # nothing to hide, and "unset" is useful
+    if key and _SECRET_NAME.search(key):
+        return "•••set•••"
+    return value
+
+
 @app.get("/api/settings")
 def api_settings():
-    s = storage.all_settings()
-    for k in ("telegram_bot_token", "telegram_chat_id", "discord_webhook_url",
-              "tradingview_webhook_token"):
-        if s.get(k):
-            s[k] = "•••set•••"
-    return {"settings": s, "bounds": {k: list(v) for k, v in params_store.BOUNDS.items()}}
+    return {"settings": _redact(storage.all_settings()),
+            "bounds": {k: list(v) for k, v in params_store.BOUNDS.items()}}
 
 
 # -------------------------------------------------------------- venues

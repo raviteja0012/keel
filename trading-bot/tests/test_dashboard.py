@@ -204,10 +204,41 @@ def test_read_endpoints_respond():
 
 
 def test_secrets_never_in_settings():
-    storage.set_setting("telegram_bot_token", "SECRET-TOKEN-XYZ")
-    r = client.get("/api/settings").json()
-    assert "SECRET-TOKEN-XYZ" not in json.dumps(r), "credential leaked"
+    """This test used to check exactly one key, telegram_bot_token, which was
+    already on a hardcoded mask list. It therefore tested the implementation
+    rather than the property, and it passed happily while /api/settings returned
+    exchange api_key and api_secret in plaintext: those live NESTED inside the
+    "venues" setting, and a flat name list never sees them.
+
+    So it now asserts the property. Every one of these is a credential, several
+    are nested, and one is a name nobody has thought of yet."""
+    import venues
+
+    storage.set_setting("telegram_bot_token", "SECRET-TG-XYZ")
+    storage.set_setting("discord_webhook_url",
+                        "https://discord.com/api/webhooks/1/SECRET-DISCORD")
+    # nested, which is how the real leak happened
+    venues.upsert({"name": "sekrit", "kind": "ccxt", "exchange": "binanceus",
+                   "api_key": "SECRET-EXCHANGE-KEY",
+                   "api_secret": "SECRET-EXCHANGE-SECRET"})
+    # a shape no mask list anticipates: masking must key off the NAME, not a list
+    storage.set_setting("some_future_provider_api_key", "SECRET-FUTURE")
+
+    blob = json.dumps(client.get("/api/settings").json())
+    for secret in ("SECRET-TG-XYZ", "SECRET-DISCORD", "SECRET-EXCHANGE-KEY",
+                   "SECRET-EXCHANGE-SECRET", "SECRET-FUTURE"):
+        assert secret not in blob, "credential leaked: %s" % secret
+
+    # and the endpoint must still be useful: over-masking everything would pass
+    # the assertions above while making the settings page useless
+    storage.set_setting("min_rr", 2.4)
+    s = client.get("/api/settings").json()["settings"]
+    assert s.get("min_rr") == 2.4, "redaction ate a normal setting: %r" % s.get("min_rr")
+
+    venues.remove("sekrit")
     storage.set_setting("telegram_bot_token", "")
+    storage.set_setting("discord_webhook_url", "")
+    storage.set_setting("some_future_provider_api_key", "")
 
 
 def test_controls_require_token():
