@@ -221,6 +221,12 @@ GATE_MIN_TRADES = 50
 SIGNOFF_MIN_AGE_S = 3600            # must sit for an hour — no sign-and-go
 SIGNOFF_MAX_AGE_S = 30 * 86400      # and expires after 30 days
 
+# Operational switches: they change whether the engine is RUNNING, not how it
+# TRADES, so they do not invalidate an attestation about trading behaviour.
+# Deliberately an exclusion list rather than an inclusion list, so an unclassified
+# parameter still voids the sign-off.
+OPERATIONAL_KEYS = {"halt_new_entries"}
+
 
 def _data_trust() -> Dict[str, Any]:
     """Latest hallucination_check verdict (the data-trust gate). Read-only;
@@ -277,10 +283,21 @@ def promotion_status() -> Dict[str, Any]:
         "SELECT DISTINCT stage FROM decisions WHERE action='skipped'")}
     signoffs = storage.query(
         "SELECT * FROM promotion_signoffs ORDER BY t DESC")
-    # a sign-off made BEFORE the newest accepted parameter change attests to
-    # behaviour that no longer exists (CLAUDE.md: re-validate after changes)
+    # A sign-off made BEFORE the newest accepted BEHAVIOURAL change attests to
+    # behaviour that no longer exists (CLAUDE.md: re-validate after changes).
+    #
+    # "Behavioural" excludes the operational switches, and that exclusion is the
+    # whole point: /api/halt and /api/resume write halt_new_entries through
+    # params_store with origin='human', which lands an accepted row. Counting
+    # those meant pausing the bot for lunch destroyed the promotion sign-off and
+    # restarted the settling period -- the gate was un-keepable in practice.
+    #
+    # The list is an exclusion, not an inclusion, so it fails CLOSED: a parameter
+    # nobody has classified yet still voids the sign-off.
     _lpc = storage.query_one(
-        "SELECT MAX(t) m FROM param_changes WHERE accepted=1")
+        "SELECT MAX(t) m FROM param_changes WHERE accepted=1 "
+        "AND key NOT IN (%s)" % ",".join("?" * len(OPERATIONAL_KEYS)),
+        tuple(sorted(OPERATIONAL_KEYS)))
     last_param_change = (_lpc or {}).get("m") or 0
     out = {}
     for key, trs in sorted(cells.items()):
