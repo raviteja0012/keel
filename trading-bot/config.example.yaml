@@ -1,8 +1,16 @@
 # ===================================================================
-# SLC Trading Bot — configuration
-# Values here are STARTUP defaults. Anything also shown in the
-# dashboard Settings panel is runtime-tunable and stored in the DB;
+# SLC Trading Bot — EXAMPLE configuration (template)
+#
+#   cp config.example.yaml config.yaml      # then edit config.yaml
+#
+# `server.py` reads config.yaml (this example file is never loaded). The
+# values below are sane STARTUP defaults; anything also shown in the
+# dashboard Settings panel is runtime-tunable and stored in the DB, and
 # the DB value wins after first run.
+#
+# SECRETS: leave telegram.bot_token / chat_id (and the Discord webhook)
+# BLANK here. Enter them through the dashboard at runtime — never commit
+# real credentials (data/ is gitignored). See ../SECURITY.md.
 # ===================================================================
 
 server:

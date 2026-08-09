@@ -42,12 +42,14 @@ python3 scripts/slc.py health     # server/EA/feed/DB reachability
 
 The bot runs locally; the operational commands target it. Defaults:
 - `BOT_DIR` = `~/Claude/Projects/Price Action Strategy/trading-bot`  (note the space — always quote it)
-- `BASE_URL` = `http://127.0.0.1:8766`
+- `BASE_URL` = `http://127.0.0.1:8766`  (used by the `curl` examples)
+- `SLC_BASE_URL` = same value — the env var `scripts/slc.py` actually reads (defaults to `http://127.0.0.1:8766`)
 
 If the user's paths differ, ask once and use theirs. Every shell example below assumes:
 ```bash
 BOT_DIR="$HOME/Claude/Projects/Price Action Strategy/trading-bot"
-BASE_URL="http://127.0.0.1:8766"
+BASE_URL="http://127.0.0.1:8766"              # for the curl examples below
+export SLC_BASE_URL="$BASE_URL"               # scripts/slc.py reads SLC_BASE_URL
 ```
 If a command fails with "connection refused", the server isn't running:
 ```bash

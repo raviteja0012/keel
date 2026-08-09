@@ -14,8 +14,9 @@ they are **co-located, not file-merged**.
 - Do **not** deploy or merge the `legacy/` code. It's here for its reference value only:
   the labeled dataset (`strategy-study/setups_dataset.json`), the validation-PNG gallery,
   `strategy_knowledge_base.md`, `parameter_tuning.md`, and `docs/PROJECT_CONTEXT_HANDOFF.md`.
-- Note the builds use **different risk numbers** (SLC `min_rr 2.5`, 1%/A+; legacy `min_rr 2.0`,
-  2%→1%). When in doubt, the root build's `config.yaml` + DB settings are authoritative.
+- Note the builds use **different risk numbers** (SLC ships `min_rr 2.0`, 1%/A+; legacy `min_rr 2.0`,
+  2%→1%). When in doubt, the root build's `config.yaml` is authoritative (the runtime DB, which wins
+  after first run, is not committed).
 
 **Roadmap:** refactor the root build into a shared engine + the global risk rails, with
 strategies as isolated plug-ins (SLC = strategy #1). New strategies plug in behind that

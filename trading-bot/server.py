@@ -1,11 +1,11 @@
 """SLC Trading Bot server.
 
   python server.py            # that's it — one process runs everything:
-    - HTTP endpoints for the MT5DataBridge EA (feed, bars, pairs, commands)
+    - HTTP endpoints for the SLCDataBridge EA (feed, bars, pairs, commands)
     - the SLC strategy engine (paper/live)
     - the self-evaluation agent
-    - the Telegram notifier
-    - the web dashboard  ->  http://localhost:8765
+    - the Telegram + Discord notifier
+    - the web dashboard  ->  http://localhost:8766
 """
 import json
 import os
@@ -79,7 +79,7 @@ def seed_settings():
 
 
 # ======================================================================
-# EA-facing endpoints (contract fixed by MT5DataBridge.mq5 — do not change)
+# EA-facing endpoints (contract fixed by SLCDataBridge.mq5 — do not change)
 # ======================================================================
 @app.route("/api/mt5_feed", methods=["POST"])
 def mt5_feed():

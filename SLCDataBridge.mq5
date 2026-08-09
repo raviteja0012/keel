@@ -9,7 +9,7 @@
 //|    1. Open MT5 → Tools → Options → Expert Advisors               |
 //|    2. Tick "Allow WebRequest for listed URL"                     |
 //|    3. Add:  http://<ServerHost>:<ServerPort>                     |
-//|       e.g. http://192.168.68.104:8765                            |
+//|       e.g. http://192.168.68.104:8766                            |
 //|       (one entry covers every endpoint this EA uses)             |
 //|    4. Attach this EA to any chart (e.g. EURUSD M1)               |
 //|                                                                  |
@@ -17,8 +17,9 @@
 //|    Terminal 1:  cd trading-bot && python server.py               |
 //|    Terminal 2:  cd trading-bot && python news_agent.py           |
 //+------------------------------------------------------------------+
-#property copyright "MT5 Data Bridge"
+#property copyright "SLC Data Bridge"
 #property version   "2.30"
+// Version is 2.30 across the #property, the startup Print, and the JSON feed payload.
 
 #include <Trade\Trade.mqh>
 
@@ -124,7 +125,7 @@ int OnInit()
    ParseAliases();
    BuildBrokerSymbolIndex();
 
-   Print("SLCDataBridge v2.20: started.");
+   Print("SLCDataBridge v2.30: started.");
    Print("  Server : ", base);
    Print("  Push   : ", g_feedURL, "  every ", PushIntervalSec, "s");
    Print("  Bars   : ", g_barsURL, "  every ", BarPushIntervalSec, "s");
@@ -512,7 +513,7 @@ void PushBars()
    // MT5 server UTC offset so Python can normalise timestamps
    int tzOffsetSec = (int)(TimeCurrent() - TimeGMT());
 
-   // v2.31: ONE REQUEST PER SYMBOL. Building a single payload for many
+   // ONE REQUEST PER SYMBOL. Building a single payload for many
    // symbols (46 syms x 6 TFs x 300 bars ~ 6-7 MB through 80k+ string
    // concatenations) can exhaust EA memory and gets the EA removed from
    // the chart with a critical error. Per-symbol chunks stay ~150 KB.
@@ -1106,7 +1107,7 @@ string BuildPayload()
    //--- Metadata
    j += "\"terminal\":{";
    j += "\"platform\":\"MT5\",";
-   j += "\"version\":\"2.00\",";
+   j += "\"version\":\"2.30\",";
    j += "\"time_utc\":"   + IntegerToString((int)TimeGMT())     + ",";
    j += "\"time_local\":" + IntegerToString((int)TimeCurrent());
    j += "}";

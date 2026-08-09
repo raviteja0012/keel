@@ -14,7 +14,7 @@ env/
 .vscode/
 
 # ── SQLite transient sidecars & corrupt dumps ──────────
-# (the main data/trading.db IS tracked in this archive by choice — see SECURITY.md)
+# (data/trading.db is NOT tracked — the hardening block below excludes trading-bot/data/; see SECURITY.md)
 *.db-wal
 *.db-shm
 *.corrupt-*

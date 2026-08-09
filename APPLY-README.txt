@@ -1,6 +1,11 @@
 SLC bot — strategy-plugin + TradingView webhook foundation
 ==========================================================
 
+  >>> ALREADY APPLIED. The files below are already in the repo (trading-bot/strategies/,
+  >>> tv_webhook.py, tests/, and the engine/server/dashboard changes). This file and
+  >>> slc-foundation.patch are kept only as a record of what landed; you do not need to
+  >>> re-apply them. The instructions below are the original apply notes.
+
 Extract this at the REPO ROOT (the folder that contains trading-bot/ and
 legacy/). It places the files into trading-bot/ — 4 new, 3 modified.
 

@@ -31,7 +31,7 @@ when code and playbook disagree, the playbook is the intended behavior and the g
 | `trading-bot/server.py` | Flask app, EA endpoints, serves legacy dashboard, starts threads |
 | `trading-bot/engine.py` | execution choke point (ALL rails), paper broker, live command queue, trade mgmt, spread window |
 | `trading-bot/strategy.py` | pure SLC + chart-pattern logic (structure, liquidity, sweep, confirmation) |
-| `trading-bot/strategies/` | strategy-plugin registry (SLC = plugin #1) |
+| `trading-bot/strategies/` | strategy-plugin registry (SLC = plugin #1) behind the shared engine |
 | `trading-bot/storage.py` | SQLite (WAL), additive migrations, hardened command queue, runtime settings **including credentials** |
 | `trading-bot/instruments.py` | per-symbol registry: asset class, factor exposures, calendars, news entities |
 | `trading-bot/sessions.py` | per-class market calendars, day/week boundaries, crypto weekend risk factor |
@@ -42,15 +42,16 @@ when code and playbook disagree, the playbook is the intended behavior and the g
 | `trading-bot/analysis.py` | importable studies: regime/session perf, exposure, drawdown forensics, promotion-gate status |
 | `trading-bot/dashboard_api.py` + `dashboard/multiasset.html` | localhost-only FastAPI control dashboard (port 8767) |
 | `trading-bot/live_switch.py`, `dash_auth.py` | two-step, promotion-gated live switch — the ONLY path to live |
-| `trading-bot/agent.py` | bounded self-tuning (writes only via params_store) |
+| `trading-bot/agent.py` | bounded self-tuning (whitelisted params only; writes only via params_store) |
 | `trading-bot/notifier.py`, `telegram_notifier.py` | dual-channel Telegram + Discord |
 | `trading-bot/news_agent.py`, `news_evaluator.py` | RSS news monitor + SL management (separate process) |
+| `trading-bot/tv_webhook.py`, `tv_context.py` | TradingView/external alert intake (`/api/tv_webhook`) + market-context snapshot |
 | `trading-bot/backtest.py`, `sanity_check.py` | replay + parameter sweep |
-| `trading-bot/tests/` | risk-rail / circuit-breaker / promotion-gate suites — keep green (`python3 tests/<file>.py`) |
-| `trading-bot/config.yaml` | startup defaults (DB values win after first run) |
+| `trading-bot/tests/` | risk-rail / circuit-breaker / promotion-gate suites — keep green (`python3 tests/<file>.py`), no MT5 needed |
+| `trading-bot/config.yaml`, `config.example.yaml` | startup defaults (DB values win after first run); example is the committed template |
 | `install-multiasset-services.sh` | launchd install/status/uninstall for the multi-asset stack (`com.slcmulti.*`) |
 | `SLCDataBridge.mq5` / `.original.mq5` | MT5 data-bridge EA (v2.30) and baseline |
-| `slc-*.skill` | four Cowork skills to operate the bot conversationally |
+| `cowork-skills/slc-bot/` | consolidated Cowork skill (operate/analyze/develop) — replaces the four root `slc-*.skill` bundles |
 | `*-REPORT.md`, `*.patch`, `*.diff`, `volume_gate_shadow.py`, `recover-db.sh`, `hallucination_check.py` | experiments, validation, ops tooling |
 
 `trading-bot/data/` (the SQLite DB) and `trading-bot/state/` (logs, decisions, traces) are
@@ -70,13 +71,18 @@ for t in tests/test_*.py; do python3 "$t"; done   # rails/gate suites — must s
 Then attach the `SLCDataBridge` EA in MT5 and allow-list the WebRequest URL — see
 `SETUP-GUIDE.md`.
 
-## Authoritative config (some docs are stale — don't be misled)
+## Authoritative config
 
-- Live system uses **port 8766** and the **`SLCDataBridge`** EA (v2.30, magic 770001).
-  `trading-bot/README.md` and parts of `SETUP-GUIDE.md` still say port 8765 / `MT5DataBridge`
-  — ignore that. `config.yaml` and the DB settings are authoritative.
-- Current mode **paper**, active speed **swing**. Risk 1% per A+ trade, min RR 2.5, ATR
-  buffer 0.35, daily stop −2%, weekly −5%, volume gate `vol_mult = 1.0`, 22 enabled pairs.
+- Live system uses **port 8766** and the **`SLCDataBridge`** EA (v2.30). The bot tags its trades
+  with magic **770001** (sent in each open command; the news agent manages only these) — the EA
+  itself does not hardcode 770001. `config.yaml` is authoritative for what ships; the runtime DB
+  (gitignored, not in the repo) wins after first run.
+- Shipped defaults (`config.yaml`): mode **paper**, speeds **intraday + swing**, risk 1% per A+
+  trade (B setups ×0.5), min RR **2.0**, ATR buffer 0.35, daily stop −2%, weekly −5%, volume gate
+  `vol_mult = 1.0`, `min_grade = B`, **8 enabled pairs**. (A live deployment's DB may differ; since
+  the DB isn't committed, treat `config.yaml` as the source of truth for the repo.)
+- The `legacy/` build legitimately uses port 8765 / `MT5DataBridge`; that is not stale, it is the
+  superseded build (see `CONSOLIDATION.md`).
 
 ## Safety invariants (hold in paper AND live — never weaken)
 
@@ -138,6 +144,9 @@ This repo is the home for the whole effort, and is expanding beyond SLC. SLC is 
 New strategies are added as **isolated modules behind the shared engine and the GLOBAL risk
 rails** — never fork the rails per strategy, never let one strategy's tuning touch another, and
 each new strategy clears its **own** ≥50-trade positive-expectancy paper gate before live. The
+plumbing for this has landed: a strategy-plugin registry (`trading-bot/strategies/__init__.py`,
+SLC registered as plugin #1) and an optional TradingView/external-signal intake
+(`/api/tv_webhook`, off by default) that routes candidates through the same global rails. The
 earlier FastAPI/port-8765 build under `legacy/` is **superseded**: reference only (its labeled
 dataset, validation gallery, and context handoff), never deployed or merged.
 
@@ -145,8 +154,11 @@ dataset, validation gallery, and context handoff), never deployed or merged.
 
 EA tick-accurate spread reporting (untested MQL5 draft), paper commission/swap modelling (not
 built), per-level `force` flag (deferred), TP2/runner trailing leaving gains on the table
-(swing winners avg +1.16R but capture only +0.16R), symbol culling deferred until ~15+ trades
-per pair, and launchd service-name / doc inconsistencies to reconcile.
+(swing winners avg +1.16R but capture only +0.16R), and symbol culling deferred until ~15+ trades
+per pair. Recently resolved: the EA now reports **2.30** consistently (`#property`, startup `Print`,
+and JSON feed); the legacy port-8765 autostart scripts (`install_autostart.sh`, `watchdog.sh`) were
+removed from the root (`watchdog-install.sh` → `com.slc.*`/8766 is the only autostart path now); and
+`config.example.yaml` is now a documented template rather than an exact copy of `config.yaml`.
 
 ---
 *Educational trading software, not financial advice. See `LICENSE.md`.*

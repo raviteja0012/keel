@@ -1,5 +1,12 @@
 # SLC Trading System — Consolidation Plan + GitHub & Project Kit
 
+> **Historical planning note.** This is the original consolidation/GitHub planning doc. The
+> consolidation it describes has since happened (single repo, `legacy/` retained for reference,
+> secrets removed, `data/`/`state/` gitignored). Some figures here predate the alignment of the
+> docs to `config.yaml` — the current shipped defaults are **min RR 2.0** and **8 enabled pairs**
+> (see [`../README.md`](../README.md)); the 2.5 / 22-pair values below reflect an earlier live
+> deployment's runtime DB, which is not committed.
+
 Covers four things you asked: (1) are the two zips the same, (2) the best way to combine them
 and expand with new strategies, (3) exactly what to post on GitHub, (4) a review of the Claude
 Project name / description / instructions.

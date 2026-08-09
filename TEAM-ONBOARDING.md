@@ -25,21 +25,20 @@ The server prints the dashboard URL and the machine's LAN IP. Open **http://loca
 header will show *EA: offline* until MT5 is connected. Then follow
 [`SETUP-GUIDE.md`](SETUP-GUIDE.md) to compile/attach the EA and allow-list the WebRequest URL.
 
-> Ports/EA naming: the live system uses **port 8766** and the **`SLCDataBridge`** EA. The older
-> `trading-bot/README.md` mentions 8765 / `MT5DataBridge`; prefer 8766 / `SLCDataBridge`.
+> Ports/EA naming: the live system uses **port 8766** and the **`SLCDataBridge`** EA throughout the
+> docs. (The `legacy/` build legitimately uses 8765 / `MT5DataBridge` — see [`CONSOLIDATION.md`](CONSOLIDATION.md).)
 
-## 3. What ships with state (and what that means)
+## 3. What ships — and what doesn't
 
-This is a **working snapshot**, not a blank template:
+This repo ships **code, docs, and config only** — no runtime state and no secrets:
 
-- `trading-bot/data/trading.db` — full paper trade history, equity curve, signals, **and the live
-  Telegram/Discord credentials**. On first run the values in this DB win over `config.yaml`.
-- `trading-bot/state/` — runtime logs, news decisions, spread traces, sanity/validation reports.
-- `trading-bot/.backups/` — timestamped backups of config/code taken before edits.
-
-Because the credentials are live, **read [`SECURITY.md`](SECURITY.md)** before pushing this anywhere.
-If a teammate wants a clean start, delete `trading-bot/data/trading.db` (it's recreated empty) and
-re-enter credentials via the dashboard.
+- `trading-bot/data/` (the SQLite DB) and `trading-bot/state/` (logs, news decisions, spread traces)
+  are **gitignored and not in the repo**. They are created on first run.
+- `trading-bot/config.yaml` ships startup defaults with **empty** credential fields. On first run the
+  bot creates `data/trading.db` from these defaults; settings you change in the dashboard (including
+  Telegram/Discord credentials) are written to that DB and win over `config.yaml` thereafter.
+- There are therefore **no live credentials in a clone**. Enter them via the dashboard on each
+  deployment, and read [`SECURITY.md`](SECURITY.md) before sharing the repo.
 
 ## 4. Paper vs live (the safety model)
 
@@ -56,10 +55,10 @@ going live.** If another system manages stops on the same MT5 account, run live 
 
 - **Dashboard** (`http://localhost:8766`): performance, chart with entry/exit markers, trade history
   filters, live per-symbol engine analysis, pairs manager, and the settings panel.
-- **Cowork skills** (`slc-*.skill`): operate it conversationally — `slc-status` (open trades / equity /
-  PnL), `slc-tv-context` (market snapshot, USD bias, top setups), `slc-sanity` (parameter sweep +
-  health + tuning recommendations), `slc-backtest` (replay stored bars). Install the `.skill` files
-  via Settings → Capabilities.
+- **Cowork skill** (`cowork-skills/slc-bot/`): operate it conversationally. The consolidated `slc-bot`
+  skill (operate / analyze / develop, loaded on demand) replaces the four older root-level
+  `slc-*.skill` bundles (status, tv-context, sanity, backtest). Package and install it via
+  Cowork → Settings → Capabilities. See [`cowork-skills/README.md`](cowork-skills/README.md).
 - **Self-tuning agent**: evaluates every 4 h once ≥15 trades close; only nudges a small whitelist of
   parameters and can never touch risk %, stops, concurrency, or trading mode. Toggle/force-run it from
   the dashboard header.
