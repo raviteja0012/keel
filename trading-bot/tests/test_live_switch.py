@@ -75,6 +75,19 @@ def _seed_gate_worthy_sample(n=55, strategy="slc", symbol="EURUSD"):
          "daily stop (-2.0%) hit", "London"))
 
 
+def _sign_and_settle(strategy="slc", a_class="forex", signed_by="mahmed", note=""):
+    """Sign off, then backdate the row past SIGNOFF_MIN_AGE_S. A sign-off is
+    deliberately not usable the instant it is written (no sign-and-go), so any
+    test that wants an OPEN gate has to let it settle the way an operator would."""
+    r = client.post("/api/live/signoff", headers=H,
+                    json={"strategy": strategy, "asset_class": a_class,
+                          "signed_by": signed_by, "note": note}).json()
+    assert r["ok"], r
+    storage.execute("UPDATE promotion_signoffs SET t=? WHERE strategy=? AND asset_class=?",
+                    (int(time.time()) - analysis.SIGNOFF_MIN_AGE_S - 60, strategy, a_class))
+    return r
+
+
 def _wipe():
     for t in ("trades", "decisions", "promotion_signoffs", "param_changes"):
         storage.execute("DELETE FROM %s" % t)
@@ -120,10 +133,7 @@ def test_3_gate_without_signoff_refuses():
 def test_4_full_promotion_path():
     _wipe()
     _seed_gate_worthy_sample(n=55)
-    assert client.post("/api/live/signoff", headers=H,
-                       json={"strategy": "slc", "asset_class": "forex",
-                             "signed_by": "mahmed",
-                             "note": "forward-test continuation, min size"}).json()["ok"]
+    _sign_and_settle(note="forward-test continuation, min size")
     assert analysis.promotion_status()["cells"]["slc|forex"]["gate_open"]
 
     r = client.post("/api/live/request", headers=H).json()
@@ -155,9 +165,7 @@ def test_4_full_promotion_path():
 def test_5_confirm_expiry():
     _wipe()
     _seed_gate_worthy_sample(n=55)
-    client.post("/api/live/signoff", headers=H,
-                json={"strategy": "slc", "asset_class": "forex",
-                      "signed_by": "mahmed"})
+    _sign_and_settle()
     r = client.post("/api/live/request", headers=H).json()
     assert r["ok"]
     live_switch._pending["exp"] = time.time() - 1        # force expiry
@@ -170,9 +178,7 @@ def test_5_confirm_expiry():
 def test_6_confirm_revalidates_blockers():
     _wipe()
     _seed_gate_worthy_sample(n=55)
-    client.post("/api/live/signoff", headers=H,
-                json={"strategy": "slc", "asset_class": "forex",
-                      "signed_by": "mahmed"})
+    _sign_and_settle()
     r = client.post("/api/live/request", headers=H).json()
     assert r["ok"]
     storage.set_setting("halt_new_entries", True)        # world changed
@@ -198,6 +204,42 @@ def test_7_fail_safes_block_request():
         assert not r["ok"] and "integrity" in r["reason"]
     finally:
         storage._clear_suspect()
+
+
+def test_10_signoff_must_settle_before_it_counts():
+    """One actor holding the token must not be able to sign off and go live in
+    two consecutive calls — the attestation has to sit for SIGNOFF_MIN_AGE_S."""
+    _wipe()
+    _set_trust("GROUNDED")      # these tests sort ahead of test_1, seed it here
+    _seed_gate_worthy_sample(n=55)
+    client.post("/api/live/signoff", headers=H,
+                json={"strategy": "slc", "asset_class": "forex",
+                      "signed_by": "mahmed"})          # fresh, NOT settled
+    chk = analysis.promotion_status()["cells"]["slc|forex"]["checks"]["manual_signoff"]
+    assert not chk["pass"], "a seconds-old sign-off must not open the gate"
+    assert "settle" in chk["reason"], chk
+    r = client.post("/api/live/request", headers=H).json()
+    assert not r["ok"], "sign-and-go must be refused"
+    assert storage.get_setting("trading_mode") == "paper"
+
+
+def test_11_param_change_invalidates_signoff():
+    """A sign-off attests to behaviour. Change the behaviour and the attestation
+    is void until someone re-validates and re-signs (CLAUDE.md promotion gate)."""
+    _wipe()
+    _set_trust("GROUNDED")
+    _seed_gate_worthy_sample(n=55)
+    _sign_and_settle()
+    assert analysis.promotion_status()["cells"]["slc|forex"]["gate_open"]
+    storage.execute(
+        "INSERT INTO param_changes(t,origin,key,old,new,accepted) VALUES(?,?,?,?,?,1)",
+        (int(time.time()), "human", "min_rr", "2.5", "2.2"))
+    chk = analysis.promotion_status()["cells"]["slc|forex"]["checks"]["manual_signoff"]
+    assert not chk["pass"], "sign-off predating a param change must not count"
+    assert "re-validate" in chk["reason"], chk
+    r = client.post("/api/live/request", headers=H).json()
+    assert not r["ok"], r
+    assert storage.get_setting("trading_mode") == "paper"
 
 
 def test_8_all_live_endpoints_require_token():

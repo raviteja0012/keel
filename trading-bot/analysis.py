@@ -214,6 +214,13 @@ def drawdown_forensics(mode: str = "paper",
 # ------------------------------------------------------- promotion gate
 GATE_MIN_TRADES = 50
 
+# A sign-off is a human attestation, and an attestation has to be able to go
+# stale. Without these two bounds the row is permanent: one call to /signoff
+# satisfies the gate forever, and the same actor holding the dashboard token
+# can sign off and request live in two consecutive calls.
+SIGNOFF_MIN_AGE_S = 3600            # must sit for an hour — no sign-and-go
+SIGNOFF_MAX_AGE_S = 30 * 86400      # and expires after 30 days
+
 
 def _data_trust() -> Dict[str, Any]:
     """Latest hallucination_check verdict (the data-trust gate). Read-only;
@@ -227,6 +234,31 @@ def _data_trust() -> Dict[str, Any]:
                 "ts": rec.get("ts"), "age_h": round((time.time() - rec.get("ts", 0)) / 3600, 1)}
     except Exception:
         return {"verdict": "unknown", "ts": None, "age_h": None}
+
+
+def _signoff_check(signed: Optional[Dict[str, Any]],
+                   last_param_change: int) -> Dict[str, Any]:
+    """The manual_signoff gate check. Fails CLOSED on every uncertainty:
+    missing, too fresh (sign-and-go in one motion), expired, or predating the
+    newest accepted parameter change (it attests to behaviour that changed)."""
+    if not signed:
+        return {"pass": False, "value": None, "reason": "no sign-off recorded"}
+    age = int(time.time()) - int(signed["t"] or 0)
+    who = signed.get("signed_by")
+    if age < SIGNOFF_MIN_AGE_S:
+        return {"pass": False, "value": who,
+                "reason": "sign-off is %dm old; must settle for %dm before it "
+                          "counts (no sign-and-go)"
+                          % (age // 60, SIGNOFF_MIN_AGE_S // 60)}
+    if age > SIGNOFF_MAX_AGE_S:
+        return {"pass": False, "value": who,
+                "reason": "sign-off expired (%dd old, max %dd) — re-attest"
+                          % (age // 86400, SIGNOFF_MAX_AGE_S // 86400)}
+    if last_param_change and int(signed["t"] or 0) < last_param_change:
+        return {"pass": False, "value": who,
+                "reason": "parameters changed after this sign-off — re-validate "
+                          "then re-attest"}
+    return {"pass": True, "value": who, "age_s": age}
 
 
 def promotion_status() -> Dict[str, Any]:
@@ -245,6 +277,11 @@ def promotion_status() -> Dict[str, Any]:
         "SELECT DISTINCT stage FROM decisions WHERE action='skipped'")}
     signoffs = storage.query(
         "SELECT * FROM promotion_signoffs ORDER BY t DESC")
+    # a sign-off made BEFORE the newest accepted parameter change attests to
+    # behaviour that no longer exists (CLAUDE.md: re-validate after changes)
+    _lpc = storage.query_one(
+        "SELECT MAX(t) m FROM param_changes WHERE accepted=1")
+    last_param_change = (_lpc or {}).get("m") or 0
     out = {}
     for key, trs in sorted(cells.items()):
         strat, cls = key.split("|")
@@ -262,8 +299,7 @@ def promotion_status() -> Dict[str, Any]:
                 "pass": bool({"loss_limit", "exposure", "concurrency"} & rails_seen),
                 "value": sorted(rails_seen),
                 "note": "risk rails must have demonstrably fired in paper"},
-            "manual_signoff": {"pass": signed is not None,
-                               "value": (signed or {}).get("signed_by")},
+            "manual_signoff": _signoff_check(signed, last_param_change),
         }
         out[key] = {"strategy": strat, "asset_class": cls, "stats": st,
                     "checks": checks,

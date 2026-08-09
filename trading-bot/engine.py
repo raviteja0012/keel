@@ -264,9 +264,12 @@ def loss_governor(mode: str) -> float:
     """Playbook §10.3: after 3 consecutive losses, halve risk until 2
     consecutive wins. Derived from the trades table (restart-safe — no
     counters to lose)."""
+    # pnl IS NOT NULL matters: "(r['pnl'] or 0) < 0" reads NULL as a WIN, so a
+    # closed row that never got its pnl written would reset the loss streak and
+    # silently un-halve risk. Invariant 10 must not be defeated by bad data.
     rows = storage.query(
         "SELECT pnl FROM trades WHERE mode=? AND status='closed' "
-        "ORDER BY exit_time DESC LIMIT 50", (mode,))
+        "AND pnl IS NOT NULL ORDER BY exit_time DESC LIMIT 50", (mode,))
     halved, consec_loss, consec_win = False, 0, 0
     for r in reversed(rows):                       # oldest -> newest
         if (r["pnl"] or 0) < 0:
