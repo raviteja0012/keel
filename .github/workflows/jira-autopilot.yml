@@ -24,8 +24,14 @@ name: Jira autopilot
 # Until those exist the workflow exits quietly, so it is safe to merge now.
 
 on:
-  schedule:
-    - cron: "11,41 * * * *"
+  # The schedule is OFF until a Jira board exists. It was firing every half hour
+  # and exiting at the secrets gate in eight seconds: harmless, but it is noise in
+  # the Actions history and it trains you to ignore a workflow that will one day
+  # matter. Sweeping a board that does not exist is not a useful default.
+  #
+  # Re-enable by uncommenting, once JIRA_PROJECT_KEY and the rest are set.
+  # schedule:
+  #   - cron: "11,41 * * * *"
   workflow_dispatch:
     inputs:
       issue_key:
