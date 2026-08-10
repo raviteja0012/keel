@@ -13,10 +13,11 @@ Runs as a daemon thread started by server.py. All mutable runtime
 parameters come from storage.settings (dashboard- and agent-tunable).
 """
 import json
+import math
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import decisions
 import exposure
@@ -367,6 +368,8 @@ def feed_report(now: Optional[float] = None) -> Dict[str, Any]:
 # ------------------------------------------------- venue-sourced prices
 _venue_meta_cache: Dict[str, Dict[str, Any]] = {}
 _VENUE_META_TTL_S = 3600
+# A FAILED metadata lookup is retried within the minute, not cached for an hour.
+_VENUE_META_FAIL_TTL_S = 60
 
 
 def _match_back(want: Dict[str, str], venue_symbol: str) -> Optional[str]:
@@ -388,15 +391,25 @@ def _venue_tick_meta(vname: str, adapter: Any, symbol: str) -> Dict[str, Any]:
     this"."""
     key = "%s|%s" % (vname, symbol)
     hit = _venue_meta_cache.get(key)
-    if hit and time.time() - hit["t"] < _VENUE_META_TTL_S:
-        return dict(hit["meta"])
+    if hit:
+        # A SUCCESS is cached for the full TTL: instrument increments change
+        # rarely. A FAILURE is retried within the minute. Caching a failure for
+        # an hour meant one transient error left every position on that symbol
+        # unvaluable — and therefore new entries halted — long after the venue
+        # had recovered.
+        ttl = _VENUE_META_TTL_S if hit["meta"] else _VENUE_META_FAIL_TTL_S
+        if time.time() - hit["t"] < ttl:
+            return dict(hit["meta"])
     meta: Dict[str, Any] = {}
     try:
         m = adapter.symbol_meta(symbol)
         ts = float(getattr(m, "tick_size", 0) or 0)
-        if ts > 0:
-            meta = {"tick_size": ts, "point": ts,
-                    "tick_value": ts * float(getattr(m, "contract_size", 1.0) or 1.0)}
+        tv = ts * float(getattr(m, "contract_size", 1.0) or 1.0)
+        # Both must be finite and positive. NaN passes "> 0" as False so it is
+        # excluded here, but inf would pass, and an infinite tick_value silently
+        # poisons every sizing and P&L calculation downstream.
+        if ts > 0 and tv > 0 and math.isfinite(ts) and math.isfinite(tv):
+            meta = {"tick_size": ts, "point": ts, "tick_value": tv}
     except Exception:
         meta = {}
     _venue_meta_cache[key] = {"t": time.time(), "meta": meta}
@@ -632,8 +645,27 @@ def _pnl_since(mode: str, since_ts: int) -> float:
     return row["s"] if row else 0.0
 
 
-def _open_pnl(mode: str) -> float:
-    return round(sum(trade_upnl(t) or 0 for t in storage.open_trades(mode)), 2)
+def _open_pnl(mode: str) -> Tuple[float, int]:
+    """Open P&L, and how many positions could NOT be valued.
+
+    The count is the point. This used to be sum(trade_upnl(t) or 0), which turns
+    an UNKNOWN into a ZERO, and zero reads as "that position is flat" - the most
+    reassuring possible answer to a question we could not answer. A venue whose
+    symbol_meta call failed writes a price record with no tick_value, trade_upnl
+    then returns None for every position quoted from it, and the open drawdown
+    feeding the daily and weekly kill switches becomes exactly nothing while the
+    book is underwater. Invariant 9 defeated, silently, by an `or 0`.
+
+    Callers get the count and must decide. Nobody may collapse it back to one
+    number."""
+    total, unknown = 0.0, 0
+    for t in storage.open_trades(mode):
+        v = trade_upnl(t)
+        if v is None:
+            unknown += 1
+        else:
+            total += v
+    return round(total, 2), unknown
 
 
 def _broker_offset() -> float:
@@ -650,7 +682,20 @@ def loss_limits_hit(mode: str, balance: float, p: Dict) -> Optional[str]:
     if balance <= 0:
         return None
     day0, week0 = sessions.day_week_start("broker", broker_offset_s=_broker_offset())
-    open_dd = min(0.0, _open_pnl(mode))
+    open_pnl, unvalued = _open_pnl(mode)
+
+    # A position we cannot value is not a position worth nothing. If any open
+    # trade has no usable quote, the drawdown feeding these stops is understated
+    # by an unknown amount, so the honest reading of "am I past my daily stop?"
+    # is "I cannot tell" - and the fail-closed answer to that is to stop opening
+    # new ones. This does NOT touch existing positions; their stops are managed
+    # on the last confirmed price by manage_open_trades.
+    if unvalued:
+        return ("cannot value %d open position%s (no usable quote) — open "
+                "drawdown is unknown, so new entries stand aside"
+                % (unvalued, "" if unvalued == 1 else "s"))
+
+    open_dd = min(0.0, open_pnl)
     if _pnl_since(mode, day0) + open_dd <= -balance * p["daily_stop_pct"] / 100:
         return "daily stop (-%.1f%%) hit" % p["daily_stop_pct"]
     if _pnl_since(mode, week0) + open_dd <= -balance * p["weekly_stop_pct"] / 100:
