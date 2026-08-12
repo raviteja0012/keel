@@ -701,6 +701,81 @@ def test_a_declared_source_is_believed_but_never_resurrected():
         "a direct write resurrected a source a failed poll had marked down"
 
 
+def test_a_position_is_never_managed_off_another_venues_book():
+    """The price book is keyed by SYMBOL alone, so whoever wrote last owns the
+    quote. The stop, the R-multiple, TP1 and the trail are all decided from that
+    price, and two venues do not print the same book — an MT5 position trailed
+    off a crypto exchange's bid is a stop moved to a level the broker never
+    showed. A position is managed on its own venue's book or not at all."""
+    _reset_feed()
+    _wipe("trades")
+    _wipe("commands")
+    tid = _open_trade(CRYPTO, mode="live", ticket=987654321)
+    tr = storage.query_one("SELECT * FROM trades WHERE id=?", (tid,))
+    assert engine._holding_source(dict(tr)) == engine.MT5_SOURCE
+
+    # only a VENUE quotes the symbol, and it is far through the MT5 stop
+    _venue_push(symbol=CRYPTO, bid=58000.0, ask=58001.0)
+    assert engine.price_state(CRYPTO)["source"] != engine.MT5_SOURCE
+
+    engine.manage_open_trades(_params(trading_mode="live"))
+    after = storage.query_one(
+        "SELECT status, sl, tp1_done FROM trades WHERE id=?", (tid,))
+    assert after["status"] == "open", "closed off a book it is not held in"
+    assert after["tp1_done"] == 0
+    assert not storage.query("SELECT id FROM commands"), \
+        "queued an MT5 order priced off another venue"
+    _wipe("trades")
+
+
+def test_paper_positions_have_no_holder_and_mark_on_any_usable_quote():
+    """The mirror of the rule above. Paper and shadow trades are not HELD
+    anywhere, so demanding a matching venue would strand them with no way to be
+    marked at all."""
+    _reset_feed()
+    _wipe("trades")
+    tid = _open_trade(CRYPTO, mode="paper")
+    tr = storage.query_one("SELECT * FROM trades WHERE id=?", (tid,))
+    assert engine._holding_source(dict(tr)) is None
+    _venue_push(symbol=CRYPTO, bid=60500.0, ask=60501.0)
+    engine.manage_open_trades(_params())
+    after = storage.query_one("SELECT mfe FROM trades WHERE id=?", (tid,))
+    assert after["mfe"] is not None, "a paper trade must still be marked"
+    _wipe("trades")
+
+
+def test_sizing_uses_the_same_record_that_was_routed():
+    """try_execute used to read the book three times: once for freshness, once
+    for the routing check, and again inside calc_lots. With the venue poller as
+    a second writer those need not be the same record, so an order could be
+    routed on one quote's provenance and sized off another's tick metadata."""
+    _reset_feed()
+    _no_venues()
+    _mt5_push(symbol=FX, bid=1.1000, ask=1.10008, tick_size=0.0001,
+              tick_value=1.0)
+    routed = engine.price_state(FX)["price"]
+
+    # The book is replaced under us with genuinely different economics. Note
+    # what sizing actually depends on: the RATIO tick_value/tick_size. An
+    # earlier version of this fixture used 0.01/100.0, which looks wildly
+    # different and is arithmetically identical to 0.0001/1.0 — the test caught
+    # its own fixture, which is the behaviour we want from it.
+    engine.feed_state["prices"][FX] = {
+        "symbol": FX, "bid": 1.1000, "ask": 1.10008,
+        "tick_size": 0.0001, "tick_value": 10.0,       # ratio 10x the routed one
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
+
+    routed_lots = engine.calc_lots(FX, 1.10008, 1.0950, 100.0, price=routed)
+    reread_lots = engine.calc_lots(FX, 1.10008, 1.0950, 100.0)
+    assert routed_lots != reread_lots, \
+        "fixture did not make the two records differ: %r" % (routed_lots,)
+    assert routed_lots[0] > 0, routed_lots
+    # the property: passing the record pins the answer to THAT record, whatever
+    # the book has since become
+    assert engine.calc_lots(FX, 1.10008, 1.0950, 100.0,
+                            price=routed) == routed_lots
+
+
 def test_a_future_stamp_is_clock_skew_not_a_fresh_price():
     """fresh = age <= max_age had no LOWER bound, so a quote stamped in the
     future was fresh forever - the same permanently-tradable state this rail

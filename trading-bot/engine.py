@@ -890,11 +890,23 @@ def params() -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------ sizing
-def calc_lots(symbol: str, entry: float, sl: float, risk_amount: float):
-    """Broker-exact sizing from tick_value/tick_size pushed by the EA.
-    Returns (lots, actual_risk) so the caller can record the TRUE risk
-    after lot rounding (min-lot floors can otherwise overstate it)."""
-    p = feed_state["prices"].get(symbol)
+def calc_lots(symbol: str, entry: float, sl: float, risk_amount: float,
+              price: Optional[Dict[str, Any]] = None):
+    """Broker-exact sizing from tick_value/tick_size. Returns (lots,
+    actual_risk) so the caller can record the TRUE risk after lot rounding
+    (min-lot floors can otherwise overstate it).
+
+    `price` is the record the caller already validated, and passing it is what
+    makes the entry path atomic. try_execute used to read the book three times:
+    price_for_entry got one record, the routing rail checked THAT record's
+    source, and then this function looked the symbol up AGAIN. With the venue
+    poller running as a second writer, those need not be the same record — so an
+    order could be routed on the provenance of one quote and sized off the tick
+    metadata of another, from a different venue, with different increments.
+
+    One snapshot, checked once, used throughout. The symbol lookup remains only
+    as a fallback for callers that have no record in hand."""
+    p = price if price is not None else feed_state["prices"].get(symbol)
     if not p:
         return 0.0, 0.0
     tick_value = p.get("tick_value") or 0
@@ -1295,7 +1307,10 @@ def try_execute(sig: Dict, p: Dict) -> None:
         return skip(exp_reason, track=True, stage="exposure", checks=exp_snapshot)
 
     risk_amount = balance * risk_pct / 100.0
-    lots, actual_risk = calc_lots(symbol, entry, sig["sl"], risk_amount)
+    # Sized off the SAME record that was checked for freshness and routed, not a
+    # fresh lookup that the venue poller may have replaced in between.
+    lots, actual_risk = calc_lots(symbol, entry, sig["sl"], risk_amount,
+                                  price=price)
     if lots <= 0:
         return skip("could not size position (tick data missing)", stage="sizing")
     if actual_risk > risk_amount * 1.5:
@@ -1595,6 +1610,28 @@ def _clear_unmanaged(tr: Dict[str, Any]) -> None:
                % (tr["side"].upper(), tr["symbol"], time.time() - first))
 
 
+def _holding_source(tr: Dict[str, Any]) -> Optional[str]:
+    """Which source's book this position lives in, or None when unknown.
+
+    An MT5 ticket is decisive. Otherwise the venue declared for the symbol
+    decides, and only when exactly one venue declares it — a guess here would
+    re-create the fabrication defect in a new place, so ambiguity resolves to
+    None and the caller falls back to ordinary staleness handling rather than
+    inventing a holder.
+
+    Paper and shadow positions have no holder: they are not held anywhere, so
+    any usable quote for the symbol is the right one to mark them against."""
+    if tr.get("mode") not in ("live",):
+        return None
+    if tr.get("ticket"):
+        return MT5_SOURCE
+    try:
+        vs = declared_venues(tr["symbol"])
+    except Exception:
+        return None
+    return vs[0] if len(vs) == 1 else None
+
+
 def _held_at_mt5(tr: Dict[str, Any]) -> bool:
     """Is this live position held at MT5?
 
@@ -1617,6 +1654,22 @@ def manage_open_trades(p: Dict) -> None:
     for tr in open_trs:
         st = price_state(tr["symbol"])
         price_info = st["price"]
+        # The book is keyed by SYMBOL alone, so whoever wrote last owns the
+        # quote — and a position held at one venue could therefore be managed
+        # off another venue's price. That is not a cosmetic mismatch: the stop,
+        # the R-multiple, TP1 and the trail are all decided from `cur`, and two
+        # venues do not print the same book. A BTCUSD position at MT5 trailed
+        # off Binance's bid is a stop moved to a level the broker never showed.
+        #
+        # So a position is managed only on a quote from the venue that holds it.
+        # A mismatch is not "close enough" — it is no quote at all.
+        holder = _holding_source(tr)
+        if price_info and holder and st["source"] != holder:
+            _record_unmanaged(
+                tr, "held at %s but the live quote for %s is from %s — a "
+                    "position is managed on its own venue's book or not at all"
+                    % (holder, tr["symbol"], st["source"] or "nobody"))
+            continue
         if not price_info:
             _record_unmanaged(tr, st["reason"] or "no usable quote")
             continue
