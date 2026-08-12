@@ -16,6 +16,15 @@ Covers:
   * every entry rail behaves identically on a venue-sourced price
   * stale-source management is de-risk-only: the stop still fires, TP2 / TP1 /
     the trail do not
+  * price provenance is BOUND to the execution venue: a signal priced by a
+    venue is never submitted to MT5, and a live entry with no wired route is
+    refused rather than sent somewhere it can be filled
+  * the venue poll runs off the cycle: a wedged exchange never delays a stop
+  * an unstamped quote is stamped at the write layer, and a quote with no
+    clock fails CLOSED rather than reading as permanently fresh
+  * adapter exception text never reaches a persisted reason or a notification
+  * a held position the loop could not evaluate is recorded and announced
+  * the MT5 drop-copy guard applies only to positions actually held at MT5
 
 Run:  cd trading-bot && python3 tests/test_feed_decoupling.py
 """
@@ -23,6 +32,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +42,7 @@ import storage
 storage._DB_PATH = os.path.join(tempfile.mkdtemp(), "test.db")
 storage.init()
 
+import decisions
 import engine
 import instruments
 
@@ -59,13 +70,16 @@ class _FakeMeta:
 class _FakeVenue:
     """Stands in for a ccxt adapter. Only the two methods the price path uses."""
 
-    def __init__(self, ticks=None, raises=None):
+    def __init__(self, ticks=None, raises=None, delay=0.0):
         self.ticks = ticks or []
         self.raises = raises
+        self.delay = delay
         self.calls = 0
 
     def stream_prices(self, symbols):
         self.calls += 1
+        if self.delay:
+            time.sleep(self.delay)
         if self.raises:
             raise self.raises
         return iter(self.ticks)
@@ -88,6 +102,16 @@ def _install_venue(name=VENUE, symbols=(CRYPTO,), adapter=None):
     return ad
 
 
+def _install_venues(rows, adapters=None):
+    """Register several venues at once (routing-ambiguity cases)."""
+    ads = adapters or {}
+    engine._VENUES_AVAILABLE = True
+    engine._venues = type("V", (), {
+        "list_venues": staticmethod(lambda: [dict(r) for r in rows]),
+        "adapter": staticmethod(lambda n: ads.get(n) or _FakeVenue()),
+    })
+
+
 def _no_venues():
     engine._venues = type("V", (), {
         "list_venues": staticmethod(lambda: []),
@@ -95,23 +119,57 @@ def _no_venues():
     })
 
 
+# every notification the engine emitted since the last _reset_feed
+_notes = []
+
+
 def _reset_feed():
+    engine.stop_venue_poller()
     engine.feed_state["prices"] = {}
     engine.feed_state["sources"] = {}
     engine.feed_state["px_window"] = {}
     engine.feed_state["open_positions"] = []
     engine.feed_state["closed_today"] = []
     engine.feed_state["last_feed_t"] = 0
+    engine.feed_state["account"] = {}
+    engine.feed_state.pop("venue_poll", None)
     engine._recent_keys.clear()
     engine._venue_meta_cache.clear()
+    engine._unmanaged.clear()
+    engine._last_info.clear()
+    decisions._last_state.clear()
+    del _notes[:]
+    engine.set_notifier(_notes.append)
     storage.set_setting("ea_last_feed_t", 0)
     storage.set_setting("mt5_enabled", None)
+    # left ON deliberately: the leak tests below need the skip notification to
+    # actually be emitted so its CONTENT can be asserted
+    storage.set_setting("notify_signals", True)
     _wipe("trades")
     _wipe("signals")
+    _wipe("decisions")
+    _wipe("commands")
 
 
 def _wipe(table):
     storage.execute("DELETE FROM %s" % table)
+
+
+def _pending_commands():
+    return storage.query("SELECT * FROM commands WHERE status='pending'")
+
+
+def _last_decision(stage=None):
+    if stage:
+        return storage.query_one(
+            "SELECT * FROM decisions WHERE stage=? ORDER BY id DESC LIMIT 1",
+            (stage,))
+    return storage.query_one("SELECT * FROM decisions ORDER BY id DESC LIMIT 1")
+
+
+def _last_signal_reason():
+    row = storage.query_one("SELECT reason FROM signals ORDER BY id DESC LIMIT 1")
+    return (row["reason"] or "") if row else ""
 
 
 def _mt5_push(symbol=FX, bid=1.1000, ask=1.10008, age_s=0.0,
@@ -270,6 +328,9 @@ def test_stale_mt5_does_not_invent_a_live_close():
     tr = storage.query_one("SELECT * FROM trades WHERE id=?", (tid,))
     assert tr["status"] == "open", \
         "a stale drop copy must never be read as a broker close"
+    # the guard still applies where it should — and no longer silently
+    d = _last_decision("manage")
+    assert d and "drop copy stale" in (d["reason"] or ""), d
     _wipe("trades")
 
 
@@ -322,11 +383,19 @@ def test_stale_tick_cannot_overwrite_a_newer_one():
 
 
 def test_unreachable_venue_stands_aside_on_that_venue_only():
+    """CHANGED EXPECTATION: this used to assert `"connection reset" in
+    errs[VENUE]`, i.e. it asserted that the adapter's own exception text
+    propagates. That text is third-party and unbounded — ccxt puts the request
+    it sent in the message — and it flows into signals.reason (persisted) and
+    notify(). The old expectation was pinning the leak, so it is replaced by
+    its opposite: the raw text must NOT survive, only a classification."""
     _reset_feed()
     _mt5_push()                                     # MT5 healthy
     ad = _install_venue(adapter=_FakeVenue(raises=RuntimeError("connection reset")))
     errs = engine.refresh_venue_prices([CRYPTO])
-    assert VENUE in errs and "connection reset" in errs[VENUE], errs
+    assert VENUE in errs, errs
+    assert "connection reset" not in errs[VENUE], errs
+    assert errs[VENUE] == "adapter error (RuntimeError)", errs
     assert engine.source_state(VENUE)["reachable"] is False
     assert engine.price_for_entry(CRYPTO)[0] is None, \
         "an unreachable venue is not tradable"
@@ -451,7 +520,348 @@ def test_venue_price_without_tick_metadata_refuses_to_size():
     _wipe("signals")
 
 
-# --------------------------------- 5. the loop body, end to end
+# ------------------------- 5. provenance is bound to the execution venue
+def _live_ready():
+    """A deployment where a live MT5 order COULD be placed: an EA has reported
+    and there is a balance. Without this the routing test would pass for the
+    wrong reason."""
+    storage.set_setting("mt5_enabled", True)
+    engine.feed_state["account"] = {"balance": 10000.0, "equity": 10000.0}
+
+
+def test_live_entry_on_a_venue_symbol_never_reaches_the_mt5_queue():
+    """The proved defect: BTCUSD routed to a venue produced a live entry sized
+    off the venue's book and emitted type=open_trade to the MT5 command queue.
+    On a box with an EA attached that is a real order at the wrong broker."""
+    _reset_feed()
+    _live_ready()
+    _venue_push(bid=60000.0, ask=60001.0)           # quoted by binance-test
+    assert engine.price_state(CRYPTO)["source"] == VENUE
+    engine.try_execute(_sig(CRYPTO, key="route|live"),
+                       _params(trading_mode="live"))
+    assert storage.open_trades("live") == [], \
+        "a live entry with no wired route to its venue must not open"
+    assert _pending_commands() == [], \
+        "no command may be queued for a venue the EA does not hold"
+    d = _last_decision("routing")
+    assert d and d["action"] == "skipped", d
+    assert "no live execution path" in (d["reason"] or ""), d["reason"]
+    assert "no live execution path" in _last_signal_reason(), _last_signal_reason()
+
+
+def test_mt5_quote_cannot_fill_a_symbol_declared_on_a_venue():
+    """The mirror image: the EA quotes a symbol the registry says belongs to a
+    venue. Price and execution venue must be the same one."""
+    _reset_feed()
+    _live_ready()
+    _install_venue(symbols=(CRYPTO,))               # BTCUSD belongs to the venue
+    _mt5_push(symbol=CRYPTO, bid=60000.0, ask=60001.0,
+              tick_size=0.01, tick_value=0.01)
+    assert engine.price_state(CRYPTO)["source"] == engine.MT5_SOURCE
+    engine.try_execute(_sig(CRYPTO, key="route|mismatch"),
+                       _params(trading_mode="live"))
+    assert storage.open_trades("live") == [] and _pending_commands() == []
+    assert "declared on %s but quoted by mt5" % VENUE in _last_signal_reason(), \
+        _last_signal_reason()
+
+
+def test_two_venues_declaring_one_symbol_refuse_to_guess():
+    _reset_feed()
+    ad = _FakeVenue([_Tick(CRYPTO, 60000.0, 60001.0, time.time())])
+    _install_venues([{"name": VENUE, "kind": "ccxt", "symbols": [CRYPTO]},
+                     {"name": "kraken-test", "kind": "ccxt", "symbols": [CRYPTO]}],
+                    adapters={VENUE: ad, "kraken-test": ad})
+    engine.refresh_venue_prices([CRYPTO])
+    engine.try_execute(_sig(CRYPTO, key="route|ambig"), _params())
+    assert storage.open_trades("paper") == [], \
+        "an ambiguous route is not a route"
+    assert "more than one venue" in _last_signal_reason(), _last_signal_reason()
+
+
+def test_paper_entry_on_the_declaring_venue_is_allowed():
+    """The rail must refuse wrong routes without refusing right ones: paper is
+    filled by the engine itself against the venue that quoted it."""
+    _reset_feed()
+    _venue_push(bid=60000.0, ask=60001.0)
+    engine.try_execute(_sig(CRYPTO, key="route|ok"), _params())
+    trs = storage.open_trades("paper")
+    assert len(trs) == 1 and trs[0]["symbol"] == CRYPTO, trs
+    assert _pending_commands() == [], "paper never queues a broker command"
+    _wipe("trades")
+
+
+def test_execution_route_is_declaration_only():
+    _reset_feed()
+    _no_venues()
+    assert engine.declared_venues(CRYPTO) == [], \
+        "no registered venue means no venue declares anything"
+    r = engine.execution_route(CRYPTO, engine.MT5_SOURCE, "paper")
+    assert r["ok"] and r["kind"] == "mt5", r
+    r = engine.execution_route(CRYPTO, None, "paper")
+    assert not r["ok"] and "no source" in r["reason"], r
+    r = engine.execution_route(CRYPTO, "ghost-venue", "paper")
+    assert not r["ok"], r
+    _install_venue(symbols=(CRYPTO,))
+    assert engine.declared_venues(CRYPTO) == [VENUE]
+    assert engine.execution_route(CRYPTO, VENUE, "paper")["ok"] is True
+    assert engine.execution_route(CRYPTO, VENUE, "live")["ok"] is False
+
+
+# --------------------- 6. the venue poll never delays stop management
+def test_slow_venue_poll_does_not_delay_stop_management():
+    """The original defect was stop management blocked behind a feed. It came
+    back as a blocking call rather than a `continue`: refresh_venue_prices sat
+    ahead of manage_open_trades, so a 6s adapter delayed a breakeven move by
+    exactly 6s. The poll owns a thread now; the cycle must not wait for it."""
+    _reset_feed()
+    _venue_push(bid=61050.0, ask=61051.0)           # good print already in book
+    tid = _open_trade(CRYPTO)
+    slow = _install_venue(adapter=_FakeVenue(
+        [_Tick(CRYPTO, 61050.0, 61051.0, time.time())], delay=6.0))
+    storage.set_setting("enabled_pairs", [CRYPTO])
+    storage.set_setting("watch_pairs", [])
+    storage.set_setting("modes", ["swing"])
+
+    t0 = time.time()
+    th = threading.Thread(target=engine.engine_loop, args=(1,), daemon=True)
+    th.start()
+    try:
+        elapsed = None
+        while time.time() - t0 < 12:
+            tr = storage.query_one("SELECT * FROM trades WHERE id=?", (tid,))
+            if tr["tp1_done"] == 1:
+                elapsed = time.time() - t0
+                break
+            time.sleep(0.05)
+        assert elapsed is not None, "the stop was never moved at all"
+        assert slow.calls >= 1, \
+            "the slow poll must actually be in flight, or this proves nothing"
+        assert elapsed < 4.0, \
+            "breakeven took %.1fs — management is waiting on the venue poll" % elapsed
+    finally:
+        engine.stop()
+        th.join(timeout=5)
+        engine.stop_venue_poller(join_s=10)
+    _wipe("trades")
+
+
+# -------------------------- 7. a quote with no clock fails CLOSED
+def test_unstamped_write_is_stamped_and_ages_out():
+    """An unstamped record used to read age=None / fresh=True forever. The book
+    stamps it on the way in, so it has a real clock and expires like any other
+    quote — that is the property, not "it happens to work today"."""
+    _reset_feed()
+    _no_venues()
+    engine.feed_state["prices"][FX] = {
+        "symbol": FX, "bid": 1.1000, "ask": 1.10008,
+        "tick_value": 1.0, "tick_size": 0.0001}
+    p = engine.feed_state["prices"][FX]
+    assert p["src"] == engine.MT5_SOURCE and p["src_t"] > 0, p
+    st = engine.price_state(FX)
+    assert st["fresh"] and st["age"] is not None and st["age"] < 5, st
+    # rewind past the source limit: it must stop being tradable
+    engine.feed_state["prices"][FX]["src_t"] = \
+        time.time() - engine.MT5_PRICE_MAX_AGE_S - 30
+    assert engine.price_for_entry(FX)[0] is None, \
+        "a stamped quote must age out; nothing may be permanently tradable"
+
+
+def test_a_quote_with_no_clock_fails_closed():
+    """The rail itself, with the write layer bypassed: no timestamp means the
+    age is unknown, and unknown may never come back as fresh."""
+    _reset_feed()
+    _no_venues()
+    dict.__setitem__(engine.feed_state["prices"], FX,
+                     {"symbol": FX, "bid": 1.1000, "ask": 1.10008,
+                      "tick_value": 1.0, "tick_size": 0.0001})
+    st = engine.price_state(FX)
+    assert st["fresh"] is False and st["reachable"] is False, st
+    assert st["price"] is None and st["age"] is None, st
+    assert "no timestamp" in st["reason"], st["reason"]
+    engine.try_execute(_sig(FX, entry=1.10008, sl=1.0950, key="clock|none"),
+                       _params())
+    assert storage.open_trades("paper") == [], \
+        "an unclocked quote must never fill an entry"
+
+
+def test_a_source_nobody_has_heard_from_is_not_reachable():
+    _reset_feed()
+    _no_venues()
+    dict.__setitem__(engine.feed_state["prices"], CRYPTO,
+                     {"symbol": CRYPTO, "bid": 60000.0, "ask": 60001.0,
+                      "tick_value": 0.01, "tick_size": 0.01,
+                      "src": "ghost", "src_t": time.time()})
+    st = engine.price_state(CRYPTO)
+    assert st["fresh"] is True, st
+    assert st["reachable"] is False, "an unregistered source is unknown, not ok"
+    assert engine.price_for_entry(CRYPTO)[0] is None, st
+
+
+# ------------------- 8. adapter text never reaches a reason or a message
+_LEAK = ('binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions"} '
+         'apiKey=AKIAV7QZEXAMPLEKEY9 secret=s3cr3tZZ9 '
+         'signature=deadbeefcafe url=https://api.binance.com/api/v3/account')
+_LEAK_BITS = ("AKIAV7QZEXAMPLEKEY9", "s3cr3tZZ9", "deadbeefcafe", "apiKey")
+
+
+class _CcxtAuthenticationError(Exception):
+    """Shaped like the real thing: ccxt puts the request it sent in the text."""
+
+
+def _assert_no_leak(where, blob):
+    for bit in _LEAK_BITS:
+        assert bit not in blob, "%s leaked %r" % (where, bit)
+
+
+def test_adapter_exception_text_never_leaves_the_engine():
+    _reset_feed()
+    # a venue that WAS working and then throws: the path where the raw text
+    # reached price_state -> skip(reason) -> signals.reason + notify()
+    _venue_push(bid=60000.0, ask=60001.0)
+    _install_venue(adapter=_FakeVenue(raises=_CcxtAuthenticationError(_LEAK)))
+    errs = engine.refresh_venue_prices([CRYPTO])
+    _assert_no_leak("returned error", json.dumps(errs))
+    assert errs[VENUE] == "auth", errs
+
+    st = engine.source_state(VENUE)
+    _assert_no_leak("source record", json.dumps(st))
+    # and the doubled prefix is gone: "unreachable: unreachable: <raw>"
+    assert st["reason"].count("unreachable:") == 1, st["reason"]
+    assert st["reason"] == "%s unreachable: auth" % VENUE, st["reason"]
+
+    engine.try_execute(_sig(CRYPTO, key="leak|1"), _params())
+    _assert_no_leak("persisted signal reason", _last_signal_reason())
+    rows = storage.query("SELECT * FROM decisions")
+    _assert_no_leak("persisted decision", json.dumps(rows, default=str))
+    _assert_no_leak("notification", "\n".join(_notes))
+    assert _notes, "the skip notification must actually have been emitted"
+
+
+def test_source_detail_is_bounded_at_the_write_layer():
+    """A future call site that forgets to classify must not be able to store
+    raw text: the store refuses it, not the caller."""
+    _reset_feed()
+    engine._set_source(VENUE, "venue", reachable=False, detail=_LEAK)
+    st = engine.source_state(VENUE)
+    _assert_no_leak("write-layer detail", json.dumps(st))
+    assert st["detail"] == "unclassified adapter error", st["detail"]
+
+
+def test_error_classification_labels():
+    class AuthenticationError(Exception):
+        pass
+
+    class RequestTimeout(Exception):
+        pass
+
+    class ExchangeNotAvailable(Exception):
+        pass
+
+    got = [engine.classify_adapter_error(e(_LEAK))
+           for e in (AuthenticationError, RequestTimeout, ExchangeNotAvailable)]
+    assert got == ["auth", "timeout", "network"], got
+    _assert_no_leak("classification", "|".join(got))
+    assert engine.classify_adapter_error(ValueError(_LEAK)) == \
+        "adapter error (ValueError)"
+
+
+# ------------- 9. a position we could not evaluate is never silent
+def test_unmanaged_position_is_recorded_and_announced():
+    """A held symbol with no price used to `continue` silently: no decisions
+    row, no notification, nothing in _last_info — while the stop that only this
+    loop enforces went unevaluated for the whole outage."""
+    _reset_feed()
+    _no_venues()
+    tid = _open_trade(CRYPTO)
+    engine.manage_open_trades(_params())
+    d = _last_decision("manage")
+    assert d and d["action"] == "unmanaged" and d["symbol"] == CRYPTO, d
+    assert "no live price" in (d["reason"] or ""), d["reason"]
+    note = engine._last_info.get("manage|%s" % tid)
+    assert note and "UNMANAGED" in note["note"], note
+    assert any("POSITION UNMANAGED" in n for n in _notes), _notes
+
+    # it must not re-announce every 20s, but it must keep saying so
+    n_before = len(_notes)
+    engine.manage_open_trades(_params())
+    assert len(_notes) == n_before, "one announcement per outage, not per cycle"
+    assert engine._last_info["manage|%s" % tid]["note"], "still reported"
+
+    # and when the quote comes back, management resumes and says so
+    _venue_push(bid=61050.0, ask=61051.0)
+    engine.manage_open_trades(_params())
+    tr = storage.query_one("SELECT * FROM trades WHERE id=?", (tid,))
+    assert tr["tp1_done"] == 1, "management must resume"
+    assert "manage|%s" % tid not in engine._last_info
+    assert any("Management resumed" in n for n in _notes), _notes
+    _wipe("trades")
+
+
+def test_shadow_position_is_audited_but_never_notifies():
+    """Invariant 6: shadow trades are silent. They still get the audit row."""
+    _reset_feed()
+    _no_venues()
+    _open_trade(CRYPTO, mode="shadow")
+    engine.manage_open_trades(_params())
+    d = _last_decision("manage")
+    assert d and d["action"] == "unmanaged", d
+    assert not any("UNMANAGED" in n for n in _notes), _notes
+    _wipe("trades")
+
+
+def test_unmanaged_does_not_flip_flop_on_the_live_path():
+    """A live position with a good price but a stale MT5 drop copy is gated
+    AFTER the price check. Announcing "unmanaged" then "resumed" every cycle
+    for the length of an outage would train a human to ignore both."""
+    _reset_feed()
+    _mt5_push(symbol=CRYPTO, bid=60500.0, ask=60501.0)
+    _open_trade(CRYPTO, mode="live", ticket=555)
+    engine.feed_state["open_positions"] = [
+        {"ticket": 555, "comment": "SLC#1", "unrealized_pnl": 0.0, "swap": 0.0}]
+    engine.manage_open_trades(_params(trading_mode="live"))   # healthy: silent
+    assert not any("UNMANAGED" in n for n in _notes), _notes
+    # now the EA goes quiet with the last print still inside the price limit
+    engine.feed_state["sources"][engine.MT5_SOURCE]["last_t"] = time.time() - 600
+    for _ in range(3):
+        engine.manage_open_trades(_params(trading_mode="live"))
+    assert sum("UNMANAGED" in n for n in _notes) == 1, _notes
+    assert not any("resumed" in n for n in _notes), _notes
+    _wipe("trades")
+
+
+def test_zero_risk_distance_is_recorded_not_skipped():
+    _reset_feed()
+    _venue_push(bid=60000.0, ask=60001.0)
+    _open_trade(CRYPTO, entry=60000.0, sl=60000.0, initial_sl=60000.0)
+    engine.manage_open_trades(_params())
+    d = _last_decision("manage")
+    assert d and d["action"] == "unmanaged", d
+    assert "risk distance is zero" in (d["reason"] or ""), d["reason"]
+    _wipe("trades")
+
+
+# ------------- 10. the MT5 drop-copy guard is scoped to MT5-held trades
+def test_mt5_stale_does_not_suspend_a_venue_held_live_position():
+    """The live branch was gated on the MT5 feed for EVERY live trade whatever
+    venue held it — the same global-bypass shape this branch exists to delete.
+    A venue-held position must be judged on its own terms, and since no venue
+    execution path is wired, that judgement has to be said out loud."""
+    _reset_feed()
+    _mt5_push(age_s=600)                            # EA dead
+    _venue_push(bid=60500.0, ask=60501.0)           # venue healthy
+    tid = _open_trade(CRYPTO, mode="live")          # no ticket: not an MT5 fill
+    engine.manage_open_trades(_params(trading_mode="live"))
+    tr = storage.query_one("SELECT * FROM trades WHERE id=?", (tid,))
+    assert tr["status"] == "open", tr["status"]
+    d = _last_decision("manage")
+    assert d and d["action"] == "unmanaged", d
+    assert "not held at MT5" in (d["reason"] or ""), d["reason"]
+    assert "drop copy stale" not in (d["reason"] or ""), \
+        "the MT5 guard must not be what refused a venue-held position"
+    _wipe("trades")
+
+
+# --------------------------------- 11. the loop body, end to end
 def test_one_cycle_manages_and_analyses_without_any_mt5():
     """Drive the real loop body once with poll_seconds so small the sleep is
     irrelevant, and prove it did work rather than skipping to the sleep."""
@@ -462,7 +872,6 @@ def test_one_cycle_manages_and_analyses_without_any_mt5():
     storage.set_setting("watch_pairs", [])
     storage.set_setting("modes", ["swing"])
 
-    import threading
     t = threading.Thread(target=engine.engine_loop, args=(1,), daemon=True)
     t.start()
     try:
@@ -482,8 +891,20 @@ def test_one_cycle_manages_and_analyses_without_any_mt5():
     finally:
         engine.stop()
         t.join(timeout=5)
+        engine.stop_venue_poller(join_s=5)
         assert not t.is_alive(), "engine_loop must honour stop()"
     _wipe("trades")
+
+
+def _say(*parts):
+    """The engine's notifications carry emoji, so an assertion message can hold
+    a character the console encoding cannot. A test runner that dies printing a
+    failure reports 0 failures, which is the worst possible answer."""
+    line = " ".join(str(x) for x in parts)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "replace").decode("ascii"))
 
 
 if __name__ == "__main__":
@@ -493,12 +914,12 @@ if __name__ == "__main__":
     for fn in fns:
         try:
             fn()
-            print("ok  ", fn.__name__)
+            _say("ok  ", fn.__name__)
         except AssertionError as e:
             failed += 1
-            print("FAIL", fn.__name__, "-", e)
+            _say("FAIL", fn.__name__, "-", e)
         except Exception as e:
             failed += 1
-            print("ERR ", fn.__name__, "-", repr(e))
-    print("\n%d passed, %d failed" % (len(fns) - failed, failed))
+            _say("ERR ", fn.__name__, "-", repr(e))
+    _say("\n%d passed, %d failed" % (len(fns) - failed, failed))
     sys.exit(1 if failed else 0)

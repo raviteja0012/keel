@@ -77,8 +77,59 @@ chmod 600 "$OUT"
 # the rows in trades. It ALSO carries state/dashboard_token, which is a live
 # credential for the control plane, so this archive is 0600 and must never be
 # copied off the host unencrypted. Encrypt before it goes anywhere: see docs §7.
+#
+# WHY THIS ONE LINE NEEDS ALL THE CEREMONY BELOW
+# ----------------------------------------------
+# The engine rewrites state/open_spread.json every cycle and the news agent
+# appends to state/news_agent.log continuously, so tar reads files that are
+# changing underneath it and exits 1 ("file changed as we read it") as a matter
+# of routine. Exit 1 from GNU tar is a WARNING — the archive is written, every
+# other member is intact, and the changed member is captured as of the moment
+# it was read. Exit 2 is the fatal one.
+#
+# Under `set -e` that routine warning aborted this script, keel-stop.sh saw a
+# failed backup and REFUSED TO STOP THE STACK. The scripted safe stop was
+# unreliable exactly when it was needed, and the operator's remaining option
+# was --no-backup: no evidence saved at all. The DB snapshot above — the
+# promotion-gate evidence, the part that actually matters — had already been
+# taken and verified by then.
+#
+# So: distinguish 1 from 2, and do not take tar's word for either. The archive
+# is only accepted if it can be listed back, which is what catches a truncated
+# or half-written stream regardless of what exit code came with it.
 OUT_STATE="$DEST/keel-state-$STAMP.tar.gz"
-compose exec -T "$SERVICE" tar czf - -C /app/trading-bot/state . > "$OUT_STATE"
+TAR_RC=0
+compose exec -T "$SERVICE" tar czf - -C /app/trading-bot/state . > "$OUT_STATE" \
+  || TAR_RC=$?
+
+if [ "$TAR_RC" -ge 2 ]; then
+  echo "!! state archive FAILED (tar exit $TAR_RC) — that is a fatal tar error," >&2
+  echo "   not the routine 'file changed as we read it'. Discarding it." >&2
+  rm -f "$OUT_STATE"
+  echo "   The verified DB snapshot IS written: $OUT" >&2
+  exit 3
+fi
+
+# Verify by reading it back. An archive that lists is an archive that restores;
+# an unverified one is a guess, which is the same standard the DB snapshot above
+# is held to.
+#
+# Fed on stdin, not as `-f "$OUT_STATE"`: GNU tar reads a filename containing a
+# colon as host:path and tries to resolve a hostname. `keel-backup.sh /mnt/c:/b`
+# would then fail verification on a perfectly good archive and delete it.
+if ! tar tzf - < "$OUT_STATE" >/dev/null 2>&1; then
+  echo "!! state archive is unreadable (tar exit was $TAR_RC). Discarding it." >&2
+  rm -f "$OUT_STATE"
+  echo "   The verified DB snapshot IS written: $OUT" >&2
+  exit 3
+fi
+
+if [ "$TAR_RC" -eq 1 ]; then
+  echo "    note: tar exit 1 — files changed while being read. Expected on a"
+  echo "    running stack (open_spread.json every cycle, news_agent.log"
+  echo "    continuously). Archive verified readable; contents are a snapshot"
+  echo "    of each file as it was read, not a single instant."
+fi
 chmod 600 "$OUT_STATE"
 
 echo "==> wrote $OUT ($(du -h "$OUT" | cut -f1))"

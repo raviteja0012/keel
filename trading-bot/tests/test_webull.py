@@ -7,7 +7,9 @@ absence of credentials is a health RESULT and not an exception. Every HTTP call
 goes through a fake transport that records what the adapter would have sent.
 
 Covers:
-  * registry: kinds() carries webull, brokers.build and venues.adapter make one
+  * registry: a PLAIN `import brokers` in a clean subprocess registers webull,
+    and venues.upsert(kind="webull") builds one — importing the module from the
+    test would prove only that the test imported it
   * health(): no credentials -> result, not a raise, and no socket touched
   * health(): transport failure -> result, not a raise
   * symbol_meta(): refuses rather than guessing tick size / lot step / min qty,
@@ -20,17 +22,30 @@ Covers:
     instrument_type, unreadable balance, unreadable position
   * signing: deterministic, covers body and params, secret never transmitted
 
+The W1..W5 sections below are the regressions from the DO-NOT-SHIP review.
+Each asserts the BEHAVIOUR that was wrong — a submission that happened, a
+phantom order that was returned, a cancel that was reported — not the shape of
+the code that produced it.
+
+  W1  an indeterminate probe must never read as "no order there"
+  W2  the probe must verify the order it got back is the order it asked for
+  W3  the adapter must be registered by production import, not by the test
+  W4  cancel() must read the response before claiming the cancel happened
+  W5  NaN and Infinity must not pass a comparison-based numeric guard
+
 Run:  cd trading-bot && python3 tests/test_webull.py
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 # isolate DB writes BEFORE importing anything that touches storage
 import storage
@@ -44,6 +59,9 @@ from brokers import (Balance, Order, OrderResult, Position, SymbolMeta,
 
 CREDS = {"name": "wb", "api_key": "APPKEY123", "api_secret": "s3cr3t-app-secret",
          "account_id": "20150320010101001", "instrument_type": "EQUITY"}
+
+NAN = float("nan")
+INF = float("inf")
 
 
 # ------------------------------------------------------------- fake transport
@@ -68,6 +86,9 @@ class FakeHTTP:
         if isinstance(out, Exception):
             raise out
         date = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+        # json.dumps renders NaN/Infinity as bare literals and json.loads reads
+        # them straight back, which is exactly how a non-finite number arrives
+        # from a real venue that serialises floats the same way.
         return json.dumps(out), {"Date": date}
 
     def paths(self, method=None):
@@ -135,6 +156,59 @@ def test_venues_can_build_and_health_it():
 
 def test_read_only_is_the_default():
     assert webull.WebullVenue({"name": "wb"}).read_only is True
+
+
+# ------------------------------------------------------- W3 real registration
+def _subprocess(code, what):
+    """Run code in a clean interpreter rooted at trading-bot. Nothing this test
+    module imported is visible in there, which is the whole point."""
+    p = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, "%s failed (rc=%d)\nstdout: %s\nstderr: %s" % (
+        what, p.returncode, p.stdout.strip(), p.stderr.strip()[-1500:])
+    return p.stdout
+
+
+def test_w3_a_plain_import_of_brokers_registers_webull():
+    """The old suite imported brokers.webull at module top, so `kinds()`
+    contained webull because the TEST had imported it. In production nothing
+    did, and venues.upsert(kind="webull") raised 'unknown kind'."""
+    out = _subprocess(
+        "import sys\n"
+        "import brokers\n"
+        "assert 'brokers.webull' not in sys.modules or True\n"
+        "ks = brokers.kinds()\n"
+        "assert 'webull' in ks, 'kinds() = %r' % (ks,)\n"
+        "assert 'brokers.webull' in sys.modules, 'registered without importing?'\n"
+        "print('KINDS ' + ','.join(ks))\n",
+        "plain `import brokers`")
+    assert "webull" in out, out
+    assert "KINDS" in out, out
+
+
+def test_w3_venues_builds_a_webull_adapter_in_a_clean_process():
+    """The production path end to end: DB-backed venue registry, no test-side
+    import of the adapter module anywhere."""
+    out = _subprocess(
+        "import os, tempfile\n"
+        "import storage\n"
+        "storage._DB_PATH = os.path.join(tempfile.mkdtemp(), 'sub.db')\n"
+        "storage.init()\n"
+        "import venues\n"
+        "venues.upsert({'name': 'wb-sub', 'kind': 'webull'})\n"
+        "a = venues.adapter('wb-sub')\n"
+        "assert a.read_only is True, 'a new venue must arrive disarmed'\n"
+        "h = venues.health('wb-sub')\n"
+        "assert h['authenticated'] is False\n"
+        "print('BUILT ' + type(a).__name__)\n",
+        "venues.upsert(kind='webull')")
+    assert "BUILT WebullVenue" in out, out
+
+
+def test_w3_unknown_kinds_still_refuse():
+    """The registration fix must not have turned build() into a shrug."""
+    e = _raises(lambda: brokers.build("webu11", {}))
+    assert "unknown venue kind" in str(e), str(e)
 
 
 # --------------------------------------------------------------------- health
@@ -270,7 +344,8 @@ def _armed(routes, **overrides):
 
 
 def _not_found(q, b):
-    return urllib.error.HTTPError("u", 417, "no such order", {}, None)
+    """A DEFINITE negative from the venue: this order does not exist."""
+    return urllib.error.HTTPError("u", 404, "no such order", {}, None)
 
 
 def _placed(q, b):
@@ -322,7 +397,7 @@ def test_dropped_response_is_recovered_not_resubmitted():
 
     def probe(q, b):
         if state["posted"] == 0:
-            return urllib.error.HTTPError("u", 417, "no such order", {}, None)
+            return urllib.error.HTTPError("u", 404, "no such order", {}, None)
         return {"order_id": "WB-42", "client_order_id": "slc-drop",
                 "status": "FILLED", "filled_quantity": "2"}
 
@@ -375,6 +450,507 @@ def test_generated_client_order_id_fits_the_venue_limit():
         cid = webull.new_client_order_id()
         assert 0 < len(cid) <= 32, cid
     assert len(set(webull.new_client_order_id() for _ in range(200))) == 200
+
+
+# =============================================================== W1: the probe
+# An INDETERMINATE probe must never be treated as absence. Proved before the
+# fix: two calls with the same client_order_id and an unreachable probe both
+# times produced TWO submissions.
+
+def _unreachable(q, b):
+    return urllib.error.URLError("connection refused")
+
+
+def _count_posts(state):
+    def post(q, b):
+        state["posted"] += 1
+        return _placed(q, b)
+    return post
+
+
+def test_w1_unreachable_probe_refuses_to_submit():
+    state = {"posted": 0}
+    v, fake = _armed({("GET", "/trading/orders/get"): _unreachable,
+                      ("POST", "/trading/orders/place"): _count_posts(state)})
+    e = _raises(lambda: v.place_order(Order("slc-w1a", "AAPL", "buy", 1)))
+    assert state["posted"] == 0, "an unreachable probe must not authorise a submit"
+    assert fake.paths("POST") == []
+    low = str(e).lower()
+    assert "cannot confirm" in low, str(e)
+    assert "slc-w1a" in str(e), "the refusal must name the order it refused"
+
+
+def test_w1_two_calls_with_an_unreachable_probe_never_submit_twice():
+    """The exact proof from the review: same client_order_id, probe unreachable
+    both times. Before the fix this produced two submissions."""
+    state = {"posted": 0}
+    v, fake = _armed({("GET", "/trading/orders/get"): _unreachable,
+                      ("POST", "/trading/orders/place"): _count_posts(state)})
+    order = Order("slc-w1-dup", "AAPL", "buy", 5)
+    _raises(lambda: v.place_order(order))
+    _raises(lambda: v.place_order(order))
+    assert state["posted"] == 0, \
+        "two calls, probe blind both times, %d submissions" % state["posted"]
+    assert fake.paths("POST") == []
+    assert fake.paths("GET").count("/trading/orders/get") == 2, \
+        "each attempt must still probe; it just must not submit on a blind one"
+
+
+def test_w1_probe_401_is_not_read_as_absence():
+    state = {"posted": 0}
+    v, _ = _armed({("GET", "/trading/orders/get"):
+                   lambda q, b: urllib.error.HTTPError("u", 401, "bad key", {}, None),
+                   ("POST", "/trading/orders/place"): _count_posts(state)})
+    e = _raises(lambda: v.place_order(Order("slc-w1b", "AAPL", "buy", 1)))
+    assert state["posted"] == 0, "an auth failure says nothing about the order"
+    assert "401" in str(e), str(e)
+
+
+def test_w1_probe_500_is_not_read_as_absence():
+    state = {"posted": 0}
+    v, _ = _armed({("GET", "/trading/orders/get"):
+                   lambda q, b: urllib.error.HTTPError("u", 500, "boom", {}, None),
+                   ("POST", "/trading/orders/place"): _count_posts(state)})
+    e = _raises(lambda: v.place_order(Order("slc-w1c", "AAPL", "buy", 1)))
+    assert state["posted"] == 0
+    assert e.retryable is True, "a 5xx probe failure is transient; retry is safe"
+
+
+def test_w1_probe_417_is_not_read_as_absence_by_default():
+    """417 is Webull's ordinary business-rejection status. It cannot double as
+    'no such order' unless an operator has actually observed that."""
+    state = {"posted": 0}
+    v, _ = _armed({("GET", "/trading/orders/get"):
+                   lambda q, b: urllib.error.HTTPError("u", 417, "nope", {}, None),
+                   ("POST", "/trading/orders/place"): _count_posts(state)})
+    _raises(lambda: v.place_order(Order("slc-w1d", "AAPL", "buy", 1)))
+    assert state["posted"] == 0
+
+
+def test_w1_probe_empty_200_is_not_read_as_absence():
+    state = {"posted": 0}
+    v, _ = _armed({("GET", "/trading/orders/get"): lambda q, b: {},
+                   ("POST", "/trading/orders/place"): _count_posts(state)})
+    e = _raises(lambda: v.place_order(Order("slc-w1e", "AAPL", "buy", 1)))
+    assert state["posted"] == 0
+    assert "absence" in str(e).lower(), str(e)
+
+
+def test_w1_probe_error_envelope_is_not_read_as_absence():
+    state = {"posted": 0}
+    v, _ = _armed({("GET", "/trading/orders/get"):
+                   lambda q, b: {"code": "60001", "msg": "system busy"},
+                   ("POST", "/trading/orders/place"): _count_posts(state)})
+    _raises(lambda: v.place_order(Order("slc-w1f", "AAPL", "buy", 1)))
+    assert state["posted"] == 0
+
+
+def test_w1_a_definite_not_found_still_places():
+    """The fix must refuse uncertainty, not refuse everything: a venue that
+    definitely says 'no such order' still gets the submit."""
+    v, fake = _armed({("GET", "/trading/orders/get"): _not_found,
+                      ("POST", "/trading/orders/place"): _placed})
+    r = v.place_order(Order("slc-w1g", "AAPL", "buy", 1))
+    assert r.venue_order_id == "WB-9001"
+    assert fake.paths("POST") == ["/trading/orders/place"]
+
+
+def test_w1_indeterminate_recovery_probe_does_not_resubmit_or_claim_absence():
+    """Submit lands, response drops, and the follow-up probe cannot reach the
+    venue. The order may be live: say so, do not report it as not-placed."""
+    state = {"posted": 0}
+
+    def flaky_post(q, b):
+        state["posted"] += 1
+        return urllib.error.HTTPError("u", 503, "gateway", {}, None)
+
+    def probe(q, b):
+        if state["posted"] == 0:
+            return urllib.error.HTTPError("u", 404, "no such order", {}, None)
+        return urllib.error.URLError("connection reset")
+
+    v, fake = _armed({("GET", "/trading/orders/get"): probe,
+                      ("POST", "/trading/orders/place"): flaky_post})
+    e = _raises(lambda: v.place_order(Order("slc-w1h", "AAPL", "buy", 2)))
+    assert state["posted"] == 1, "must not resubmit into an unknown outcome"
+    low = str(e).lower()
+    assert "may be live" in low, str(e)
+    assert "not found at venue" not in low, \
+        "an unreachable follow-up probe is not evidence the order is absent"
+    assert e.retryable is False, \
+        "this needs reconciliation, not a retry loop"
+
+
+def test_w1_recovery_probe_finding_another_order_does_not_confirm_ours():
+    state = {"posted": 0}
+
+    def flaky_post(q, b):
+        state["posted"] += 1
+        return urllib.error.HTTPError("u", 503, "gateway", {}, None)
+
+    def probe(q, b):
+        if state["posted"] == 0:
+            return urllib.error.HTTPError("u", 404, "no such order", {}, None)
+        return {"order_id": "WB-SOMEONE-ELSE", "client_order_id": "slc-other",
+                "status": "FILLED", "filled_quantity": "9"}
+
+    v, _ = _armed({("GET", "/trading/orders/get"): probe,
+                   ("POST", "/trading/orders/place"): flaky_post})
+    e = _raises(lambda: v.place_order(Order("slc-w1i", "AAPL", "buy", 2)))
+    assert state["posted"] == 1
+    assert "may be live" in str(e).lower(), str(e)
+
+
+def test_w1_config_cannot_make_a_transport_failure_mean_absent():
+    for bad in (503, 500, 429, 401, 403):
+        e = _raises(lambda bad=bad: _venue(order_not_found_http=[bad]))
+        assert str(bad) in str(e), str(e)
+        assert "second fill" in str(e), str(e)
+
+
+def test_w1_config_can_add_an_observed_not_found_status():
+    """Once a real 417 'order does not exist' has been seen, the operator can
+    map it — and only then does 417 authorise a submit."""
+    v, fake = _armed({("GET", "/trading/orders/get"):
+                      lambda q, b: urllib.error.HTTPError("u", 417, "nope", {}, None),
+                      ("POST", "/trading/orders/place"): _placed},
+                     order_not_found_http=[417])
+    r = v.place_order(Order("slc-w1j", "AAPL", "buy", 1))
+    assert r.venue_order_id == "WB-9001"
+
+
+def test_w1_venue_error_carries_the_status_that_made_the_call_fail():
+    fake = FakeHTTP({("GET", "/trading/accounts/list"):
+                     lambda q, b: urllib.error.HTTPError("u", 418, "teapot", {}, None)})
+    e = _raises(lambda: _venue(fake).accounts())
+    assert e.http_status == 418, e.http_status
+
+
+def test_w1_unreachable_venue_error_has_no_status_at_all():
+    """None is the signal that the venue never answered. It must not be
+    confusable with a status code."""
+    def boom(*a, **kw):
+        raise urllib.error.URLError("dns is down")
+    e = _raises(lambda: _venue(boom).accounts())
+    assert e.http_status is None, e.http_status
+
+
+# ============================================================ W2: probe identity
+# The probe must verify the order it got back is the order it asked for.
+# Proved before the fix: asked to place slc-brand-new, the probe returned an
+# unrelated FILLED order, the adapter made zero POSTs and returned it.
+
+def test_w2_probe_answer_about_a_different_order_is_refused():
+    state = {"posted": 0}
+    other = {"order_id": "WB-OTHER", "client_order_id": "slc-someone-else",
+             "status": "FILLED", "filled_quantity": "100",
+             "avg_filled_price": "999.99"}
+    v, fake = _armed({("GET", "/trading/orders/get"): lambda q, b: other,
+                      ("POST", "/trading/orders/place"): _count_posts(state)})
+    e = _raises(lambda: v.place_order(Order("slc-brand-new", "AAPL", "buy", 1)))
+    assert "slc-someone-else" in str(e), str(e)
+    assert "slc-brand-new" in str(e), str(e)
+    assert state["posted"] == 0, "an unverified answer is not permission to submit"
+
+
+def test_w2_a_phantom_fill_is_never_returned_as_this_orders_result():
+    """The engine-facing shape of the same bug: whatever happens, this call must
+    not hand back an OrderResult describing somebody else's fill."""
+    other = {"order_id": "WB-OTHER", "client_order_id": "slc-someone-else",
+             "status": "FILLED", "filled_quantity": "100"}
+    v, _ = _armed({("GET", "/trading/orders/get"): lambda q, b: other,
+                   ("POST", "/trading/orders/place"): _placed})
+    try:
+        r = v.place_order(Order("slc-brand-new", "AAPL", "buy", 1))
+    except VenueError:
+        return                                    # refusing is the correct outcome
+    raise AssertionError(
+        "returned a result for a foreign order: id=%s status=%s filled=%s"
+        % (r.venue_order_id, r.status, r.filled_qty))
+
+
+def test_w2_probe_answer_with_no_client_order_id_is_refused():
+    """order_id alone does not prove the answer is about our key."""
+    state = {"posted": 0}
+    v, _ = _armed({("GET", "/trading/orders/get"):
+                   lambda q, b: {"order_id": "WB-77", "status": "FILLED"},
+                   ("POST", "/trading/orders/place"): _count_posts(state)})
+    e = _raises(lambda: v.place_order(Order("slc-w2c", "AAPL", "buy", 1)))
+    assert "none carrying client_order_id" in str(e), str(e)
+    assert state["posted"] == 0
+
+
+def test_w2_probe_picks_our_order_out_of_a_list():
+    rows = {"orders": [
+        {"order_id": "WB-1", "client_order_id": "slc-nope", "status": "FILLED"},
+        {"order_id": "WB-2", "client_order_id": "slc-w2d", "status": "PENDING"}]}
+    v, fake = _armed({("GET", "/trading/orders/get"): lambda q, b: rows,
+                      ("POST", "/trading/orders/place"): _placed})
+    r = v.place_order(Order("slc-w2d", "AAPL", "buy", 1))
+    assert r.venue_order_id == "WB-2", \
+        "matched on position in the list, not on client_order_id: got %s" \
+        % r.venue_order_id
+    assert r.status == "accepted", r.status
+    assert fake.paths("POST") == [], "our order is already there"
+
+
+def test_w2_place_response_naming_another_order_is_refused():
+    v, _ = _armed({("GET", "/trading/orders/get"): _not_found,
+                   ("POST", "/trading/orders/place"): lambda q, b: {
+                       "orders": [{"order_id": "WB-X",
+                                   "client_order_id": "slc-not-mine",
+                                   "status": "FILLED"}]}})
+    e = _raises(lambda: v.place_order(Order("slc-w2e", "AAPL", "buy", 1)))
+    assert "slc-not-mine" in str(e), str(e)
+
+
+# ================================================================= W4: cancel
+# cancel() returned True unconditionally without reading the response.
+
+def _cancel_venue(handler, **overrides):
+    return _armed({(webull._CANCEL_METHOD, "/trading/orders/cancel"): handler},
+                  **overrides)
+
+
+def test_w4_cancel_refused_inside_a_200_body_is_not_reported_as_success():
+    """The proved case: HTTP 200, body says the cancel did not happen."""
+    v, _ = _cancel_venue(lambda q, b: {"success": False,
+                                       "msg": "order already filled"})
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "did not confirm" in str(e), str(e)
+    assert "already filled" in str(e), \
+        "the venue's own reason has to reach the operator"
+
+
+def test_w4_cancel_confirmed_returns_true():
+    v, fake = _cancel_venue(lambda q, b: {"success": True, "order_id": "WB-9001"})
+    assert v.cancel("WB-9001") is True
+    assert fake.calls[0]["body"]["order_id"] == "WB-9001"
+
+
+def test_w4_cancel_accepts_a_cancelled_status_as_confirmation():
+    v, _ = _cancel_venue(lambda q, b: {"order_id": "WB-9001",
+                                       "status": "CANCELLED"})
+    assert v.cancel("WB-9001") is True
+
+
+def test_w4_a_pending_cancel_is_not_a_completed_cancel():
+    """PENDING_CANCEL means the venue took the request, not that the order is
+    dead — it can still lose the race to a fill."""
+    for st in ("PENDING_CANCEL", "CANCELLING"):
+        v, _ = _cancel_venue(lambda q, b, st=st: {"order_id": "WB-9001",
+                                                  "status": st})
+        e = _raises(lambda: v.cancel("WB-9001"))
+        assert "pending" in str(e).lower(), (st, str(e))
+
+
+def test_w4_disagreeing_flags_fail_closed():
+    v, _ = _cancel_venue(lambda q, b: {"success": True, "cancelled": False,
+                                       "order_id": "WB-9001"})
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "cancelled=False" in str(e), str(e)
+
+
+def test_w4_an_unreadable_success_flag_is_not_consent():
+    v, _ = _cancel_venue(lambda q, b: {"success": "maybe", "order_id": "WB-9001"})
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "cannot read as consent" in str(e), str(e)
+
+
+def test_w4_cancel_of_an_order_reported_filled_is_not_a_cancel():
+    v, _ = _cancel_venue(lambda q, b: {"order_id": "WB-9001", "status": "FILLED"})
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "filled" in str(e).lower(), str(e)
+
+
+def test_w4_cancel_with_an_unrecognised_body_is_not_reported_as_success():
+    for body in ({}, {"whatever": 1}, {"data": []}):
+        v, _ = _cancel_venue(lambda q, b, body=body: body)
+        e = _raises(lambda: v.cancel("WB-9001"))
+        assert "did not confirm" in str(e), (body, str(e))
+
+
+def test_w4_cancel_response_about_another_order_is_refused():
+    v, _ = _cancel_venue(lambda q, b: {"success": True, "order_id": "WB-OTHER"})
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "WB-OTHER" in str(e), str(e)
+
+
+def test_w4_cancel_error_envelope_still_raises():
+    v, _ = _cancel_venue(lambda q, b: {"code": "417", "msg": "already filled"})
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "417" in str(e), str(e)
+
+
+def test_w4_cancel_needs_an_order_id():
+    v, fake = _cancel_venue(lambda q, b: {"success": True})
+    _raises(lambda: v.cancel(""))
+    assert fake.calls == [], "an empty order id must not become a blind cancel"
+
+
+def test_w4_cancel_of_an_unreachable_venue_is_not_a_cancel():
+    v, _ = _cancel_venue(lambda q, b: urllib.error.URLError("down"))
+    e = _raises(lambda: v.cancel("WB-9001"))
+    assert "unreachable" in str(e).lower(), str(e)
+
+
+# ============================================================= W5: finiteness
+# _num used float() with no finiteness check, so NaN and Infinity passed every
+# guard built on comparison (nan <= 0 is False).
+
+def test_w5_num_refuses_a_non_finite_value_outright():
+    # two positional args only: this asserts the BEHAVIOUR of the old signature,
+    # so it cannot be satisfied by a shape change.
+    for bad in (NAN, INF, -INF, "nan", "Infinity", "-inf"):
+        e = _raises(lambda bad=bad: webull._num({"q": bad}, ("q",)))
+        assert "finite" in str(e), (bad, str(e))
+
+
+def test_w5_num_does_not_launder_a_nan_into_a_missing_field():
+    """Falling through to the next key would turn 'corrupt' into 'absent', and
+    every caller that writes `_num(...) or 0.0` would then read a confident
+    zero."""
+    e = _raises(lambda: webull._num({"qty": NAN, "quantity": 5},
+                                    ("qty", "quantity")))
+    assert "finite" in str(e), str(e)
+
+
+def test_w5_num_names_the_field_and_the_value_it_refused():
+    """The refusal is what an operator gets in the log; it has to be diagnostic."""
+    e = _raises(lambda: webull._num({"quantity": NAN}, ("quantity",),
+                                    "position quantity"))
+    assert "quantity" in str(e) and "position quantity" in str(e), str(e)
+
+
+def test_w5_num_still_returns_ordinary_numbers():
+    assert webull._num({"a": "1.5"}, ("a", "b")) == 1.5
+    assert webull._num({"a": "", "b": 2}, ("a", "b")) == 2.0
+    assert webull._num({"a": "abc"}, ("a",)) is None
+    assert webull._num({}, ("a",)) is None
+
+
+def _meta_venue(row):
+    fake = FakeHTTP({("GET", "/i"): lambda q, b: {"instruments": [row]}})
+    return _venue(fake, instrument_path="/i",
+                  instrument_fields={"tick_size": "tick", "lot_step": "lot",
+                                     "min_qty": "min_q", "min_notional": "min_n"})
+
+
+def test_w5_nan_tick_size_is_refused():
+    v = _meta_venue({"symbol": "AAPL", "tick": NAN, "lot": "1", "min_q": "1"})
+    e = _raises(lambda: v.symbol_meta("AAPL"))
+    assert "finite" in str(e), str(e)
+
+
+def test_w5_infinite_lot_step_is_refused():
+    v = _meta_venue({"symbol": "AAPL", "tick": "0.01", "lot": INF, "min_q": "1"})
+    assert "finite" in str(_raises(lambda: v.symbol_meta("AAPL")))
+
+
+def test_w5_nan_min_qty_is_refused():
+    v = _meta_venue({"symbol": "AAPL", "tick": "0.01", "lot": "1", "min_q": NAN})
+    assert "finite" in str(_raises(lambda: v.symbol_meta("AAPL")))
+
+
+def test_w5_non_finite_min_notional_is_refused_too():
+    v = _meta_venue({"symbol": "AAPL", "tick": "0.01", "lot": "1", "min_q": "1",
+                     "min_n": INF})
+    assert "finite" in str(_raises(lambda: v.symbol_meta("AAPL")))
+
+
+def test_w5_a_nan_increment_never_reaches_a_SymbolMeta():
+    """The comparison guard alone let both through: nan <= 0 and inf <= 0 are
+    both False."""
+    assert not (NAN <= 0) and not (INF <= 0), "premise of this test"
+    for bad in (NAN, INF):
+        v = _meta_venue({"symbol": "AAPL", "tick": bad, "lot": "1", "min_q": "1"})
+        try:
+            m = v.symbol_meta("AAPL")
+        except VenueError:
+            continue
+        raise AssertionError("accepted tick_size=%r" % (m.tick_size,))
+
+
+def test_w5_nan_position_quantity_is_refused():
+    fake = FakeHTTP({("GET", "/trading/assets/positions/list"): lambda q, b: {
+        "positions": [{"symbol": "AAPL", "quantity": NAN}]}})
+    e = _raises(lambda: _venue(fake).positions())
+    assert "finite" in str(e), str(e)
+
+
+def test_w5_infinite_position_quantity_is_refused():
+    fake = FakeHTTP({("GET", "/trading/assets/positions/list"): lambda q, b: {
+        "positions": [{"symbol": "AAPL", "quantity": INF}]}})
+    assert "finite" in str(_raises(lambda: _venue(fake).positions()))
+
+
+def test_w5_nan_position_pnl_is_refused_not_read_as_zero():
+    fake = FakeHTTP({("GET", "/trading/assets/positions/list"): lambda q, b: {
+        "positions": [{"symbol": "AAPL", "quantity": "10", "cost_price": "1",
+                       "unrealized_profit_loss": NAN}]}})
+    assert "finite" in str(_raises(lambda: _venue(fake).positions()))
+
+
+def test_w5_non_finite_balance_is_refused():
+    fake = FakeHTTP({("GET", "/trading/assets/balances/get"): lambda q, b: {
+        "account_currency_assets": [{"currency": "USD", "total_amount": INF}]}})
+    assert "finite" in str(_raises(lambda: _venue(fake).balances()))
+
+
+def test_w5_nan_order_quantity_never_reaches_the_venue():
+    v, fake = _armed({("GET", "/trading/orders/get"): _not_found,
+                      ("POST", "/trading/orders/place"): _placed})
+    e = _raises(lambda: v.place_order(Order("slc-w5a", "AAPL", "buy", NAN)))
+    assert "finite" in str(e), str(e)
+    assert fake.calls == [], "a corrupt order must not even open a connection"
+
+
+def test_w5_infinite_order_quantity_never_reaches_the_venue():
+    v, fake = _armed({("GET", "/trading/orders/get"): _not_found,
+                      ("POST", "/trading/orders/place"): _placed})
+    assert "finite" in str(
+        _raises(lambda: v.place_order(Order("slc-w5b", "AAPL", "buy", INF))))
+    assert fake.calls == []
+
+
+def test_w5_non_finite_limit_price_never_reaches_the_venue():
+    v, fake = _armed({("GET", "/trading/orders/get"): _not_found,
+                      ("POST", "/trading/orders/place"): _placed})
+    e = _raises(lambda: v.place_order(
+        Order("slc-w5c", "AAPL", "buy", 1, order_type="limit", limit_price=NAN)))
+    assert "finite" in str(e), str(e)
+    assert fake.calls == []
+
+
+def test_w5_zero_or_negative_quantity_is_refused():
+    v, fake = _armed({("GET", "/trading/orders/get"): _not_found,
+                      ("POST", "/trading/orders/place"): _placed})
+    for bad in (0, -1):
+        _raises(lambda bad=bad: v.place_order(Order("slc-w5d", "AAPL", "buy", bad)))
+    assert fake.calls == []
+
+
+def test_w5_decimal_str_refuses_to_render_a_non_finite_number():
+    for bad in (NAN, INF, -INF):
+        e = _raises(lambda bad=bad: webull._decimal_str(bad))
+        assert "finite" in str(e), (bad, str(e))
+    assert webull._decimal_str(0.00000123) == "0.00000123"
+
+
+def test_w5_nan_fill_quantity_is_not_reported_as_zero():
+    """A filled order whose size we cannot read must not come back as
+    filled_qty 0.0 — that is the UNKNOWN-becomes-ZERO bug in a new place."""
+    seen = {"order_id": "WB-8", "client_order_id": "slc-w5e", "status": "FILLED",
+            "filled_quantity": NAN}
+    v, _ = _armed({("GET", "/trading/orders/get"): lambda q, b: seen,
+                   ("POST", "/trading/orders/place"): _placed})
+    try:
+        r = v.place_order(Order("slc-w5e", "AAPL", "buy", 3))
+    except VenueError as e:
+        assert "finite" in str(e), str(e)
+        return
+    raise AssertionError("reported filled_qty=%r for an unreadable fill"
+                         % (r.filled_qty,))
 
 
 # --------------------------------------------------------------- fail closed
@@ -546,6 +1122,50 @@ def test_the_secret_is_never_transmitted():
     assert v._secret not in blob, "app secret must never leave the process"
 
 
+def test_no_refusal_message_leaks_the_secret():
+    """Refusal text ends up in logs and notifications. It must carry the reason,
+    never the credential."""
+    v, _ = _armed({("GET", "/trading/orders/get"): _unreachable})
+    e = _raises(lambda: v.place_order(Order("slc-leak", "AAPL", "buy", 1)))
+    assert v._secret not in str(e), str(e)
+    assert v._key not in str(e), str(e)
+
+
+class _EchoingError(urllib.error.HTTPError):
+    """A venue that quotes the request back inside its error body. Real APIs do
+    this, and the body lands in a VenueError message that gets persisted."""
+
+    def __init__(self, body):
+        urllib.error.HTTPError.__init__(self, "u", 401, "denied", {}, None)
+        self._body = body.encode()
+
+    def read(self):
+        return self._body
+
+
+def test_an_error_body_echoing_the_credentials_is_redacted():
+    key, secret = CREDS["api_key"], CREDS["api_secret"]
+    body = json.dumps({"msg": "bad signature for app_key=%s secret=%s"
+                              % (key, secret)})
+    fake = FakeHTTP({("GET", "/trading/accounts/list"):
+                     lambda q, b: _EchoingError(body)})
+    e = _raises(lambda: _venue(fake).accounts())
+    assert "401" in str(e), str(e)
+    assert secret not in str(e), str(e)
+    assert key not in str(e), str(e)
+    assert "<redacted>" in str(e), str(e)
+
+
+def test_a_non_json_error_page_echoing_a_credential_is_redacted():
+    """A proxy returning an HTML error page is the other way a request gets
+    quoted back at you."""
+    v = _venue(lambda *a, **kw: ("<html>key=%s</html>" % CREDS["api_key"], {}),
+               read_only=False)
+    e = _raises(lambda: v.place_order(Order("slc-echo2", "AAPL", "buy", 1)))
+    assert CREDS["api_key"] not in str(e), str(e)
+    assert "non-JSON" in str(e), str(e)
+
+
 def test_nonce_changes_every_request():
     fake = FakeHTTP({("GET", "/trading/accounts/list"): lambda q, b: ACCOUNTS_OK})
     v = _venue(fake)
@@ -561,16 +1181,6 @@ def test_production_host_is_the_default():
 
 
 if __name__ == "__main__":
-    # Not a test: brokers/__init__.py owns the import-side-effect registration
-    # list and is outside this change. Say so loudly rather than failing a suite
-    # another agent is mid-edit on.
-    _init = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "brokers", "__init__.py")
-    with open(_init) as _f:
-        if "import webull" not in _f.read():
-            print("WARN  brokers/__init__.py does not import webull: "
-                  "venues.py cannot build this kind until it does\n")
-
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
     failed = 0

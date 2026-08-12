@@ -19,6 +19,16 @@ make it visible rather than to look finished:
     after any transport failure. Webull documents client_order_id as unique and
     non-repeating but does not document what it does with a duplicate, so this
     adapter does not rely on the venue to reject one.
+  * that probe has THREE outcomes, not two. found / absent / indeterminate. A
+    probe that could not reach the venue, could not authenticate, or came back
+    describing some other order is indeterminate, and place_order refuses on
+    it. "I could not determine whether this order exists" is not "it does not
+    exist"; collapsing the two turns one intent into two fills.
+  * cancel() returns True only when the response CONFIRMS the cancel. Webull
+    can answer HTTP 200 with a body that says the cancel was refused.
+  * every number crossing this boundary is checked for finiteness. NaN and
+    Infinity satisfy no comparison, so they walk straight through guards
+    written as `x <= 0` and land in sizing.
   * Anything the docs leave ambiguous is marked AMBIGUOUS in a comment and
     fails closed. Nothing here invents a field name to look complete.
 
@@ -43,12 +53,14 @@ import calendar
 import hashlib
 import hmac
 import json
+import math
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import (Any, Dict, Iterator, List, NamedTuple, Optional, Sequence,
+                    Tuple)
 
 from . import (Balance, Order, OrderResult, Position, SymbolMeta, Tick,
                VenueError, VenueHealth, VenueReadOnly, register)
@@ -67,6 +79,44 @@ _SIGNATURE_VERSION = "1.0"
 # it overridable, because guessing wrong here fails loudly on the first cancel
 # rather than quietly, and a cancel that silently no-ops leaves a live position.
 _CANCEL_METHOD = "POST"
+
+# The idempotency probe has exactly three answers and "indeterminate" is not a
+# spelling of "absent". brokers/__init__.py makes idempotency mandatory, and the
+# only thing that delivers it is refusing to submit when we cannot prove the
+# order is not already there.
+PROBE_FOUND = "found"
+PROBE_ABSENT = "absent"
+PROBE_INDETERMINATE = "indeterminate"
+
+
+class _Probe(NamedTuple):
+    outcome: str                       # PROBE_FOUND | PROBE_ABSENT | PROBE_INDETERMINATE
+    order: Optional[Dict[str, Any]]    # only ever set for PROBE_FOUND
+    reason: str                        # why, in words, for the refusal message
+    retryable: bool = False            # is the *cause* of indeterminacy transient
+
+
+# AMBIGUOUS: the docs do not say what /trading/orders/get returns for an unknown
+# client_order_id. 404 is the only status this adapter reads as a definite "no
+# such order". Note what is deliberately NOT here: 417, which Webull also uses
+# for ordinary business rejections, so it cannot carry that meaning alone.
+_DEFAULT_NOT_FOUND_HTTP: Tuple[int, ...] = (404,)
+
+# An operator may extend that set once a real response has been observed, but
+# only with statuses that could mean "no such order". A transport failure (429,
+# 5xx) or an auth failure (401/403) says nothing whatsoever about whether the
+# order exists, and letting one be configured as "absent" would re-open the hole
+# from the other side — through config instead of through code.
+_ALLOWED_NOT_FOUND_HTTP: Tuple[int, ...] = (400, 404, 410, 417, 422)
+
+# Cancel-confirmation vocabulary. Webull's cancel response schema is not
+# published, so read every marker that could carry a verdict and treat the
+# absence of all of them as "not confirmed" rather than as success.
+_CANCEL_FLAG_KEYS = ("success", "ok", "cancelled", "canceled", "is_cancelled")
+_TRUE_WORDS = frozenset(("true", "1", "success", "succeeded", "ok", "yes",
+                         "cancelled", "canceled"))
+_FALSE_WORDS = frozenset(("false", "0", "fail", "failed", "failure", "no",
+                          "error", "rejected"))
 
 # Webull caps client_order_id at 32 characters. This is NOT a formatting detail:
 # truncating a longer id would map two distinct orders onto one idempotency key,
@@ -108,26 +158,70 @@ _BAL_FREE_KEYS = ("cash_balance", "available_amount", "settled_funds",
                   "buying_power", "available_cash")
 
 
-def _num(row: Dict[str, Any], keys: Sequence[str]) -> Optional[float]:
-    """First key present and numeric, or None. Never a default: the caller has
-    to decide whether a missing field is survivable, and mostly it is not."""
+def _num(row: Dict[str, Any], keys: Sequence[str], where: str = "",
+         venue: str = "") -> Optional[float]:
+    """First key present and FINITE, or None. Never a default: the caller has
+    to decide whether a missing field is survivable, and mostly it is not.
+
+    A value that parses as NaN or Infinity raises instead of being returned.
+    float() accepts both, and neither satisfies any comparison — `nan <= 0` is
+    False, `nan > 0` is False — so a non-finite number walks through every
+    guard downstream that is written as a comparison, including the `v <= 0`
+    check on tick size and lot step a few lines below. Returning None for one
+    would be no better: it would be laundered into "field missing", and the
+    callers that write `_num(...) or 0.0` would turn a corrupt increment into a
+    confident zero. Raise where the corruption is visible.
+    """
     for k in keys:
         v = row.get(k)
         if v is None or v == "":
             continue
         try:
-            return float(v)
+            f = float(v)
         except (TypeError, ValueError):
             continue
+        if not math.isfinite(f):
+            raise VenueError(
+                "Webull %s field %r carries %r, which is not a finite number. "
+                "NaN and Infinity pass every comparison-based guard in the "
+                "engine, so this value is refused here rather than propagated "
+                "into sizing." % (where or "numeric", k, v), venue=venue)
+        return f
     return None
 
 
 def _decimal_str(x: float) -> str:
     """Webull takes quantities and prices as strings. Exponent notation is what
     a naive str() produces for a small crypto quantity and it is not a format
-    the docs offer, so render plain decimal and trim."""
-    s = ("%.8f" % float(x)).rstrip("0").rstrip(".")
+    the docs offer, so render plain decimal and trim.
+
+    Non-finite input is refused rather than formatted: "%.8f" % float("nan")
+    is the literal text "nan", which would be transmitted as a quantity.
+    """
+    v = float(x)
+    if not math.isfinite(v):
+        raise VenueError(
+            "refusing to send %r to Webull as a number: it is not finite and "
+            "would be transmitted as the literal text %r" % (x, "%.8f" % v))
+    s = ("%.8f" % v).rstrip("0").rstrip(".")
     return s or "0"
+
+
+def _truthy(v: Any) -> Optional[bool]:
+    """True / False / None for "the venue did not say". None is the important
+    one: an unrecognised marker must not be read as consent."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in _TRUE_WORDS:
+        return True
+    if s in _FALSE_WORDS:
+        return False
+    return None
 
 
 def _iso_timestamp(now: Optional[float] = None) -> str:
@@ -170,6 +264,36 @@ class WebullVenue:
         self._instrument_path: Optional[str] = config.get("instrument_path")
         self._instrument_fields: Dict[str, str] = config.get("instrument_fields") or {}
         self._clock_skew_s: Optional[float] = None
+        self._not_found_http: Tuple[int, ...] = self._read_not_found_http(
+            config.get("order_not_found_http"))
+
+    def _read_not_found_http(self, raw: Any) -> Tuple[int, ...]:
+        """Which HTTP statuses this venue is allowed to read as "no such order".
+
+        Validated at construction, not at probe time: a venue whose config
+        would make a 503 mean "absent" must never get as far as placing an
+        order, because that is the double-fill hole wearing a config file.
+        """
+        if raw is None or raw == "":
+            return _DEFAULT_NOT_FOUND_HTTP
+        if isinstance(raw, (int, str)):
+            raw = [raw]
+        out: List[int] = []
+        for s in raw:
+            try:
+                code = int(s)
+            except (TypeError, ValueError):
+                raise VenueError("order_not_found_http takes HTTP status codes, "
+                                 "got %r" % (s,), venue=self.name)
+            if code not in _ALLOWED_NOT_FOUND_HTTP:
+                raise VenueError(
+                    "HTTP %d may not be configured to mean 'this order does not "
+                    "exist' (allowed: %s). A transport or auth failure read as "
+                    "absence is exactly how a retry becomes a second fill."
+                    % (code, ", ".join(str(c) for c in _ALLOWED_NOT_FOUND_HTTP)),
+                    venue=self.name)
+            out.append(code)
+        return tuple(sorted(set(out)))
 
     # ------------------------------------------------------------- internals
     def _sign(self, path: str, params: Dict[str, str], body: str,
@@ -231,20 +355,32 @@ class WebullVenue:
         except urllib.error.HTTPError as e:
             detail = ""
             try:
-                detail = e.read().decode()[:300]
+                detail = self._redact(e.read().decode()[:300])
             except Exception:
                 pass
             # 401 is bad credentials and 417 is a business rejection: retrying
             # either just repeats the same answer. 429/5xx may be transient.
+            # http_status is carried so the idempotency probe can tell a
+            # definite "no such order" from "I could not find out".
             raise VenueError("Webull HTTP %d: %s" % (e.code, detail),
                              retryable=e.code in (429, 500, 502, 503, 504),
-                             venue=self.name, cause=e)
+                             venue=self.name, cause=e, http_status=e.code)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise VenueError("Webull unreachable: %s" % e, retryable=True,
                              venue=self.name, cause=e)
 
         self._note_skew(resp_headers)
         return self._unwrap(raw)
+
+    def _redact(self, text: str) -> str:
+        """Venue error bodies echo the request on some surfaces, and this text
+        travels straight into a VenueError message, then into a log line, a
+        notification and a persisted reason string. Credentials live in the
+        runtime DB; an error path must not be the thing that copies them out."""
+        for secret in (self._secret, self._key):
+            if secret and secret in text:
+                text = text.replace(secret, "<redacted>")
+        return text
 
     def _note_skew(self, resp_headers: Dict[str, str]) -> None:
         """Webull publishes no server-time endpoint, but every response carries
@@ -268,7 +404,8 @@ class WebullVenue:
         try:
             data = json.loads(raw)
         except ValueError as e:
-            raise VenueError("Webull returned non-JSON: %s" % raw[:200],
+            raise VenueError("Webull returned non-JSON: %s"
+                             % self._redact(raw[:200]),
                              venue=self.name, cause=e)
         # AMBIGUOUS: the docs signal failure with HTTP status codes and do not
         # publish an envelope. Some Webull surfaces still wrap in {code,msg,data},
@@ -277,9 +414,14 @@ class WebullVenue:
         if isinstance(data, dict) and "code" in data:
             code = str(data.get("code"))
             if code not in ("200", "0", "OK", "success"):
+                # An envelope code is the venue saying the same thing it would
+                # have said in the status line, so carry it the same way — a
+                # numeric one is classified by the probe exactly like an HTTP
+                # status, and an unfamiliar one classifies as indeterminate.
                 raise VenueError("Webull error %s: %s"
-                                 % (code, str(data.get("msg"))[:200]),
-                                 venue=self.name)
+                                 % (code, self._redact(str(data.get("msg"))[:200])),
+                                 venue=self.name,
+                                 http_status=int(code) if code.isdigit() else None)
             return data.get("data", data)
         return data
 
@@ -384,7 +526,11 @@ class WebullVenue:
 
         def _need(key: str) -> float:
             field = f.get(key)
-            v = _num(row, (field,)) if field else None
+            # _num raises on a non-finite value rather than returning it: the
+            # `v <= 0` below is False for NaN and False for Infinity, so this
+            # guard alone would have accepted both as a valid increment.
+            v = _num(row, (field,), "instrument profile %s for %s" % (key, symbol),
+                     self.name) if field else None
             if v is None or v <= 0:
                 raise VenueError(
                     "Webull instrument profile for %s has no usable %s "
@@ -397,7 +543,9 @@ class WebullVenue:
         # cannot produce a wrongly-sized order, only a rejected one.
         min_notional = 0.0
         if f.get("min_notional"):
-            min_notional = _num(row, (f["min_notional"],)) or 0.0
+            min_notional = _num(row, (f["min_notional"],),
+                                "instrument profile min_notional for %s" % symbol,
+                                self.name) or 0.0
 
         return SymbolMeta(
             symbol=symbol,
@@ -419,10 +567,10 @@ class WebullVenue:
         out: List[Balance] = []
         for row in rows:
             cur = row.get("currency") or row.get("currency_code")
-            total = _num(row, _BAL_TOTAL_KEYS)
+            total = _num(row, _BAL_TOTAL_KEYS, "balance total", self.name)
             if not cur or total is None:
                 continue
-            free = _num(row, _BAL_FREE_KEYS)
+            free = _num(row, _BAL_FREE_KEYS, "balance free", self.name)
             out.append(Balance(str(cur), total, total if free is None else free))
         if not out:
             # Reporting zero equity would silently mis-size the next order.
@@ -442,7 +590,7 @@ class WebullVenue:
                           "positions", "items", "data")
         out: List[Position] = []
         for row in rows:
-            qty = _num(row, _POS_QTY_KEYS)
+            qty = _num(row, _POS_QTY_KEYS, "position quantity", self.name)
             if qty is None:
                 # An unreadable holding must not be dropped: reconciliation
                 # would then see the engine flat on a position that is open.
@@ -457,32 +605,71 @@ class WebullVenue:
             symbol = next((str(row[k]) for k in _POS_SYMBOL_KEYS if row.get(k)), "")
             out.append(Position(
                 symbol=symbol, side=side, qty=abs(qty),
-                entry_price=_num(row, _POS_COST_KEYS) or 0.0,
-                unrealized_pnl=_num(row, _POS_PNL_KEYS) or 0.0,
+                entry_price=_num(row, _POS_COST_KEYS,
+                                 "position cost price", self.name) or 0.0,
+                unrealized_pnl=_num(row, _POS_PNL_KEYS,
+                                    "position unrealized pnl", self.name) or 0.0,
                 venue_id=str(row.get("position_id") or row.get("instrument_id") or ""),
                 raw=row))
         return out
 
     # --------------------------------------------------------------- writes
-    def _find_by_client_id(self, client_order_id: str,
-                           account_id: str) -> Optional[Dict[str, Any]]:
-        """The idempotency probe. /trading/orders/get takes either the venue's
-        order_id or our client_order_id, which is exactly what a retry needs."""
+    def _probe_client_id(self, client_order_id: str, account_id: str) -> _Probe:
+        """The idempotency probe, and the only reason place_order is safe to
+        retry. /trading/orders/get takes either the venue's order_id or our
+        client_order_id, which is exactly what a retry needs.
+
+        Three outcomes, never two. This method used to catch VenueError and
+        return None, which made "venue unreachable", "401" and "500" look
+        identical to "no such order" — and every caller read None as absence
+        and submitted. Both the pre-submit probe and the post-failure recovery
+        probe did it, so an outage during a retry produced two live orders.
+
+        PROBE_ABSENT is returned only for a status this venue is configured to
+        read as a definite no. Everything else is PROBE_INDETERMINATE, and the
+        caller must stand aside: an answer we could not get is not an answer
+        of no.
+        """
         try:
             payload = self._call("GET", "/trading/orders/get",
                                  {"account_id": account_id,
                                   "client_order_id": client_order_id})
-        except VenueError:
-            # Not-found is reported as an HTTP error by this API. A genuine
-            # outage is handled by the caller, which never blind-retries.
-            return None
+        except VenueError as e:
+            status = getattr(e, "http_status", None)
+            if status is not None and status in self._not_found_http:
+                return _Probe(PROBE_ABSENT, None,
+                              "venue answered %d: no such order" % status)
+            return _Probe(PROBE_INDETERMINATE, None,
+                          "the probe failed without reporting the order as "
+                          "absent: %s" % str(e)[:200],
+                          retryable=bool(getattr(e, "retryable", False)))
+
         rows = self._rows(payload, "orders", "items", "data")
+        if not rows and isinstance(payload, dict) and payload:
+            rows = [payload]          # order detail comes back flat
+
+        # Verify the answer is about the order we asked about. Accepting any
+        # payload that merely carried an order_id let an unrelated FILLED order
+        # be returned as this one's result: zero POSTs, and the engine booking a
+        # fill that never happened and managing a phantom position.
+        for row in rows:
+            if str(row.get("client_order_id") or "") == client_order_id:
+                return _Probe(PROBE_FOUND, row, "matched on client_order_id")
+
         if rows:
-            payload = rows[0]
-        if isinstance(payload, dict) and (payload.get("order_id")
-                                          or payload.get("client_order_id")):
-            return payload
-        return None
+            seen = sorted({str(r.get("client_order_id") or "<none>")
+                           for r in rows})[:4]
+            return _Probe(
+                PROBE_INDETERMINATE, None,
+                "the venue answered with %d order(s), none carrying "
+                "client_order_id %r (saw: %s) — the query did not filter the "
+                "way this adapter assumes, so this is not evidence of absence"
+                % (len(rows), client_order_id, ", ".join(seen)))
+        return _Probe(
+            PROBE_INDETERMINATE, None,
+            "the venue answered with no order and no not-found status, so "
+            "absence cannot be told apart from an envelope this adapter "
+            "failed to parse")
 
     def place_order(self, order: Order) -> OrderResult:
         if self.read_only:
@@ -502,6 +689,25 @@ class WebullVenue:
             # Truncating would collapse two orders onto one idempotency key.
             raise VenueError("client_order_id %r exceeds Webull's %d-character "
                              "limit" % (cid, _MAX_CLIENT_ORDER_ID), venue=self.name)
+        # Numeric sanity BEFORE the probe, so a corrupt order never opens a
+        # connection. `qty <= 0` is the guard, and it is also the guard NaN
+        # defeats: float("nan") <= 0 is False, so a NaN quantity would sail
+        # past it and be rendered into the body as the text "nan".
+        for label, val in (("qty", order.qty), ("limit_price", order.limit_price)):
+            if val is None:
+                continue
+            try:
+                fv = float(val)
+            except (TypeError, ValueError):
+                raise VenueError("order %s is not a number: %r" % (label, val),
+                                 venue=self.name)
+            if not math.isfinite(fv):
+                raise VenueError(
+                    "order %s is %r, which is not a finite number; refusing to "
+                    "send it to a venue" % (label, val), venue=self.name)
+            if fv <= 0:
+                raise VenueError("order %s must be positive, got %r"
+                                 % (label, val), venue=self.name)
         if order.stop_loss is not None or order.take_profit is not None:
             # The documented order body has no attached stop or target for a
             # NORMAL order. Sending the order without them would leave a live
@@ -537,10 +743,19 @@ class WebullVenue:
         # Probe first, always. Webull documents client_order_id as non-repeating
         # but not what it does with a duplicate, and an unverified adapter is the
         # wrong place to find out. One extra GET against a double fill.
-        existing = self._find_by_client_id(cid, acct)
-        if existing:
-            return self._to_result(cid, existing,
+        probe = self._probe_client_id(cid, acct)
+        if probe.outcome == PROBE_FOUND:
+            return self._to_result(cid, probe.order or {},
                                    "idempotent: already placed at venue")
+        if probe.outcome != PROBE_ABSENT:
+            # Fail CLOSED. Standing aside costs an opportunity; submitting on a
+            # probe that proved nothing costs a second position, and no rail
+            # downstream can undo a double fill. A later retry with the same
+            # client_order_id is still safe: it arrives back here.
+            raise VenueError(
+                "cannot confirm whether client_order_id %r is already at "
+                "Webull: %s. Refusing to submit." % (cid, probe.reason),
+                retryable=probe.retryable, venue=self.name)
 
         item: Dict[str, Any] = {
             "client_order_id": cid,
@@ -567,12 +782,24 @@ class WebullVenue:
                 raise
             # The submit may or may not have landed. Look before retrying:
             # this is the exact window a double fill comes out of.
-            landed = self._find_by_client_id(cid, acct)
-            if landed:
-                return self._to_result(cid, landed,
+            landed = self._probe_client_id(cid, acct)
+            if landed.outcome == PROBE_FOUND:
+                return self._to_result(cid, landed.order or {},
                                        "order landed despite transport error")
-            raise VenueError("Webull transport error, order not found at venue: %s"
-                             % e, retryable=True, venue=self.name, cause=e)
+            if landed.outcome == PROBE_ABSENT:
+                raise VenueError("Webull transport error, order not found at "
+                                 "venue: %s" % e, retryable=True,
+                                 venue=self.name, cause=e)
+            # Transport failed AND the probe proved nothing. The order may be
+            # live. Not retryable: a retry cannot double-submit (the pre-submit
+            # probe refuses the same way) but it also cannot resolve this, and
+            # a silent retry loop would hide an unmanaged position. Reconcile.
+            raise VenueError(
+                "Webull transport error (%s) and the follow-up probe could not "
+                "determine whether the order landed: %s. client_order_id %r may "
+                "be live at the venue — reconcile before acting on it."
+                % (str(e)[:200], landed.reason, cid),
+                retryable=False, venue=self.name, cause=e)
 
         rows = self._rows(raw, "orders", "new_orders", "data")
         return self._to_result(cid, rows[0] if rows else
@@ -580,6 +807,17 @@ class WebullVenue:
 
     def _to_result(self, cid: str, raw: Dict[str, Any],
                    message: str = "") -> OrderResult:
+        # Last line of the identity check. Every payload that reaches here is
+        # supposed to be about `cid`; one that names a different order would be
+        # reported to the engine under this order's id, binding our intent to
+        # somebody else's fill.
+        echoed = str(raw.get("client_order_id") or "")
+        if echoed and echoed != cid:
+            raise VenueError(
+                "Webull answered about client_order_id %r while this call was "
+                "placing %r; refusing to report another order as this one"
+                % (echoed, cid), venue=self.name)
+
         status = _STATUS_MAP.get(str(raw.get("status") or
                                      raw.get("order_status") or "").upper(),
                                  "")
@@ -587,24 +825,100 @@ class WebullVenue:
             # A place that returned an order_id and no state we recognise is
             # accepted-but-unconfirmed, not filled and not failed.
             status = "accepted" if raw.get("order_id") else "unknown"
+        # A non-finite fill size or price raises out of _num rather than
+        # becoming 0.0 / None here. That loses the OrderResult for an order
+        # that IS at the venue, which is why the message carries both ids: the
+        # honest outcome is reconciliation, not a confident zero fill.
         return OrderResult(
             client_order_id=cid,
             venue_order_id=str(raw.get("order_id") or ""),
             status=status,
             filled_qty=_num(raw, ("filled_quantity", "filledQuantity",
-                                  "filled_qty")) or 0.0,
+                                  "filled_qty"),
+                            "filled quantity for order %s / %s"
+                            % (cid, raw.get("order_id")), self.name) or 0.0,
             avg_price=_num(raw, ("avg_filled_price", "average_filled_price",
-                                 "avg_price")),
+                                 "avg_price"),
+                           "average fill price for order %s / %s"
+                           % (cid, raw.get("order_id")), self.name),
             message=message, raw=raw)
 
+    def _cancel_confirmed(self, payload: Any,
+                          venue_order_id: str) -> Tuple[bool, str]:
+        """Did the venue CONFIRM this cancel? (ok, why-not).
+
+        Only an explicit yes counts. Webull's cancel response schema is not
+        published and HTTP 200 does not mean the cancel happened — a 200 body
+        of {"success": false, "msg": "order already filled"} is a refusal.
+        """
+        rows = self._rows(payload, "orders", "items", "data")
+        row = rows[0] if rows else (payload if isinstance(payload, dict) else None)
+        if not isinstance(row, dict) or not row:
+            return False, ("the response carried no cancel confirmation (%s)"
+                           % (str(payload)[:120] or "empty body"))
+
+        echoed = str(row.get("order_id") or row.get("orderId") or "")
+        if echoed and echoed != str(venue_order_id):
+            return False, ("the response is about order %s, not %s"
+                           % (echoed, venue_order_id))
+
+        msg = str(row.get("msg") or row.get("message") or "")[:120]
+        # Every flag present has to agree. Returning on the first one found
+        # would let {"success": true, "cancelled": false} through on whichever
+        # happened to be checked first.
+        flags = [(k, row[k], _truthy(row[k])) for k in _CANCEL_FLAG_KEYS if k in row]
+        for k, val, verdict in flags:
+            if verdict is False:
+                return False, ("the venue reported %s=%r%s"
+                               % (k, val, " (%s)" % msg if msg else ""))
+            if verdict is None:
+                return False, ("the venue reported %s=%r, which this adapter "
+                               "cannot read as consent" % (k, val))
+        if flags:
+            return True, ""
+
+        raw_status = str(row.get("status") or row.get("order_status") or "").upper()
+        # _STATUS_MAP folds PENDING_CANCEL into "cancelled" because that is the
+        # right reading for an order's lifecycle state. It is the WRONG reading
+        # for "did my cancel happen": a cancel the venue has merely accepted can
+        # still lose the race to a fill.
+        if raw_status in ("PENDING_CANCEL", "CANCEL_PENDING", "CANCELLING",
+                          "CANCELING"):
+            return False, ("the venue reports the cancel as still pending (%s); "
+                           "the order can still fill" % raw_status)
+        status = _STATUS_MAP.get(raw_status, "")
+        if status == "cancelled":
+            return True, ""
+        if status:
+            return False, "the venue reports the order as %s" % status
+        return False, ("the response carried no success flag and no recognised "
+                       "status (keys: %s)" % ", ".join(sorted(row)[:10]))
+
     def cancel(self, venue_order_id: str, symbol: str = "") -> bool:
+        """True only when Webull confirmed the cancel; raises otherwise.
+
+        This used to `return True` without reading the response at all, so a
+        200 carrying {"success": false, "msg": "order already filled"} recorded
+        a cancel that never happened while the position stayed live. It raises
+        rather than returning False because a bool nobody is obliged to check
+        is call-site discipline, not a rail — and the failure mode of ignoring
+        it is an unmanaged position.
+        """
         if self.read_only:
             raise VenueReadOnly("%s is read-only" % self.name, venue=self.name)
+        if not venue_order_id:
+            raise VenueError("cancel needs a venue order_id", venue=self.name)
         acct = self._require_account()
-        self._call(_CANCEL_METHOD, "/trading/orders/cancel",
-                   {"account_id": acct}, {"account_id": acct,
-                                          "order_id": venue_order_id})
-        return True
+        raw = self._call(_CANCEL_METHOD, "/trading/orders/cancel",
+                         {"account_id": acct}, {"account_id": acct,
+                                                "order_id": venue_order_id})
+        ok, why = self._cancel_confirmed(raw, venue_order_id)
+        if ok:
+            return True
+        raise VenueError(
+            "Webull did not confirm the cancel of order %s: %s. Treat the order "
+            "as still working and the position as live until a read says "
+            "otherwise." % (venue_order_id, why), venue=self.name)
 
     def stream_prices(self, symbols: List[str]) -> Iterator[Tick]:
         """No ticks from this adapter, deliberately.

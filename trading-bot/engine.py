@@ -14,6 +14,7 @@ parameters come from storage.settings (dashboard- and agent-tunable).
 """
 import json
 import math
+import re
 import threading
 import time
 from types import MappingProxyType
@@ -65,16 +66,89 @@ MT5_SOURCE = "mt5"
 MT5_PRICE_MAX_AGE_S = 60        # the EA pushes every 5s; 12 missed pushes is dead
 VENUE_PRICE_MAX_AGE_S = 90      # venues are polled at the engine's own cadence
 
+# Venues are polled on their OWN thread at this cadence, never inside the
+# engine cycle. See _venue_poll_loop.
+VENUE_POLL_INTERVAL_S = 10
+
+
 # --------------------------------------------------------------------
 # Shared live state: pushed by the EA, polled from venues (guarded by
 # _feed_lock). "sources" is the per-source health the staleness rails read.
 # --------------------------------------------------------------------
+class _PriceBook(dict):
+    """feed_state["prices"]. Stamps provenance at the WRITE layer.
+
+    Every rail downstream assumes a quote in this book knows where it came
+    from and when it was true. That guarantee used to depend on every writer
+    remembering to stamp, and `price_state` carried an explicit branch that
+    handed an unstamped record back as age=None / fresh=True / reachable=True —
+    permanently tradable — with a comment conceding the branch existed for test
+    fixtures. CONTRIBUTING is explicit that a rule which can be bypassed by
+    forgetting to call something is not implemented, so the container enforces
+    it and `price_state` now fails closed instead of excusing it.
+
+    Provenance for an unattributed write comes from what instruments/venues
+    already declare (`_declared_source`), never from what would make a trade
+    go through, and the stamp is the real clock — so such a quote ages out on
+    the same schedule as any other and can never be permanently tradable.
+
+    Locking: the stamping path touches feed_state["sources"], so it inherits
+    _write_price_locked's contract — the caller holds _feed_lock. Every writer
+    in this module already stamps, so that path only runs for a write that came
+    from outside it."""
+
+    def __setitem__(self, symbol: str, rec: Any) -> None:
+        if not isinstance(rec, dict):
+            raise TypeError("price record must be a dict, got %r" % type(rec))
+        try:
+            src_t = float(rec.get("src_t") or 0)
+        except (TypeError, ValueError):
+            src_t = 0.0
+        src = rec.get("src")
+        if src and src_t > 0:                       # already stamped: pass through
+            dict.__setitem__(self, symbol, rec)
+            return
+        now = time.time()
+        rec = dict(rec)
+        rec.setdefault("symbol", symbol)
+        if not src:
+            src = _declared_source(symbol)
+            rec["src"] = src
+            rec["src_kind"] = "mt5" if src == MT5_SOURCE else "venue"
+            # A source nobody has heard from is unknown, and unknown fails
+            # closed in price_state. A write is evidence that source produced a
+            # quote, so create its health row — but never touch an EXISTING
+            # one: a direct write must not resurrect a source a failed poll
+            # already marked unreachable.
+            if src not in (feed_state.get("sources") or {}):
+                _source_rec_locked(src, rec["src_kind"]).update(
+                    {"last_t": now, "reachable": True, "detail": ""})
+        if src_t <= 0:
+            rec["src_t"] = now
+        dict.__setitem__(self, symbol, rec)
+
+
+class _FeedState(dict):
+    """Keeps feed_state["prices"] a _PriceBook even when a caller replaces the
+    whole book (`feed_state["prices"] = {...}`), which would otherwise drop the
+    write-layer stamp on the floor."""
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key == "prices" and not isinstance(value, _PriceBook):
+            book = _PriceBook()
+            for sym, rec in (value or {}).items():
+                book[sym] = rec                     # re-stamped on the way in
+            value = book
+        dict.__setitem__(self, key, value)
+
+
 _feed_lock = threading.Lock()
-feed_state: Dict[str, Any] = {
+feed_state: Dict[str, Any] = _FeedState({
     "account": {}, "open_positions": [], "closed_today": [],
-    "prices": {}, "terminal": {}, "last_feed_t": 0, "last_bars_t": 0,
+    "terminal": {}, "last_feed_t": 0, "last_bars_t": 0,
     "sources": {},
-}
+})
+feed_state["prices"] = {}        # through __setitem__, so it becomes a _PriceBook
 
 _stop = threading.Event()   # graceful shutdown; the loop exits after this cycle
 _notify = None          # set by server.py -> notifier.send
@@ -85,9 +159,11 @@ _tv_ctx_t: float = 0                  # timestamp of last TV context load
 
 
 def stop() -> None:
-    """Ask the loop to finish this cycle and exit. Nothing about stopping may
-    close a position or move a stop: the venue keeps the stop it already has."""
+    """Ask the loop (and the venue poller) to finish and exit. Nothing about
+    stopping may close a position or move a stop: the venue keeps the stop it
+    already has."""
     _stop.set()
+    stop_venue_poller()
 
 
 def set_notifier(fn) -> None:
@@ -148,6 +224,56 @@ def _log_spread_event(tr: Dict[str, Any], max_spr: float,
         print("spread-trace log error:", e)
 
 
+# ------------------------------------------------- adapter error handling
+# A third-party adapter's exception text is unbounded and attacker-adjacent:
+# ccxt embeds the request it sent, so the string can carry an API key, a signed
+# URL or a full header dump. That string used to be stored verbatim in the
+# source record's `detail`, from where it reached signals.reason (persisted to
+# the DB) and notify() (Telegram/Discord). Invariant 13 / CONTRIBUTING §Secrets
+# forbid exactly that. Nothing derived from an exception MESSAGE may leave here;
+# only a classification, and only from the exception's class name.
+_ERR_CLASSES = (
+    ("auth", ("authenticationerror", "permissiondenied", "invalidnonce",
+              "invalidapikey", "accountsuspended", "forbidden", "unauthorized")),
+    ("rate limit", ("ratelimit", "ddosprotection", "toomanyrequests")),
+    ("timeout", ("timeout",)),
+    ("network", ("networkerror", "connectionerror", "connectionreset",
+                 "exchangenotavailable", "onmaintenance", "ssl", "socket")),
+    ("bad symbol", ("badsymbol", "symbolnotfound", "badrequest")),
+    ("exchange error", ("exchangeerror", "invalidorder", "notsupported",
+                        "insufficientfunds")),
+)
+# Everything a source record's `detail` is ever allowed to say.
+_DETAIL_LITERALS = frozenset(
+    ["", "no quotes returned", "unclassified adapter error"]
+    + [label for label, _ in _ERR_CLASSES])
+# The class-name escape hatch, so an unmapped adapter failure is still
+# diagnosable. A class name is an identifier written in library source, never
+# response data, and it is length- and charset-bounded here regardless.
+_DETAIL_CLASS_RE = re.compile(r"^adapter error \([A-Za-z0-9_]{1,40}\)$")
+
+
+def classify_adapter_error(e: BaseException) -> str:
+    """A bounded label for an adapter failure. Never the exception message."""
+    cls = type(e).__name__
+    low = cls.lower()
+    for label, needles in _ERR_CLASSES:
+        if any(n in low for n in needles):
+            return label
+    safe = "".join(ch for ch in cls if ch.isalnum() or ch == "_")[:40]
+    return "adapter error (%s)" % (safe or "unknown")
+
+
+def _safe_detail(detail: Any) -> str:
+    """The write-layer rail for `detail`. A caller that hands this raw adapter
+    text gets "unclassified adapter error" — the leak is closed by the store,
+    not by every call site remembering to classify first."""
+    d = "" if detail is None else str(detail)
+    if d in _DETAIL_LITERALS or _DETAIL_CLASS_RE.match(d):
+        return d
+    return "unclassified adapter error"
+
+
 # ------------------------------------------------- price sources
 def _source_rec_locked(name: str, kind: str) -> Dict[str, Any]:
     """The health row for one price source. Caller holds _feed_lock."""
@@ -165,6 +291,8 @@ def _source_rec_locked(name: str, kind: str) -> Dict[str, Any]:
 
 
 def _set_source(name: str, kind: str, **fields: Any) -> Dict[str, Any]:
+    if "detail" in fields:
+        fields["detail"] = _safe_detail(fields["detail"])
     with _feed_lock:
         rec = _source_rec_locked(name, kind)
         rec.update(fields)
@@ -282,23 +410,39 @@ def price_state(symbol: str, now: Optional[float] = None) -> Dict[str, Any]:
                 "reachable": False, "reason": "no live price"}
     src = p.get("src")
     rec = (feed_state.get("sources") or {}).get(src) if src else None
-    src_t = float(p.get("src_t") or 0)
-    if not src_t:
-        # A quote written straight into feed_state carries no clock of its own,
-        # so there is nothing to age it against. Every writer in this module
-        # stamps; this branch exists for prices injected by a test fixture.
-        return {"price": p, "source": src, "age": None, "fresh": True,
-                "reachable": True, "reason": ""}
+    try:
+        src_t = float(p.get("src_t") or 0)
+    except (TypeError, ValueError):
+        src_t = 0.0
+    if src_t <= 0:
+        # No clock on the quote means no way to age it, and "I cannot tell how
+        # old this is" must never come back as "fresh". This branch used to
+        # return age=None / fresh=True / reachable=True — permanently tradable —
+        # to accommodate test fixtures that wrote into the book directly. The
+        # stamp is now enforced by _PriceBook at the write layer, so getting
+        # here means a record reached the book some other way, and the honest
+        # answer to unknown provenance is to stand aside.
+        return {"price": None, "source": src, "age": None, "fresh": False,
+                "reachable": False,
+                "reason": "%s quote carries no timestamp — age unknown"
+                          % (src or symbol)}
     age = now - src_t
     max_age = float((rec or {}).get("max_age_s") or MT5_PRICE_MAX_AGE_S)
     fresh = age <= max_age
-    reachable = True if rec is None else bool(rec.get("reachable"))
+    # A source with no health row is a source nobody has ever heard from. That
+    # is unknown, not reachable — it used to read `True if rec is None`, so an
+    # unregistered source was assumed to be answering.
+    reachable = bool(rec) and bool(rec.get("reachable"))
     reason = ""
     if not fresh:
         reason = "%s price stale (%.0fs old, limit %.0fs)" % (
             src or "feed", age, max_age)
     elif not reachable:
-        reason = "%s unreachable: %s" % (src, (rec or {}).get("detail") or "no detail")
+        # `detail` is a bounded classification (see _safe_detail); the raw
+        # adapter text it used to carry — and the doubled "unreachable:
+        # unreachable:" prefix that came with it — are both gone.
+        reason = ("%s unreachable: %s" % (src, rec.get("detail") or "no detail")
+                  if rec else "%s has never reported" % (src or "unknown source"))
     return {"price": p, "source": src, "age": age, "fresh": fresh,
             "reachable": reachable, "reason": reason}
 
@@ -360,9 +504,117 @@ def feed_report(now: Optional[float] = None) -> Dict[str, Any]:
         note = "; ".join([s["reason"] for s in degraded if s["reason"]]) or "degraded"
         if healthy:
             note = "%s (still live: %s)" % (note, ", ".join(healthy))
+    # The poller runs off the cycle, so its own health has to be reported
+    # explicitly: a wedged poll shows up here before the quotes it stopped
+    # refreshing age out.
+    vp = dict(feed_state.get("venue_poll") or {})
+    if vp and now - float(vp.get("t") or 0) > 3 * VENUE_POLL_INTERVAL_S:
+        note = "%s; venue poll last ran %.0fs ago" % (note, now - float(vp["t"]))
     return {"sources": srcs, "healthy": healthy,
             "degraded": [s["name"] for s in degraded],
-            "mt5_configured": has_mt5, "note": note}
+            "mt5_configured": has_mt5, "venue_poll": vp, "note": note}
+
+
+# ------------------------------------------------- declared routes
+def _venue_cfgs() -> Dict[str, Dict[str, Any]]:
+    """{name: config} for every registered venue. Never raises: a registry we
+    cannot read declares nothing, and declaring nothing fails closed."""
+    if not _VENUES_AVAILABLE:
+        return {}
+    try:
+        return {v.get("name"): v for v in _venues.list_venues() if v.get("name")}
+    except Exception as e:
+        print("venue registry read error:", type(e).__name__)
+        return {}
+
+
+def declared_venues(symbol: str) -> List[str]:
+    """Every REGISTERED venue that declares this symbol, from the same two
+    declarations `venue_symbol_map` uses and no others: a venue config row's
+    `symbols` list, and the instruments registry's `venue` column.
+
+    Empty means nothing registered claims it — which is the MT5 case, because
+    MT5 is not a venue row. More than one means the declarations disagree, and
+    a disagreement about where an order goes is not something to average out."""
+    cfgs = _venue_cfgs()
+    if not cfgs:
+        return []
+    claims = set()
+    for name, cfg in cfgs.items():
+        for entry in (cfg.get("symbols") or []):
+            if str(entry).partition(":")[0] == symbol:
+                claims.add(name)
+                break
+    v = (instruments.get(symbol) or {}).get("venue")
+    if v and v in cfgs:
+        claims.add(v)
+    return sorted(claims)
+
+
+def _declared_source(symbol: str) -> str:
+    """Who a quote for this symbol is presumed to have come from when the
+    writer did not say. Unambiguous declaration wins; otherwise MT5, which is
+    the default `instruments.seed_defaults()` writes and what
+    `venue_symbol_map` already assumes for an unrouted symbol."""
+    try:
+        vs = declared_venues(symbol)
+    except Exception:
+        return MT5_SOURCE
+    return vs[0] if len(vs) == 1 else MT5_SOURCE
+
+
+def execution_route(symbol: str, src: Optional[str],
+                    mode: str) -> Dict[str, Any]:
+    """Where an order for `symbol`, priced by source `src`, is allowed to go.
+
+    The order goes to the venue that quoted the price and nowhere else. Sizing
+    a position off one venue's book and submitting it to another is not a
+    routing inconvenience — it is a real fill, at the wrong broker, at a price
+    that broker never showed. `try_execute` used to be provenance-blind and the
+    live branch enqueued an MT5 `open_trade` unconditionally, so a symbol routed
+    to a crypto venue produced exactly that.
+
+    Returns {"ok", "route", "kind", "reason"}. Every refusal is a reason the
+    caller records; none of them collapse into a benign default."""
+    if not src:
+        return {"ok": False, "route": None, "kind": None,
+                "reason": "quote has no source — cannot tell which venue would fill it"}
+    claims = declared_venues(symbol)
+    if len(claims) > 1:
+        return {"ok": False, "route": None, "kind": None,
+                "reason": "%s is declared on more than one venue (%s) — refusing "
+                          "to guess where the order goes" % (symbol, ", ".join(claims))}
+    if claims and claims[0] != src:
+        return {"ok": False, "route": None, "kind": None,
+                "reason": "%s is declared on %s but quoted by %s — price and "
+                          "execution venue must be the same"
+                          % (symbol, claims[0], src)}
+    if claims:
+        route, kind = claims[0], "venue"
+    elif src == MT5_SOURCE:
+        route, kind = MT5_SOURCE, "mt5"
+    else:
+        # src names a venue that no longer declares the symbol (config edited
+        # between the poll and the fill). Standing aside costs an opportunity.
+        return {"ok": False, "route": None, "kind": None,
+                "reason": "%s was quoted by %s, which no longer declares it"
+                          % (symbol, src)}
+    if mode == "live":
+        # The EA is the only wired execution path in this file. A venue adapter
+        # can quote and it can be reconciled against, but nothing here submits
+        # an order to one (docs/ARCHITECTURE-V3.md §5 Increment 6 gates that
+        # behind supports_attached_stop and the host-continuity rail). Until
+        # then a live entry on a venue-routed symbol has nowhere to go, and the
+        # honest response is to refuse rather than send it to MT5.
+        if kind != "mt5":
+            return {"ok": False, "route": route, "kind": kind,
+                    "reason": "no live execution path to %s (the MT5 EA is the "
+                              "only wired venue) — refusing the entry" % route}
+        if not mt5_configured():
+            return {"ok": False, "route": route, "kind": kind,
+                    "reason": "live entry routed to MT5 but no EA has ever "
+                              "reported in this deployment"}
+    return {"ok": True, "route": route, "kind": kind, "reason": ""}
 
 
 # ------------------------------------------------- venue-sourced prices
@@ -427,11 +679,7 @@ def venue_symbol_map(symbols: List[str]) -> Dict[str, Dict[str, str]]:
     out: Dict[str, Dict[str, str]] = {}
     if not _VENUES_AVAILABLE or not symbols:
         return out
-    try:
-        cfgs = {v.get("name"): v for v in _venues.list_venues()}
-    except Exception as e:
-        print("venue registry read error:", e)
-        return out
+    cfgs = _venue_cfgs()
     if not cfgs:
         return out
     want = set(symbols)
@@ -452,17 +700,24 @@ def refresh_venue_prices(symbols: List[str]) -> Dict[str, str]:
     """Poll every configured venue that quotes one of `symbols` and merge the
     result into the shared book with provenance attached.
 
+    NEVER call this from the engine cycle: `stream_prices` is an unbounded
+    synchronous network call and stop management must not wait behind it
+    (_venue_poll_loop is the only production caller).
+
     Failures are contained to the venue that failed: an exchange that is down
-    costs you the symbols it quotes and nothing else. Returns {venue: error}."""
+    costs you the symbols it quotes and nothing else. Returns {venue: label},
+    where the label is a CLASSIFICATION — the adapter's own exception text is
+    never returned, stored or forwarded (see classify_adapter_error)."""
     errors: Dict[str, str] = {}
     for vname, want in venue_symbol_map(symbols).items():
         try:
             ad = _venues.adapter(vname)
             ticks = list(ad.stream_prices(list(want)))
         except Exception as e:
-            errors[vname] = str(e)[:200]
-            _set_source(vname, "venue", reachable=False,
-                        detail="unreachable: %s" % errors[vname])
+            # No "unreachable: " prefix here: source_state adds one, and the two
+            # used to compound into "unreachable: unreachable: <raw text>".
+            errors[vname] = classify_adapter_error(e)
+            _set_source(vname, "venue", reachable=False, detail=errors[vname])
             continue
         now = time.time()
         recs: List[Dict[str, Any]] = []
@@ -494,6 +749,70 @@ def refresh_venue_prices(symbols: List[str]) -> Dict[str, str]:
             _set_source(vname, "venue", reachable=False,
                         detail="no quotes returned")
     return errors
+
+
+# ------------------------------------------- venue polling, off the hot loop
+# The original defect on this branch was stop management blocked behind a feed.
+# It came back as a blocking call instead of a `continue`: refresh_venue_prices
+# sat AHEAD of manage_open_trades in the cycle, and one wedged exchange
+# (load_markets plus a fetch_ticker per symbol, each at ccxt's 15s timeout)
+# delays every breakeven move, every trail and every paper stop evaluation by
+# however long the exchange takes to answer. Managing a position we already
+# hold must never wait on fetching prices for one we do not.
+#
+# So the poll owns a thread. The engine cycle publishes the symbol list it
+# wants priced and reads whatever is in the book; if the poller is wedged, the
+# quotes it stopped refreshing age out and the staleness rails refuse entries
+# on them — which is the correct fail-closed outcome and costs no management.
+_venue_poll_stop = threading.Event()
+_venue_poll_thread: Optional[threading.Thread] = None
+_venue_want_lock = threading.Lock()
+_venue_want: List[str] = []
+
+
+def set_venue_symbols(symbols: Any) -> None:
+    """Publish the symbols the poller should keep priced. Cheap and
+    non-blocking: it is called from the engine cycle."""
+    global _venue_want
+    with _venue_want_lock:
+        _venue_want = sorted({str(s) for s in symbols})
+
+
+def _venue_poll_loop(interval: float) -> None:
+    while not _venue_poll_stop.is_set():
+        with _venue_want_lock:
+            syms = list(_venue_want)
+        t0 = time.time()
+        errs: Dict[str, str] = {}
+        try:
+            if syms:
+                errs = refresh_venue_prices(syms)
+        except Exception as e:                 # a dead poller must not be silent
+            errs = {"poller": classify_adapter_error(e)}
+        feed_state["venue_poll"] = {
+            "t": t0, "took_s": round(time.time() - t0, 3),
+            "symbols": len(syms), "errors": errs}
+        _venue_poll_stop.wait(interval)
+
+
+def start_venue_poller(interval: float = VENUE_POLL_INTERVAL_S) -> None:
+    global _venue_poll_thread
+    t = _venue_poll_thread
+    if t is not None and t.is_alive():
+        return
+    _venue_poll_stop.clear()
+    _venue_poll_thread = threading.Thread(target=_venue_poll_loop,
+                                          args=(float(interval),),
+                                          name="venue-poller", daemon=True)
+    _venue_poll_thread.start()
+
+
+def stop_venue_poller(join_s: float = 0.0) -> None:
+    """Ask the poller to exit. Like stop(), this never touches a position."""
+    _venue_poll_stop.set()
+    t = _venue_poll_thread
+    if t is not None and join_s:
+        t.join(timeout=join_s)
 
 
 # ----------------------------------------------------------- params
@@ -860,11 +1179,22 @@ def try_execute(sig: Dict, p: Dict) -> None:
     if lim:
         return skip(lim, track=True, stage="loss_limit")
 
-    # Provenance-blind on purpose: this rail asks whether the quote is fresh and
-    # its source is answering, never which venue it came from.
+    # Freshness and reachability only: this rail asks whether the quote is
+    # usable, not which venue it came from. Where the order may go is the
+    # separate question the routing rail below answers.
     price, px_reason = price_for_entry(symbol)
     if not price:
         return skip(px_reason, stage="feed")
+
+    # ---- price provenance is bound to the execution venue -----------------
+    # A signal priced by source S may only be executed on the venue that owns
+    # S. Without this, a symbol routed to a crypto venue was sized off that
+    # venue's book and then submitted to MT5 by the live branch below — a real
+    # order, at the wrong broker, at a price that broker never showed.
+    route = execution_route(symbol, price.get("src"), mode)
+    if not route["ok"]:
+        return skip(route["reason"], track=True, stage="routing")
+
     entry = price["ask"] if sig["side"] == "buy" else price["bid"]
     stop_dist = abs(entry - sig["sl"])
     spread = abs(price["ask"] - price["bid"])
@@ -931,6 +1261,13 @@ def try_execute(sig: Dict, p: Dict) -> None:
                           tv_adx=round(tv_adx, 1) if tv_adx else None)
     if risk_notes:
         enhanced_setup["risk_notes"] = risk_notes
+    # Write-layer restatement of the routing rail: nothing may reach
+    # insert_trade in live mode unless the EA is the cleared route, so a future
+    # edit cannot produce an open live row with no order behind it.
+    if mode == "live" and route.get("kind") != "mt5":
+        return skip("live entry has no cleared execution route", track=True,
+                    stage="routing")
+
     sig_id = _log_signal(sig, "executed", "")
     trade = {
         "mode": mode, "trade_mode": sig["trade_mode"], "symbol": symbol,
@@ -948,7 +1285,8 @@ def try_execute(sig: Dict, p: Dict) -> None:
                                                     "risk_pct": risk_pct},
                      regime=regime_ctx, signal_id=sig_id, trade_id=trade_id)
 
-    if mode == "live":
+    if mode == "live" and route.get("kind") == "mt5":
+        # Only ever the EA. execution_route refused every other route above.
         storage.enqueue_command("open_trade", {
             "symbol": symbol, "side": sig["side"], "lots": lots,
             "sl": sig["sl"], "tp": sig["tp"], "magic": 770001,
@@ -1148,6 +1486,64 @@ def _mtf_trail_level(tr: Dict) -> Optional[float]:
     return highs[-1] if highs else None
 
 
+# trade id -> the instant this position first went unevaluated. In-process
+# only, and deliberately so: losing it on restart re-announces the outage,
+# which is the safe direction. No risk state is derived from it.
+_unmanaged: Dict[int, float] = {}
+
+
+def _record_unmanaged(tr: Dict[str, Any], reason: str) -> None:
+    """A position we hold and could NOT evaluate this cycle.
+
+    This used to be a bare `continue`: no decisions row, no notification,
+    nothing in _last_info. On a Linux node a missing quote is the ORDINARY
+    failure mode, and a position whose stop is enforced only by this loop then
+    runs unevaluated for the whole outage with nothing saying so. CONTRIBUTING
+    requires a decisions.record for every decision including the decision not
+    to act, and this is the one that costs money when it is missing."""
+    tid = tr["id"]
+    now = time.time()
+    first = _unmanaged.get(tid)
+    if first is None:
+        first = _unmanaged[tid] = now
+    _last_info["manage|%s" % tid] = {
+        "symbol": tr["symbol"], "trade_mode": tr.get("trade_mode") or "—",
+        "note": "%s %s #%s UNMANAGED for %.0fs: %s"
+                % (tr["mode"], tr["symbol"], tid, now - first, reason)}
+    # Deduped on (symbol, trade_mode, strategy, stage|reason): a transition log
+    # rather than three identical rows a minute for the length of an outage.
+    decisions.record_state(tr.get("strategy"), tr["symbol"],
+                           tr.get("trade_mode") or "—", "manage", reason,
+                           action="unmanaged", trade_id=tid)
+    # Invariant 6: shadow trades are silent. They still get the audit row.
+    if first == now and tr["mode"] != "shadow":
+        notify("⚠️ <b>POSITION UNMANAGED</b> (%s)\n<b>%s %s</b> — stop is not "
+               "being evaluated\nReason: %s"
+               % (tr["mode"].upper(), tr["side"].upper(), tr["symbol"], reason))
+
+
+def _clear_unmanaged(tr: Dict[str, Any]) -> None:
+    """Management resumed on a position that had gone dark."""
+    first = _unmanaged.pop(tr["id"], None)
+    _last_info.pop("manage|%s" % tr["id"], None)
+    if first is not None and tr["mode"] != "shadow":
+        notify("🟩 <b>Management resumed</b> %s %s after %.0fs"
+               % (tr["side"].upper(), tr["symbol"], time.time() - first))
+
+
+def _held_at_mt5(tr: Dict[str, Any]) -> bool:
+    """Is this live position held at MT5?
+
+    Today every live position is — the EA is the only wired execution path —
+    but gating EVERY live trade on the MT5 feed is the same global-bypass shape
+    this branch exists to delete: the day one live position sits at a venue, a
+    quiet EA would suspend its management too. A ticket is an MT5 ticket;
+    failing that, the source quoting the symbol decides."""
+    if tr.get("ticket"):
+        return True
+    return price_state(tr["symbol"]).get("source") == MT5_SOURCE
+
+
 def manage_open_trades(p: Dict) -> None:
     """Runs EVERY cycle, per position, judged against the source that quotes
     THAT position. One venue going quiet must never suspend the stops on a
@@ -1158,6 +1554,7 @@ def manage_open_trades(p: Dict) -> None:
         st = price_state(tr["symbol"])
         price_info = st["price"]
         if not price_info:
+            _record_unmanaged(tr, st["reason"] or "no usable quote")
             continue
         # A stale quote drops management into de-risk-only: the stop may still
         # act on it, nothing else may (docs/ARCHITECTURE-V3.md §2).
@@ -1167,6 +1564,10 @@ def manage_open_trades(p: Dict) -> None:
         direction = 1 if tr["side"] == "buy" else -1
         risk_dist = abs(tr["entry"] - tr["initial_sl"])
         if risk_dist <= 0:
+            # entry == initial_sl: an R-multiple cannot be computed, so every
+            # level below is undefined. Bad data, not a benign skip.
+            _record_unmanaged(tr, "entry equals initial stop — risk distance is "
+                                  "zero, no level can be evaluated")
             continue
         r_now = (cur - tr["entry"]) * direction / risk_dist
 
@@ -1180,6 +1581,11 @@ def manage_open_trades(p: Dict) -> None:
                 upd["mae"] = round(r_now, 2)
 
         if tr["mode"] in ("paper", "shadow"):
+            # Cleared here and not earlier: "we have a price" is not the same
+            # as "we are managing it". The live branch below has two more gates
+            # and clearing before them would flip-flop unmanaged/resumed every
+            # cycle for the whole of an MT5 outage.
+            _clear_unmanaged(tr)
             # Dynamic-spread stop: evaluate against the WORST exit-side price
             # seen on the 5s feed since the last cycle, not just this instant.
             w = feed_state.get("px_window", {}).get(tr["symbol"], {})
@@ -1239,12 +1645,24 @@ def manage_open_trades(p: Dict) -> None:
                 storage.update_trade(tr["id"], upd)
 
         else:  # live: EA holds the position; we mirror + issue SL commands
-            # The drop copy this branch reasons over (open_positions,
-            # closed_today) is MT5's, so it is only as good as the MT5 feed. On
-            # a stale one the "position is gone -> it closed at the broker" leg
-            # below would invent an exit for a trade that is still open.
-            if not source_state(MT5_SOURCE)["fresh"]:
+            # This whole branch reasons over MT5's drop copy (open_positions,
+            # closed_today) and issues MT5 commands, so it only applies to a
+            # position MT5 actually holds. Gating it on the MT5 feed for EVERY
+            # live trade regardless of venue is benign while live is EA-only —
+            # and is exactly the global-bypass shape this branch exists to
+            # remove, so it is scoped instead.
+            if not _held_at_mt5(tr):
+                _record_unmanaged(
+                    tr, "live position is not held at MT5 and no venue "
+                        "execution path is wired — cannot manage it from here")
                 continue
+            # On a stale drop copy the "position is gone -> it closed at the
+            # broker" leg below would invent an exit for a trade still open.
+            if not source_state(MT5_SOURCE)["fresh"]:
+                _record_unmanaged(
+                    tr, "MT5 drop copy stale — cannot confirm this position")
+                continue
+            _clear_unmanaged(tr)
             pos = next((x for x in feed_state["open_positions"]
                         if "SLC#%d" % tr["id"] in (x.get("comment") or "")
                         or x.get("ticket") == tr["ticket"]), None)
@@ -1300,6 +1718,10 @@ def manage_open_trades(p: Dict) -> None:
     for _tid in list(_open_spread):
         if _tid not in open_ids:
             _open_spread.pop(_tid, None)
+    for _tid in list(_unmanaged):
+        if _tid not in open_ids:            # closed while dark; stop reporting it
+            _unmanaged.pop(_tid, None)
+            _last_info.pop("manage|%s" % _tid, None)
     try:
         import json as _json, os as _os
         _os.makedirs("state", exist_ok=True)
@@ -1353,12 +1775,16 @@ def engine_loop(poll_seconds: int = 20) -> None:
             shadow_only = [s for s in p["watch_pairs"] if s not in p["enabled_pairs"]]
             symbols = tradable + shadow_only
 
-            # Pull venue quotes BEFORE anything reads a price. Positions on a
-            # symbol that has since been disabled still need managing, so they
-            # get priced too — a pair leaving the watchlist must not strand the
-            # stop on a position it opened.
+            # Tell the poller which symbols to keep priced, then move on. This
+            # is a list assignment, not a network call: the venue poll happens
+            # on its own thread precisely so manage_open_trades below never
+            # waits behind an exchange. Positions on a symbol that has since
+            # been disabled still need priced — a pair leaving the watchlist
+            # must not strand the stop on a position it opened.
             held = {t["symbol"] for t in storage.open_trades()}
-            refresh_venue_prices(sorted(set(symbols) | held))
+            set_venue_symbols(set(symbols) | held)
+            if not _stop.is_set():
+                start_venue_poller()
 
             # Feed health is now a per-source report, not one global verdict.
             # The loop never waits on it: work proceeds for every source that is

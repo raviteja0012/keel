@@ -17,10 +17,28 @@ cd "$REPO_DIR"
 
 if [ "${1:-}" != "--no-backup" ]; then
   echo "==> backing up before stopping"
-  "$REPO_DIR/scripts/deploy/keel-backup.sh" || {
-    echo "!! backup failed. Stop anyway with: keel-stop.sh --no-backup" >&2
+  # Exit codes from keel-backup.sh, and why they are not all the same answer:
+  #   0  DB snapshot and state archive both written and verified.
+  #   3  DB snapshot written and VERIFIED; only the state archive failed.
+  #   *  the DB snapshot itself did not happen.
+  #
+  # 3 must not block the stop. The promotion-gate evidence is the `trades`
+  # table and it is already safe on disk; state/ is the decision traces beside
+  # it. Refusing to stop over the lesser of the two leaves the operator with
+  # --no-backup as their only route, which saves nothing at all — and a stop
+  # script that is unreliable in a hurry is a stop that gets done by hand
+  # without a drain.
+  BK_RC=0
+  "$REPO_DIR/scripts/deploy/keel-backup.sh" || BK_RC=$?
+  if [ "$BK_RC" -eq 3 ]; then
+    echo "!! state archive failed, DB snapshot is written and verified." >&2
+    echo "   Continuing with the stop; the gate evidence is safe." >&2
+  elif [ "$BK_RC" -ne 0 ]; then
+    echo "!! backup failed before the DB snapshot was verified (exit $BK_RC)." >&2
+    echo "   NOT stopping: a stop now would be a stop with no evidence saved." >&2
+    echo "   Investigate, or accept the loss explicitly: keel-stop.sh --no-backup" >&2
     exit 1
-  }
+  fi
 fi
 
 echo "==> open positions at stop time:"

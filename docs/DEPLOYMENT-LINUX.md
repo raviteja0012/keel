@@ -158,6 +158,15 @@ docker compose build
 docker compose up -d
 ```
 
+**Clone on the host. Do not `scp` a Windows working tree.** With `core.autocrlf=true` — the
+Windows default — every `.sh` in `scripts/deploy/` lands with CRLF endings, and bash then reads
+`set -euo pipefail\r` and dies with `set: pipefail: invalid option name` before the script does
+anything. `keel-stop.sh` is one of them, so the way you find out is while trying to stop
+cleanly. Git stores these files LF; a clone on the host gets LF.
+
+The build **refuses** if `trading-bot/config.yaml` carries a credential (§5). A `BUILD REFUSED`
+message is that guard working, not a broken build.
+
 `LICENSE.md` forbids distribution outside the team, and ARCHITECTURE-V3 §6 treats a public image
 as evidence of holding out to the public — which is the condition the 15-person CTA exemption
 rests on. **Build on the host, or push to a private registry. Never a public one.**
@@ -197,6 +206,38 @@ env file.
 `settings` table. A deny-list leaks the day someone adds a new secret path and forgets to come
 back to it; a layer is permanent, kept by `docker history` and every registry copy even after a
 later layer deletes the file. `test_deploy_assets.py` asserts the behaviour, not the text.
+
+### The one file that could still have carried one, and the guard that stops it
+
+`config.yaml` ships in the image — it is startup defaults, and the runtime DB wins after first
+run. But it has a `telegram.bot_token` field, its own comment says *"flip to true after filling
+token + chat_id"*, and `telegram_notifier.build_notifier()` reads it **before** the DB:
+
+```python
+token = tg.get("bot_token") or ""            # config.yaml first
+token = token or storage.get_setting("telegram_bot_token", "")   # DB only if blank
+```
+
+So an operator doing exactly what the file told them, before a build, put a live token in a
+permanent layer — while this section claimed nothing in the deployment carries a credential.
+
+The build now runs `scripts/deploy/keel-config-guard.py` over the copied app directory and
+**fails** if any credential-shaped key holds a value, or if any line — comments included —
+contains something shaped like a Telegram token, a Discord/Slack webhook, an AWS key id or a PEM
+private key. It prints the file, the line and the value's *length*, never the value.
+
+It refuses rather than quietly stripping the field, for two reasons. A silent scrub leaves the
+operator with a live token in their working copy and a false belief that the posture held. And
+the `config.yaml` inside the image stays byte-identical to the one in the repo, which is the
+same argument `keel-run-dashboard.py` makes about not rewriting tracked config at runtime.
+
+Run it yourself before a build, or in a pre-commit hook:
+
+```bash
+python scripts/deploy/keel-config-guard.py trading-bot
+```
+
+If it fires on a value that was ever committed or pushed, rotate it — `SECURITY.md`.
 
 ---
 
@@ -261,10 +302,20 @@ docker compose exec engine python /app/bin/keel-healthcheck.py --role engine
 docker compose exec engine sqlite3 /app/trading-bot/data/trading.db \
   "PRAGMA quick_check; SELECT count(*) FROM trades WHERE status='closed';"
 
-# is the entry gate open or closed?
+# is the entry gate open or closed, and did the last run stop cleanly?
 docker compose exec engine sqlite3 /app/trading-bot/data/trading.db \
-  "SELECT key,value FROM settings WHERE key IN ('trading_mode','halt_new_entries');"
+  "SELECT key,value FROM settings WHERE key IN
+   ('trading_mode','halt_new_entries','keel_supervisor_run_state');"
+
+# who closed the gate, and why — every drain leaves a row
+docker compose exec engine sqlite3 /app/trading-bot/data/trading.db \
+  "SELECT datetime(t,'unixepoch'),origin,new,accepted,trigger_data FROM param_changes
+   WHERE key='halt_new_entries' ORDER BY id DESC LIMIT 5;"
 ```
+
+`keel_supervisor_run_state` reads `running` while the engine is up and `stopped_drained` after a
+clean stop. Finding `running` on a stopped stack means the last stop bypassed the handler, and
+the next start will close the entry gate — §10.
 
 The engine healthcheck checks the socket **and** that `engine_heartbeat_t` has advanced within
 three poll cycles. Flask keeps answering HTTP perfectly while the engine daemon thread is dead
@@ -338,6 +389,30 @@ the evidence.** Losing it does not lose a database, it restarts a clock that tak
 nothing can reconstruct it — the cost model, git SHA and fill assumptions behind each closed
 trade exist only in the row.
 
+**Exit codes, because `keel-stop.sh` reads them:**
+
+| Exit | Meaning |
+|---|---|
+| 0 | DB snapshot and state archive both written and verified |
+| 2 | the snapshot failed `integrity_check` — nothing was written, investigate with `hallucination_check.py` |
+| 3 | DB snapshot written and verified; only the `state/` archive failed |
+| 1 | something earlier failed — the service is not running, or the snapshot itself did not happen |
+
+Exit 3 exists because of a defect worth remembering. The engine rewrites `state/open_spread.json`
+every cycle and the news agent appends to `state/news_agent.log` continuously, so
+`tar czf -` over `state/` exits **1** — `file changed as we read it` — as a matter of routine.
+That is a warning: the archive is written and every other member is intact. Under `set -e` it
+aborted the backup anyway, and `keel-stop.sh` then **refused to stop the stack** — leaving
+`--no-backup`, which saves nothing at all, as the only route, in the moment a clean stop mattered
+most. A scripted safe stop that is unreliable when it is needed gets done by hand without a
+drain.
+
+Now: exit 1 from tar is tolerated and reported, exit 2 (tar's fatal code) is not, and either way
+the archive is only kept if it can be listed back — which is what catches a truncated stream
+regardless of the code that came with it. `keel-stop.sh` continues on exit 3, because the
+promotion-gate evidence is the `trades` table and that is already snapshotted and verified, and
+still refuses on anything that means the DB snapshot did not happen.
+
 `keel-state-*.tar.gz` **contains `dashboard_token`.** It is written 0600. Encrypt it before it
 leaves the host:
 
@@ -399,19 +474,47 @@ On ARM (Hetzner CAX), regenerate the pins first: `scripts/deploy/keel-freeze.sh`
 
 1. writes `halt_new_entries = True` through `params_store.set_param` (origin `human`, reason
    recorded, audited in `param_changes`);
-2. waits for the engine to observe it and reach the quiet part of its cycle;
-3. sends the child **SIGINT**, not SIGTERM.
-
-Step 3 is not a stylistic choice. Nothing in this tree installs a SIGTERM handler, so SIGTERM is
-an immediate kill. SIGINT is the one signal the code already answers: werkzeug unwinds
-`app.run()`, and `NewsAgent.run()` breaks its own loop on `KeyboardInterrupt`.
+2. sends the child **SIGINT**, not SIGTERM;
+3. the child — `keel-run-engine.py` — calls `engine.stop()` and holds the interpreter open until
+   `engine_loop` has returned.
 
 Step 1 is the half that matters. An interrupted *management* pass leaves a stop where it was. An
 interrupted *entry* can leave a position the database does not know about. Closing the entry
 gate first means that by the time anything is signalled, no new position can be opened.
 
-This happens on **every** stop — `docker compose stop`, `down`, a host reboot, an OOM kill —
-because it lives in the container, not in a script someone has to remember to run.
+Step 2 is not a stylistic choice. Nothing in this tree installs a SIGTERM handler, so SIGTERM is
+an immediate kill. SIGINT is the one signal the code already answers: werkzeug unwinds
+`app.run()`, and `NewsAgent.run()` breaks its own loop on `KeyboardInterrupt`.
+
+Step 3 is why the engine command is `keel-run-engine.py` and not `python server.py`. `server.py`
+starts `engine_loop` as a daemon thread and never calls `engine.stop()`, so a bare SIGINT unwinds
+Flask and destroys that thread wherever it happens to be. The wrapper sets the stop event the
+loop already checks and waits for the loop to leave the cycle. A healthy stop looks like this,
+and takes about two seconds:
+
+```
+[supervise] received SIGTERM
+[supervise] halt_new_entries=True written and audited
+[supervise] sending SIGINT to child pid 7
+[run-engine] received SIGINT — asking engine_loop to finish its cycle
+engine: stopped
+[run-engine] engine_loop returned after 0.0s — stop was clean
+[supervise] child exited cleanly (status 0)
+```
+
+`engine: stopped` is `engine_loop`'s own last line. Seeing it *before* the process exits is the
+whole point: the loop left the cycle, it was not destroyed inside one.
+
+> **If you remember the old behaviour:** every stop used to take about a minute and end with
+> `child ignored SIGINT after 20s — escalating to SIGTERM` and `child still alive — SIGKILL`.
+> Both lines were false. The supervisor ran its stop sequence inside the signal handler while
+> `main()` sat in `_child.wait()` with no timeout, which holds `Popen._waitpid_lock` across
+> `waitpid()`; the handler's own timed waits could never take that lock, so they always expired
+> and always escalated — on a child that had already exited cleanly. If you have logs from
+> before this change showing a SIGKILLed engine, they are not evidence of anything.
+
+This happens on **every** stop — `docker compose stop`, `down`, a host reboot — because it lives
+in the container, not in a script someone has to remember to run.
 
 **Consequence, and it is deliberate: entries stay halted across the restart.** An engine that
 silently resumes trading after an unexplained stop is failing open. Resume is a decision:
@@ -423,6 +526,48 @@ scripts/deploy/keel-resume.sh     # prints the open book and the kill-switch sta
 `keel-resume.sh` never touches `trading_mode`. Paper → live is `live_switch.py`'s two-step
 confirm behind the promotion gate, and no deploy script may shortcut it (CLAUDE.md invariant 2).
 `test_deploy_assets.py` asserts that no script in `scripts/deploy/` writes `trading_mode`.
+
+### The stops that never reach the handler
+
+A segfault, an OOM kill, `docker kill`, a host that loses power: none of them run step 1. The
+drain enforces no-self-resume for SIGTERM only, and `restart: unless-stopped` would otherwise
+bring the engine back with the entry gate exactly as open as the crash left it. The stops you
+cannot explain are precisely the ones that must not resume unattended.
+
+So the gate is also closed on the way **in**. The supervisor writes
+`keel_supervisor_run_state = running` to the settings table before it launches the engine, and
+rewrites it to `stopped_drained` only when a drained stop completes. A start that finds `running`
+still there knows the previous run died without draining:
+
+```
+[supervise] previous run ended WITHOUT a drain (run state was still 'running').
+[supervise] segfault, OOM kill, `docker kill` or a host that lost power — the
+[supervise] handler never ran, so the entry gate is however the crash left it.
+[supervise] halt_new_entries=True written and audited
+[supervise] entries are HALTED. Positions are still managed. Resume with
+            scripts/deploy/keel-resume.sh once you know what happened.
+```
+
+The engine still starts. That is deliberate — open positions need managing, and their stops are
+at the venue either way. What it does not do is take a new position before a human has looked.
+
+Two related behaviours worth knowing:
+
+- If only the **child** dies (the common crash), the supervisor sees the exit status directly and
+  closes the gate immediately, before the container even exits:
+  `child exited on its own with status -11 (nothing drained it)`.
+- If the supervisor cannot classify the previous stop **and** cannot close the gate — an
+  unreadable database — it **refuses to start** with exit 3 rather than run an engine whose entry
+  gate is in an unknown state. Repair the volume (§7 restore, §11), or, having checked
+  `halt_new_entries` by hand, start once with `KEEL_STARTUP_GATE=0`.
+
+One-off commands do not trip any of this. `docker compose run --rm engine python
+tests/test_risk_rails.py` shares the role and the entrypoint but is not a service start, so it
+neither halts entries nor clears the marker a running engine left behind.
+
+`docker kill` is worth a note of its own: Docker treats it as a user-initiated stop, so
+`unless-stopped` does **not** restart afterwards. The marker survives, and the gate closes on
+whatever start comes next.
 
 ---
 
@@ -445,8 +590,12 @@ docker inspect keel-engine --format '{{.State.ExitCode}} {{.State.OOMKilled}} {{
 | `newsagent` never starts, no logs | `depends_on: engine: service_healthy` and the engine is not healthy | fix the engine first; `docker inspect keel-engine --format '{{json .State.Health}}'` |
 | Engine `(unhealthy)` but logs look fine | port answers, `engine_heartbeat_t` stale — the daemon thread is dead or wedged | `docker compose exec engine python /app/bin/keel-healthcheck.py --role engine` for the reason; restart; if it recurs, that is a real engine bug, not a deployment one |
 | Dashboard container up, tunnel refuses | it bound container-loopback and nothing can reach it | `KEEL_DASHBOARD_HOST` must be `0.0.0.0` in compose (§6 explains why that is still loopback-only externally) |
-| `stop` hangs ~90s every time | that is the drain working | if it needs to be faster, lower `engine.poll_seconds`, not `stop_grace_period` |
+| `stop` takes ~30s+ and logs `child has not exited Ns after SIGINT` | the loop really is stuck in a cycle — a venue call that is not timing out. Look for `ENGINE LOOP DID NOT RETURN` from `[run-engine]` just before it | that is an engine bug, not a deployment one; the container exits 75 to say the stop was not clean. Reconcile against the venue before resuming entries |
 | Container killed mid-cycle on reboot | `shutdown-timeout` missing from `/etc/docker/daemon.json` | add it (§3), `systemctl restart docker` |
+| Build stops with `BUILD REFUSED - a credential is present` | `config.yaml` has a filled-in `bot_token`/`chat_id`, or a token pasted somewhere in a YAML file | empty the field, put the value in the dashboard, rebuild. Rotate it if it was ever committed (§5) |
+| Engine exits 3 immediately, `STARTUP GATE FAILED` | the supervisor could not read the run-state marker or close the entry gate — usually an unreadable or unwritable `data/` volume | fix the volume (rows above), or restore (§9). Only after checking `halt_new_entries` by hand: start once with `KEEL_STARTUP_GATE=0` |
+| Every start logs `previous run ended WITHOUT a drain` | something is killing the container without SIGTERM — OOM, or a `docker kill` in a script | check `docker inspect ... {{.State.OOMKilled}}` and `RestartCount`. Entries are halted each time, which is correct; the crash is the thing to fix |
+| Any `.sh` dies with `set: pipefail: invalid option name` | CRLF line endings — the tree was copied from Windows rather than cloned | `git clone` on the host, or `sed -i 's/\r$//' scripts/deploy/*.sh` |
 | Build fails resolving packages | pinned set no longer available, or wrong arch | `scripts/deploy/keel-freeze.sh`, read the diff |
 
 Nuclear option, and note what it does **not** delete:
@@ -462,14 +611,20 @@ Never `down -v`. That deletes the gate evidence.
 
 ## 12. The awkward parts, written down
 
-**The supervisor cannot make an arbitrary mid-cycle stop safe.** `engine_loop` is `while True:`
-with no stop event, running as a daemon thread nothing joins. The supervisor closes the entry
-gate — which is the half that can create an unknown position — and then aims for the quiet part
-of the cycle by watching `engine_heartbeat_t` advance and waiting out most of a poll interval.
-That is a heuristic. The durable fix is a `threading.Event` checked by `engine_loop` and joined
-before the process exits, in `engine.py`, which this change does not own. Until then a stop
-during the working part of a cycle is possible; it is just unlikely, and it can no longer open a
-position.
+**`server.py` still never calls `engine.stop()`.** `engine.py` has the stop event and the
+`stop()` that sets it; `server.py` starts `engine_loop` as a daemon thread, blocks in
+`app.run()`, and installs no signal handler. Run `python server.py` directly — outside the
+container, as `CONTRIBUTING.md` still tells you to for development — and Ctrl-C destroys the loop
+thread wherever it is. `keel-run-engine.py` supplies the missing handler from the deployment
+side, which means the guarantee in §10 holds **only inside the container**. The durable fix is
+that handler living in `server.py` and joining the loop thread; `server.py` is not part of this
+change. Delete the wrapper the day it lands.
+
+**Only `engine_loop` gets the deterministic stop.** `agent_loop`, the news-calendar refresher and
+the safety monitor are still daemon threads that die with the interpreter. They write through
+`params_store`, which is transactional, and none of them holds a position — the engine loop is
+the one whose interruption can leave the database disagreeing with the venue. It is a smaller
+gap than the one that was there, not no gap.
 
 **`POST /api/commands` still authenticates nothing.** The loopback binding is currently the only
 thing protecting it. ARCHITECTURE-V3 §5 item 3 is the fix (require the dashboard token) and it

@@ -31,12 +31,21 @@ Run:  python scripts/deploy/test_deploy_assets.py
 import os
 import py_compile
 import re
+import shutil
+import signal
+import subprocess
 import sys
+import threading
+import time
 
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEPLOY = os.path.join(REPO, "scripts", "deploy")
+
+
+class Skip(Exception):
+    """A check that cannot run here. Reported separately, never as a pass."""
 
 
 def _read(rel):
@@ -392,7 +401,8 @@ def test_dependencies_are_pinned():
 
 # ============================================================ scripts
 def test_deploy_scripts_compile():
-    for f in ("keel-supervise.py", "keel-healthcheck.py", "keel-run-dashboard.py"):
+    for f in ("keel-supervise.py", "keel-healthcheck.py", "keel-run-dashboard.py",
+              "keel-run-engine.py", "keel-config-guard.py"):
         py_compile.compile(os.path.join(DEPLOY, f), doraise=True)
 
 
@@ -459,6 +469,210 @@ def test_nothing_in_deploy_scripts_can_flip_trading_mode():
             is_read = "SELECT" in line or "echo" in line or "print" in line
             assert is_comment or is_read, \
                 "%s appears to WRITE trading_mode: %s" % (f, stripped)
+
+
+# ==================================== no credential reaches an image layer
+# config.yaml ships, and telegram_notifier.build_notifier() reads
+# `telegram.bot_token` from it BEFORE the settings DB:
+#     token = tg.get("bot_token") or ""
+#     token = token or storage.get_setting("telegram_bot_token", "")
+# So the field the file invites an operator to fill in is also the one that
+# beats the dashboard, and filling it in before a build writes a live token
+# into a layer that `docker history` keeps forever.
+def _guard():
+    return _load_module("keel-config-guard.py", "keel_config_guard_under_test")
+
+
+def test_the_build_refuses_a_config_that_carries_a_token():
+    g = _guard()
+    findings = g.scan_text(
+        'telegram:\n'
+        '  enabled: true\n'
+        '  bot_token: "123456789:AAHexampleexampleexampleexampleexam"\n'
+        '  chat_id: "-1001234567890"\n', "config.yaml")
+    keys = " ".join(findings)
+    assert "bot_token" in keys, "a filled-in bot_token was allowed into a layer"
+    assert "chat_id" in keys, "a filled-in chat_id was allowed into a layer"
+
+
+def test_the_build_guard_catches_a_credential_a_yaml_parser_would_not_see():
+    """A token pasted under a key nobody enumerated, or into a comment. Parsing
+    the YAML would see neither; the layer keeps both."""
+    g = _guard()
+    assert g.scan_text("# TODO rotate 123456789:AAHexampleexampleexampleexampleexam\n",
+                       "notes.yaml"), "credential in a comment slipped through"
+    assert g.scan_text(
+        "notify:\n  hook: https://discord.com/api/webhooks/1/abcdef\n", "x.yaml"), \
+        "a webhook URL under an unenumerated key slipped through"
+
+
+def test_the_build_guard_never_prints_the_credential():
+    """A guard that echoes the secret into the build log has moved it, not
+    caught it — and build logs are kept and shared."""
+    g = _guard()
+    secret = "987654321:AAHsecretsecretsecretsecretsecretse"
+    findings = g.scan_text('  bot_token: "%s"\n' % secret, "config.yaml")
+    assert findings
+    blob = " ".join(findings)
+    assert secret not in blob, "the guard printed the token"
+    assert "AAHsecret" not in blob, "the guard printed part of the token"
+
+
+def test_the_shipped_config_passes_the_guard():
+    """If this fails, someone has a live credential in their working copy and
+    the build is about to be refused — which is the point."""
+    g = _guard()
+    for rel in ("trading-bot/config.yaml", "trading-bot/config.example.yaml"):
+        assert g.scan_text(_read(rel), rel) == [], \
+            "%s carries a credential" % rel
+
+
+def test_the_guard_accepts_the_empty_placeholders_it_must_not_flag():
+    g = _guard()
+    assert g.scan_text('telegram:\n  bot_token: ""\n  chat_id: ""\n', "c.yaml") == []
+    assert g.scan_text('  bot_token:            # from the dashboard\n', "c.yaml") == []
+
+
+def test_the_image_runs_the_config_guard_before_it_is_usable():
+    """The guard is only a guard if the build actually runs it, after the COPY
+    that brings config.yaml in — so a config change re-runs it."""
+    copy_at = DOCKERFILE.find("COPY --chown=10001:10001 trading-bot/")
+    run_at = DOCKERFILE.find("RUN python /app/bin/keel-config-guard.py")
+    assert copy_at != -1, "the app COPY moved; re-check the guard's position"
+    assert run_at != -1, "the Dockerfile does not run keel-config-guard.py"
+    assert run_at > copy_at, "the guard runs before config.yaml is in the image"
+
+
+# ============================================== the backup must not block a stop
+def _bash():
+    b = shutil.which("bash")
+    if not b:
+        raise Skip("no bash on this host; run this suite in the image or on CI")
+    if not shutil.which("tar") or not shutil.which("gzip"):
+        raise Skip("tar/gzip not on PATH")
+    return b
+
+
+def _shell_path(p):
+    """Windows path -> a path the shell's tar will accept.
+
+    On the deploy host this is a no-op. Here it matters: `tar tzf C:/x` makes
+    GNU tar read "C" as a remote host, and a backslash is not a separator to
+    it. The script under test is unchanged either way — only how this harness
+    hands it a directory."""
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", p)
+    if m:
+        return "/%s/%s" % (m.group(1).lower(), m.group(2).replace("\\", "/"))
+    return p.replace("\\", "/")
+
+
+def _run_backup_with_fake_docker(tar_exit):
+    """Run the real keel-backup.sh with `docker` replaced by a stub.
+
+    No daemon, no network. The stub answers each `docker compose ...` the
+    script issues and, for the state archive, emits a REAL tar.gz and then
+    exits with `tar_exit` — which is how GNU tar reports "file changed as we
+    read it" (1) against the engine rewriting state/open_spread.json every
+    cycle and the news agent appending to news_agent.log continuously.
+    """
+    import tempfile
+    bash = _bash()
+    work = tempfile.mkdtemp()
+    bindir = os.path.join(work, "bin")
+    payload = os.path.join(work, "payload")
+    dest = os.path.join(work, "backups")
+    os.makedirs(bindir)
+    os.makedirs(payload)
+
+    # Run a byte-copy of the script with LF endings. Git stores these files LF,
+    # but a Windows checkout with core.autocrlf=true materialises them CRLF, and
+    # bash then reads `set -euo pipefail\r` and dies with "invalid option name"
+    # before the script does anything. That is a real hazard for anyone who
+    # COPIES a Windows working tree to the Linux host instead of cloning there
+    # (docs/DEPLOYMENT-LINUX.md §2 says clone), but it is not what these two
+    # tests are measuring, and letting it mask the tar behaviour would leave
+    # the actual defect untested.
+    # Same relative position, so the script's own `dirname/../..` REPO_DIR
+    # resolves to a directory rather than something above the temp root.
+    staged = os.path.join(work, "scripts", "deploy")
+    os.makedirs(staged)
+    script = os.path.join(staged, "keel-backup.sh")
+    with open(os.path.join(DEPLOY, "keel-backup.sh"), "rb") as src:
+        body = src.read().replace(b"\r\n", b"\n")
+    with open(script, "wb") as dst:
+        dst.write(body)
+    os.chmod(script, 0o755)
+    with open(os.path.join(payload, "open_spread.json"), "w") as f:
+        f.write("{}")
+
+    stub = """#!/usr/bin/env bash
+case "$*" in
+  *"ps --status running --services"*) echo engine ;;
+  *"integrity_check"*)                echo ok ;;
+  *"SELECT count(*)"*)                echo 51 ;;
+  *".backup"*)                        exit 0 ;;
+  *" cat "*)                          printf 'SQLite format 3\\0' ;;
+  *" rm -f "*)                        exit 0 ;;
+  *"tar czf -"*)
+      tar czf - -C "%s" . || true
+      exit %d ;;
+  *) exit 0 ;;
+esac
+""" % (_shell_path(payload), tar_exit)
+    stub_path = os.path.join(bindir, "docker")
+    with open(stub_path, "w", newline="\n") as f:
+        f.write(stub)
+    os.chmod(stub_path, 0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = bindir + os.pathsep + env["PATH"]
+    p = subprocess.run(
+        [bash, _shell_path(script), _shell_path(dest)],
+        capture_output=True, text=True, env=env, timeout=180)
+    states = [f for f in os.listdir(dest)] if os.path.isdir(dest) else []
+    return p, [f for f in states if f.startswith("keel-state-")], dest
+
+
+def test_a_routine_tar_warning_does_not_block_the_stop():
+    """The defect: `tar czf -` over a live state/ exits 1 as a matter of course,
+    `set -euo pipefail` turned that into a failed backup, and keel-stop.sh then
+    REFUSED TO STOP THE STACK — leaving --no-backup (no evidence at all) as the
+    operator's only route, in the moment they most wanted a clean stop."""
+    p, states, dest = _run_backup_with_fake_docker(tar_exit=1)
+    assert p.returncode == 0, (
+        "backup exited %d on the routine 'file changed as we read it'.\n"
+        "stdout:\n%s\nstderr:\n%s" % (p.returncode, p.stdout, p.stderr))
+    assert states, "no state archive was written"
+    out = subprocess.run(
+        [_bash(), "-c", "tar tzf '%s'" % _shell_path(os.path.join(dest, states[0]))],
+        capture_output=True, text=True)
+    assert out.returncode == 0, "the archive it kept is not readable"
+    assert "open_spread.json" in out.stdout, \
+        "the archive is missing the files it was supposed to hold"
+
+
+def test_a_fatal_tar_error_is_still_a_failure_and_leaves_no_archive():
+    """Tolerating exit 1 must not become tolerating everything. Exit 2 is
+    tar's fatal code, and a half-written archive that nobody can read must not
+    sit in the backup directory looking like a backup."""
+    p, states, _ = _run_backup_with_fake_docker(tar_exit=2)
+    assert p.returncode == 3, (
+        "fatal tar error exited %d; expected 3 (DB snapshot written, state "
+        "archive failed).\nstdout:\n%s\nstderr:\n%s"
+        % (p.returncode, p.stdout, p.stderr))
+    assert not states, "a failed state archive was left behind: %s" % states
+
+
+def test_keel_stop_continues_when_only_the_state_archive_failed():
+    """Exit 3 means the promotion-gate evidence — the trades table — is already
+    snapshotted and verified. Refusing to stop over the lesser half is how a
+    scripted safe stop turns into a stop done by hand with no drain at all."""
+    src = open(os.path.join(DEPLOY, "keel-stop.sh"), encoding="utf-8").read()
+    body = src[src.index("backing up before stopping"):src.index("open positions at stop time")]
+    assert re.search(r'BK_RC"?\s*-eq\s*3', body), \
+        "keel-stop.sh does not distinguish a state-archive-only failure"
+    assert re.search(r"exit 1", body), \
+        "keel-stop.sh no longer refuses when the DB snapshot itself failed"
 
 
 def test_no_destructive_volume_removal_in_any_script():
@@ -566,25 +780,34 @@ def test_stop_sequence_drains_before_it_signals():
     """Order is the whole safety property.
 
     If the SIGINT went first, the engine could be mid-entry when it lands. The
-    gate must be shut, and observed shut, before anything is signalled. Driven
-    with a fake child so this tests the ordering rather than the host OS's
-    signal semantics (Windows does not deliver SIGTERM the way Linux does).
+    gate must be shut before anything is signalled. Driven with a fake child so
+    this tests the ordering rather than the host OS's signal semantics (Windows
+    does not deliver SIGTERM the way Linux does).
+
+    CHANGED, deliberately: this used to assert the sequence
+    ["drain", "quiet", "signal:SIGINT"], where "quiet" was
+    `_wait_for_quiet_window` — a sleep timed off `engine_heartbeat_t` to guess
+    when the loop was between cycles. The old expectation was wrong twice over.
+    It certified a heuristic as if it were the safety property (the property is
+    "the loop is not mid-cycle", which a sleep cannot establish), and
+    `engine.stop()` now exists, so the child stops the loop for real and the
+    guess is gone. The step is removed, not renamed.
     """
-    import signal as _sig
     storage, app = _fresh_app_db()
     os.environ["KEEL_APP_DIR"] = app
     os.environ["KEEL_DRAIN_ON_STOP"] = "1"
+    os.environ["KEEL_CHILD_GRACE_S"] = "2"
     sup = _load_module("keel-supervise.py", "keel_supervise_stop")
     sup.APP_DIR = app
-    sup._wait_for_quiet_window = lambda poll_s: events.append("quiet")
 
     events = []
 
     class FakeChild:
         pid = 4242
+        returncode = 0
         def poll(self): return None
         def send_signal(self, s):
-            events.append("signal:%s" % ("SIGINT" if s == _sig.SIGINT else s))
+            events.append("signal:%s" % ("SIGINT" if s == signal.SIGINT else s))
         def wait(self, timeout=None):
             events.append("wait"); return 0
         def terminate(self): events.append("SIGTERM")
@@ -592,14 +815,428 @@ def test_stop_sequence_drains_before_it_signals():
 
     sup._child = FakeChild()
     real_halt = sup._halt_new_entries
-    sup._halt_new_entries = lambda: (events.append("drain"), real_halt())[1]
+    sup._halt_new_entries = lambda *a, **k: (events.append("drain"), real_halt())[1]
 
-    sup._terminate(_sig.SIGTERM, None)
+    sup.stop_child(signal.SIGTERM, gate_armed=False)
 
-    assert events[:3] == ["drain", "quiet", "signal:SIGINT"], \
-        "stop sequence was %s; must drain, settle, then SIGINT" % events
+    assert events[:2] == ["drain", "signal:SIGINT"], \
+        "stop sequence was %s; must drain, then SIGINT" % events
     assert storage.get_setting("halt_new_entries") is True
     assert "SIGKILL" not in events, "escalated to SIGKILL on a child that exited"
+
+
+# ------------------------------------------------- the stop must not deadlock
+class _CPythonPopenModel:
+    """A Popen stand-in that reproduces CPython's POSIX waitpid locking.
+
+    This is the whole point of the test below, so it is worth stating what is
+    being modelled. `subprocess.Popen._wait()` has two paths:
+
+      timeout is None -> `with self._waitpid_lock: self._try_wait(0)`. The lock
+        is HELD across a blocking waitpid(). CPython installs signal handlers
+        without SA_RESTART, so the Python handler runs from inside that call's
+        EINTR retry — with the lock held by this very thread.
+      timeout is not None -> a busy loop whose only acquisition is
+        `self._waitpid_lock.acquire(False)`. A non-reentrant lock already held
+        by this thread never yields, so the loop reaps nothing and runs out to
+        TimeoutExpired.
+
+    A stop sequence that runs inside the handler therefore times out every
+    time, on a child that has already exited, and then escalates to SIGTERM and
+    SIGKILL — inventing evidence that the child ignored the signal.
+    """
+
+    def __init__(self, on_first_wait=None):
+        self.pid = 4242
+        self.returncode = None
+        self.signals = []
+        # Only waits long enough to BE the grace window are counted. A short
+        # poll expiring is how the supervisor is supposed to work; the grace
+        # window expiring on a child that already exited is the defect.
+        self.graces_expired = 0
+        self._lock = threading.Lock()
+        self._exited = False
+        self._on_first_wait = on_first_wait
+
+    # `Popen._internal_poll` gives up rather than block when the lock is busy.
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        if not self._lock.acquire(False):
+            return None
+        try:
+            if self._exited:
+                self.returncode = 0
+            return self.returncode
+        finally:
+            self._lock.release()
+
+    # Names, not signal constants: Windows has no signal.SIGKILL, and a model
+    # that raises AttributeError the moment a regression escalates would report
+    # the regression as an error in the harness instead of a failed assertion.
+    def send_signal(self, sig):
+        self.signals.append(getattr(sig, "name", str(sig)))
+        if sig == signal.SIGINT:
+            self._exited = True          # a child that handles SIGINT, exiting
+    def terminate(self):
+        self.signals.append("SIGTERM"); self._exited = True
+    def kill(self):
+        self.signals.append("SIGKILL"); self._exited = True
+
+    def _fire(self, holding_lock):
+        cb, self._on_first_wait = self._on_first_wait, None
+        if cb:
+            cb(holding_lock)
+
+    def wait(self, timeout=None):
+        if timeout is None:
+            with self._lock:                       # blocking waitpid, lock held
+                self._fire(holding_lock=True)      # EINTR: handler runs in here
+                deadline = time.time() + 30
+                while not self._exited and time.time() < deadline:
+                    time.sleep(0.01)
+                self.returncode = 0
+                return 0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._lock.acquire(False):
+                try:
+                    if self._exited:
+                        self.returncode = 0
+                        return 0
+                finally:
+                    self._lock.release()
+            self._fire(holding_lock=False)         # handler runs between tries
+            time.sleep(0.01)
+        if timeout >= 1:
+            self.graces_expired += 1
+        raise subprocess.TimeoutExpired("child", timeout)
+
+
+def test_stop_does_not_deadlock_on_the_popen_waitpid_lock():
+    """The defect: a guaranteed extra 30s and a log that lies.
+
+    Drive the supervisor's real wait loop with a child that models CPython's
+    locking, deliver the stop signal from inside the wait exactly as EINTR
+    does, and require that the child is stopped with ONE SIGINT and no
+    escalation. Against the previous shape — stop work inside the handler,
+    `_child.wait()` with no timeout in main() — the handler would hold the lock,
+    both of its timed waits would expire, and this would see SIGTERM and
+    SIGKILL on a child that exited on the SIGINT.
+    """
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    os.environ["KEEL_DRAIN_ON_STOP"] = "1"
+    os.environ["KEEL_CHILD_GRACE_S"] = "3"
+    sup = _load_module("keel-supervise.py", "keel_supervise_deadlock")
+    sup.APP_DIR = app
+    sup._stop_signum = None
+
+    child = _CPythonPopenModel(
+        on_first_wait=lambda holding_lock: sup._on_signal(signal.SIGTERM, None))
+    sup._child = child
+
+    t0 = time.time()
+    rc = sup.supervise(gate_armed=False)
+    elapsed = time.time() - t0
+
+    assert child.signals == ["SIGINT"], (
+        "child was signalled %s; a child that exits on SIGINT must not be "
+        "escalated to SIGTERM/SIGKILL" % child.signals)
+    assert child.graces_expired == 0, (
+        "%d grace window(s) expired against a child that had already exited — "
+        "the waitpid lock is being held across the stop" % child.graces_expired)
+    assert elapsed < 3, (
+        "stop took %.1fs with a 3s grace; it should not consume the grace "
+        "window at all" % elapsed)
+    assert rc == 0
+    assert storage.get_setting("halt_new_entries") is True
+
+
+def test_the_signal_handler_touches_nothing_but_a_flag():
+    """It can run with `Popen._waitpid_lock` held. Any call into the child, or
+    any lock, is the deadlock. A child that explodes on attribute access proves
+    the handler never reaches for one."""
+    sup = _load_module("keel-supervise.py", "keel_supervise_handler")
+    sup._stop_signum = None
+
+    class Landmine:
+        def __getattr__(self, name):
+            raise AssertionError(
+                "signal handler touched _child.%s; it must only record the "
+                "signal number" % name)
+
+    sup._child = Landmine()
+    sup._on_signal(signal.SIGTERM, None)
+    assert sup._stop_signum == signal.SIGTERM
+    sup._child = None
+
+
+def test_supervisor_never_waits_on_the_child_without_a_timeout():
+    """The structural companion to the test above: one `.wait()` with no
+    timeout anywhere in this file reintroduces the whole defect.
+
+    Parsed, not grepped — the docstring in that file quotes `_child.wait()` while
+    explaining the bug, and a test that cannot tell prose from a call site is
+    the kind of test this repo has been bitten by.
+    """
+    import ast
+    src = open(os.path.join(DEPLOY, "keel-supervise.py"), encoding="utf-8").read()
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "wait":
+            timed = bool(node.args) or any(k.arg == "timeout" for k in node.keywords)
+            if not timed:
+                bad.append(node.lineno)
+    assert not bad, (
+        "keel-supervise.py:%s waits with no timeout; that holds "
+        "Popen._waitpid_lock across waitpid() and the signal handler runs "
+        "inside it" % bad)
+
+
+# ------------------------------------------------ the start must not resume
+def test_an_undrained_previous_run_halts_entries_at_the_next_start():
+    """`restart: unless-stopped` after a segfault, an OOM kill or `docker kill`.
+    None of those reach the stop handler, so nothing drained: the container
+    would otherwise come back with the entry gate exactly as the crash left it.
+    """
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    sup = _load_module("keel-supervise.py", "keel_supervise_startup")
+    sup.APP_DIR = app
+
+    storage.set_setting(sup.RUN_STATE_KEY, sup.RUN_STATE_RUNNING)   # crashed run
+    assert not storage.get_setting("halt_new_entries"), "precondition: gate open"
+
+    assert sup.startup_entry_gate() == "halted"
+
+    assert storage.get_setting("halt_new_entries") is True, \
+        "the engine would come back taking new positions after a stop nobody " \
+        "has explained"
+    import engine
+    assert engine.params()["halt_new_entries"] is True, \
+        "the engine would not see the halt"
+    rows = storage.query("SELECT * FROM param_changes WHERE key='halt_new_entries'"
+                         " ORDER BY id DESC")
+    assert rows and rows[0]["origin"] == "human" and rows[0]["accepted"] == 1
+    td = rows[0]["trigger_data"] or ""
+    assert "keel-supervise" in td and "undrained" in td, \
+        "the audit row does not say an undrained stop caused this: %s" % td
+    assert storage.get_setting(sup.RUN_STATE_KEY) == sup.RUN_STATE_RUNNING, \
+        "this run did not re-arm the marker; the next crash would look clean"
+
+
+def test_a_drained_stop_leaves_the_next_start_alone():
+    """The halt must come from the crash, not from every start. A drained stop
+    already wrote halt_new_entries; re-deciding it here would make the marker
+    meaningless and bury the real signal in noise."""
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    sup = _load_module("keel-supervise.py", "keel_supervise_startup_clean")
+    sup.APP_DIR = app
+
+    storage.set_setting(sup.RUN_STATE_KEY, sup.RUN_STATE_DRAINED)
+    assert sup.startup_entry_gate() == "clean"
+    assert not storage.get_setting("halt_new_entries")
+    assert not storage.query("SELECT id FROM param_changes "
+                             "WHERE key='halt_new_entries'")
+
+
+def test_a_first_start_is_not_treated_as_a_crash():
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    sup = _load_module("keel-supervise.py", "keel_supervise_startup_first")
+    sup.APP_DIR = app
+    assert sup.startup_entry_gate() == "first-start"
+    assert not storage.get_setting("halt_new_entries")
+
+
+def test_the_startup_gate_arms_only_for_a_real_engine_start():
+    """`docker compose run --rm engine python tests/test_risk_rails.py` shares
+    the role and the entrypoint. It must neither trip the gate nor clear the
+    marker a running engine left behind."""
+    sup = _load_module("keel-supervise.py", "keel_supervise_armed")
+    os.environ.pop("KEEL_STARTUP_GATE", None)
+    assert sup.startup_gate_armed("engine", ["python", "/app/bin/keel-run-engine.py"])
+    assert not sup.startup_gate_armed("engine", ["python", "tests/test_risk_rails.py"])
+    assert not sup.startup_gate_armed("engine", ["sqlite3", "data/trading.db"])
+    assert not sup.startup_gate_armed(
+        "dashboard", ["python", "/app/bin/keel-run-dashboard.py"])
+
+
+def test_the_engine_does_not_start_when_the_gate_cannot_be_closed():
+    """Fail closed. If the previous stop cannot be classified AND the gate
+    cannot be shut, a started engine is an engine that may open a position
+    nobody decided to open. Refusing is loud; starting is silent."""
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    sup = _load_module("keel-supervise.py", "keel_supervise_refuse")
+    sup.APP_DIR = app
+    sup._run_state_get = lambda: sup.RUN_STATE_RUNNING
+    sup._halt_new_entries = lambda *a, **k: False        # DB unwritable
+
+    raised = False
+    try:
+        sup.startup_entry_gate()
+    except Exception:
+        raised = True
+    assert raised, "startup gate returned normally with the entry gate open"
+
+    # ...and main() turns that into a refusal to launch the child.
+    sup.startup_entry_gate = lambda: (_ for _ in ()).throw(RuntimeError("db gone"))
+    sup._child = None
+    old_argv, old_term, old_int = (sys.argv,
+                                   signal.getsignal(signal.SIGTERM),
+                                   signal.getsignal(signal.SIGINT))
+    sys.argv = ["keel-supervise.py", "--role", "engine", "--",
+                "python", "/app/bin/keel-run-engine.py"]
+    try:
+        rc = sup.main()
+    finally:
+        sys.argv = old_argv
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+    assert rc == 3, "expected a refusal exit code, got %r" % rc
+    assert sup._child is None, \
+        "the engine was launched with an unknown entry-gate state"
+
+
+def test_a_child_that_dies_on_its_own_halts_entries():
+    """The supervisor can see this one directly — it holds the exit status.
+    A SIGSEGV child is an unexplained stop whether or not anyone restarts it."""
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    sup = _load_module("keel-supervise.py", "keel_supervise_crash")
+    sup.APP_DIR = app
+    sup._stop_signum = None
+
+    class Segfaulted:
+        pid = 7
+        returncode = -11
+        def wait(self, timeout=None): return -11
+        def poll(self): return -11
+
+    sup._child = Segfaulted()
+    rc = sup.supervise(gate_armed=True)
+
+    assert rc == 139, \
+        "a child killed by signal 11 must be reported as 128+11, got %r" % rc
+    assert storage.get_setting("halt_new_entries") is True, \
+        "the engine crashed and the entry gate stayed open"
+
+
+# ------------------------------------ the child's stop is deterministic now
+def test_run_engine_stops_the_loop_by_event_not_by_timing():
+    """The property the heartbeat heuristic could never have: the loop is out
+    of the cycle BEFORE the interpreter exits, and it does not cost a poll
+    interval to find out.
+
+    Driven with a stand-in that has engine_loop's actual shape — check the
+    event, do work, then park in `_stop.wait(poll_seconds)` — because running
+    the real loop would need a venue. The event, `engine.stop()` and the
+    wrapper under test are all real.
+    """
+    _, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    run = _load_module("keel-run-engine.py", "keel_run_engine")
+    import engine
+
+    original = engine.engine_loop
+    cycles = []
+
+    def stand_in_loop(poll_seconds=20):
+        engine._stop.clear()
+        while not engine._stop.is_set():
+            cycles.append(time.time())
+            time.sleep(0.05)                      # the "work" half of a cycle
+            engine._stop.wait(poll_seconds)
+
+    try:
+        engine.engine_loop = stand_in_loop
+        run.instrument_loop()
+        t = threading.Thread(target=engine.engine_loop, args=(30,), daemon=True)
+        t.start()
+        assert run._loop_started.wait(5), "stand-in loop never started"
+        time.sleep(0.2)
+
+        t0 = time.time()
+        try:
+            run._on_signal(signal.SIGTERM, None)   # raises KeyboardInterrupt
+        except KeyboardInterrupt:
+            pass
+        rc = run.drain_loop()
+        elapsed = time.time() - t0
+
+        assert rc == 0, "clean stop reported as %r" % rc
+        assert run._loop_exited.is_set(), "the loop had not returned"
+        t.join(timeout=5)
+        assert not t.is_alive(), "loop thread still running after the stop"
+        assert elapsed < 5, (
+            "took %.1fs to stop a loop with a 30s poll interval — this is "
+            "waiting the interval out, not setting the event" % elapsed)
+    finally:
+        engine.engine_loop = original
+        engine._stop.clear()
+
+
+def test_run_engine_refuses_to_call_a_stuck_loop_a_clean_stop():
+    """The failure this must never dress up: a loop that did not come out, on
+    a process that is about to exit and destroy the thread mid-cycle."""
+    _, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    run = _load_module("keel-run-engine.py", "keel_run_engine_stuck")
+    import engine
+
+    original = engine.engine_loop
+    try:
+        def deaf_loop(poll_seconds=20):
+            while True:                            # never looks at _stop
+                time.sleep(0.05)
+
+        engine.engine_loop = deaf_loop
+        run.instrument_loop()
+        run.LOOP_STOP_S = 0.5
+        threading.Thread(target=engine.engine_loop, daemon=True).start()
+        assert run._loop_started.wait(5)
+
+        rc = run.drain_loop()
+        assert rc != 0, \
+            "a loop that never returned was reported as a clean stop (rc=%r)" % rc
+    finally:
+        engine.engine_loop = original
+        engine._stop.clear()
+
+
+def test_the_engine_container_runs_the_deterministic_stop_wrapper():
+    """A CMD of `python server.py` puts the timing guess back: server.py never
+    calls engine.stop(), so SIGINT just unwinds Flask and the daemon thread
+    dies wherever it is."""
+    cmd = re.search(r"^CMD\s+(\[.*\]|.*)$", DOCKERFILE, re.M)
+    assert cmd, "Dockerfile has no CMD"
+    assert "keel-run-engine.py" in cmd.group(1), \
+        "engine CMD is %s; it must go through keel-run-engine.py" % cmd.group(1)
+    for svc in ("dashboard", "newsagent"):
+        ep = COMPOSE["services"][svc].get("entrypoint") or []
+        assert "keel-supervise.py" in " ".join(ep), \
+            "%s does not run under the supervisor" % svc
+
+
+def test_compose_does_not_pin_a_child_grace_below_the_poll_interval():
+    """keel-supervise derives the grace from engine.poll_seconds so that
+    raising the poll cannot silently start truncating stops. A literal in
+    compose wins over that derivation and reintroduces it."""
+    env = COMPOSE["services"]["engine"].get("environment") or {}
+    grace = env.get("KEEL_CHILD_GRACE_S")
+    if grace is None:
+        return
+    cfg = yaml.safe_load(_read("trading-bot/config.yaml"))
+    poll = int((cfg.get("engine") or {}).get("poll_seconds", 20))
+    assert int(grace) >= poll + 10, (
+        "KEEL_CHILD_GRACE_S=%s is under poll_seconds+10 (%d): a stop would be "
+        "cut off mid-cycle" % (grace, poll + 10))
 
 
 def test_healthcheck_fails_when_the_socket_is_down():
@@ -617,15 +1254,23 @@ if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
     failed = 0
+    skipped = 0
     for fn in fns:
         try:
             fn()
             print("ok  ", fn.__name__)
+        except Skip as e:
+            skipped += 1
+            print("skip", fn.__name__, "-", e)
         except AssertionError as e:
             failed += 1
             print("FAIL", fn.__name__, "-", e)
         except Exception as e:
             failed += 1
             print("ERR ", fn.__name__, "-", repr(e))
-    print("\n%d passed, %d failed" % (len(fns) - failed, failed))
+    print("\n%d passed, %d failed" % (len(fns) - failed - skipped, failed))
+    if skipped:
+        # Named, not silent. A skip is a check that did not run, and the reason
+        # has to be visible or the count above reads as more coverage than it is.
+        print("%d skipped (see 'skip' lines above)" % skipped)
     sys.exit(1 if failed else 0)

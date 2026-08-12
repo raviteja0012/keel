@@ -11,6 +11,18 @@
 #
 # Read the diff when you regenerate. A ccxt bump changes how orders reach a
 # venue; a cryptography bump does not. They are not the same review.
+#
+# A constraints file only constrains what it NAMES. A package that enters the
+# tree after this file was generated resolves freely, and the pinning is
+# silently incomplete for exactly that package — which is how `coincurve`, a
+# ccxt dependency that signs transactions, was floating while this file claimed
+# the set was pinned. Check for the next one by comparing the built image
+# against this file, not by reading it:
+#
+#   docker run --rm --entrypoint pip keel:local freeze | sort -f \
+#     | diff - <(grep -v '^#' scripts/deploy/constraints.txt)
+#
+# Anything only on the left is unpinned. Add it here, or regenerate.
 aiodns==3.6.1
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.3
@@ -25,6 +37,7 @@ certifi==2026.7.22
 cffi==2.1.1
 charset-normalizer==3.4.9
 click==8.4.2
+coincurve==21.0.0
 colorama==0.4.6
 cryptography==50.0.0
 fastapi==0.141.1

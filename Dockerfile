@@ -79,8 +79,23 @@ WORKDIR /app
 COPY --chown=10001:10001 trading-bot/ /app/trading-bot/
 COPY --chown=10001:10001 scripts/deploy/keel-supervise.py \
                          scripts/deploy/keel-healthcheck.py \
+                         scripts/deploy/keel-run-engine.py \
                          scripts/deploy/keel-run-dashboard.py \
+                         scripts/deploy/keel-config-guard.py \
                          /app/bin/
+
+# The build stops here if config.yaml carries a credential.
+#
+# config.yaml ships (it is startup defaults), and telegram_notifier resolves
+# `telegram.bot_token` from it BEFORE the DB — so the field an operator is
+# invited to fill in by the file's own comment is also the one that wins over
+# the dashboard, and filling it in before a build puts a live token in a layer
+# that `docker history` keeps forever. This RUN is what lets
+# docs/DEPLOYMENT-LINUX.md say "nothing in this deployment carries a
+# credential" and mean it. It is invalidated by the COPY above, so it re-runs
+# whenever config.yaml changes. See scripts/deploy/keel-config-guard.py for
+# what it looks for and why it refuses instead of quietly scrubbing.
+RUN python /app/bin/keel-config-guard.py /app/trading-bot
 
 # These are the volume mountpoints. Creating them here, owned by keel, is what
 # makes a FRESH named volume come up keel-owned — Docker seeds an empty named
@@ -103,13 +118,21 @@ USER 10001:10001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD ["python", "/app/bin/keel-healthcheck.py", "--role", "engine"]
 
-# keel-supervise.py is PID 1. It reaps zombies, drains the entry gate on
-# SIGTERM (halt_new_entries via params_store, audited), waits for the quiet part
-# of the engine cycle, and stops the child with SIGINT — the only stop signal
-# this codebase actually handles, since nothing in the tree installs a SIGTERM
-# handler and engine_loop is a daemon thread with no stop event.
+# keel-supervise.py is PID 1. It reaps zombies, closes the entry gate on
+# SIGTERM (halt_new_entries via params_store, audited) BEFORE signalling
+# anything, then stops the child with SIGINT — the only stop signal this
+# codebase handles, since nothing in the tree installs a SIGTERM handler. It
+# also closes the entry gate at START if the previous run died without
+# draining, so a segfault or an OOM kill cannot come back trading unattended.
+#
+# The child is keel-run-engine.py, not `python server.py` directly. server.py
+# starts engine_loop as a daemon thread and never calls engine.stop(), so a
+# bare SIGINT unwinds Flask and destroys the loop thread wherever it happens to
+# be. keel-run-engine.py calls engine.stop() and holds the interpreter open
+# until the loop has returned. That is the deterministic stop the supervisor
+# used to approximate by timing SIGINT against engine_heartbeat_t.
 #
 # STOPSIGNAL stays the default SIGTERM: the supervisor wants it, and overriding
 # it here would hide the translation somewhere an operator would not look.
 ENTRYPOINT ["python", "/app/bin/keel-supervise.py", "--role", "engine", "--"]
-CMD ["python", "server.py"]
+CMD ["python", "/app/bin/keel-run-engine.py"]

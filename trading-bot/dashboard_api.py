@@ -20,6 +20,7 @@ Run:  python3 dashboard_api.py         # http://127.0.0.1:8767
 """
 import os
 import re
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -27,11 +28,13 @@ import yaml
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
+import alerts
 import analysis
 import decisions
 import instruments
 import news_calendar
 import params_store
+import reconcile
 import storage
 from dash_auth import get_token, require_token, _TOKEN_FILE
 
@@ -55,11 +58,147 @@ from contextlib import asynccontextmanager
 async def _lifespan(_app):
     storage.init()
     instruments.seed_defaults()
+    start_watchdog()
     yield
 
 
 app = FastAPI(title="Keel multi-asset dashboard", docs_url=None, redoc_url=None,
               lifespan=_lifespan)
+
+
+# ======================================================================
+# Dead-man, second arm (S3) + standby alert relay
+#
+# server.py watches the engine heartbeat from inside the process that hosts
+# the engine, which catches a dead engine THREAD and cannot catch a dead
+# PROCESS. This process is the other side of that: it is separate, it reads
+# the same two heartbeats out of the shared database, and it can therefore say
+# "server.py is gone" — which is the sentence the in-process watchdog can never
+# produce about itself.
+#
+# It also stands by on the alerts relay. alerts.own_relay() is a lease: while
+# server.py renews it every tick this process delivers nothing, and about two
+# minutes after server.py stops renewing, this process takes over. That matters
+# specifically here, because the alert about server.py dying is otherwise
+# recorded by a process that no longer has anyone to deliver it. Taking the
+# relay means owning a notifier worker — queueing into a process that drains
+# nothing is exactly the live_switch bug, so notifier.start() is called before
+# the first relay attempt, not hoped for.
+#
+# The heartbeat-staleness logic is a deliberate ~15-line duplicate of
+# server.py's. The alternative is importing server.py here, which would drag
+# Flask, the engine and the agent into the control-plane process purely to
+# share a subtraction.
+# ======================================================================
+WATCHDOG_TICK_S = 30
+DEADMAN_STALE_S = 180            # same window analysis.health() calls "alive"
+MONITOR_STALE_S = 120            # server.py's monitor ticks every 15s
+RECON_EXPECTED_EVERY_S = 60      # server.py's reconcile cadence
+
+_watch: Dict[str, Any] = {"started_t": time.time(), "ticks": 0,
+                          "last_tick_t": 0.0, "relay": {}, "started": False}
+
+
+def _stamp(key: str) -> Optional[float]:
+    """A timestamp out of settings, or None when missing/unreadable. Never a
+    numeric default: the absence of a heartbeat is the thing being detected."""
+    try:
+        v = storage.get_setting(key, None)
+    except Exception:
+        return None
+    if v in (None, "", 0):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _age(key: str, now: float) -> Optional[float]:
+    hb = _stamp(key)
+    return None if hb is None else now - hb
+
+
+def deadman_state(now: Optional[float] = None) -> Dict[str, Any]:
+    now = time.time() if now is None else now
+    eng, mon = _age("engine_heartbeat_t", now), _age("safety_monitor_t", now)
+    return {
+        "engine_heartbeat_age_s": None if eng is None else round(eng),
+        "engine_alive": eng is not None and eng <= DEADMAN_STALE_S,
+        "safety_monitor_age_s": None if mon is None else round(mon),
+        "safety_monitor_alive": mon is not None and mon <= MONITOR_STALE_S,
+        "watched_from": "dashboard process (separate from the engine)",
+        "blind_spot": "if this host dies, nothing on it can page — that needs "
+                      "an outbound ping from the engine cycle",
+    }
+
+
+def deadman_tick(now: Optional[float] = None, send=None) -> Dict[str, Any]:
+    """One watchdog pass. Records; delivers only if it holds the relay lease."""
+    now = time.time() if now is None else now
+    grace = now - _watch["started_t"] <= MONITOR_STALE_S
+    out: Dict[str, Any] = {"engine": "ok", "monitor": "ok", "relay": {}}
+
+    eng = _age("engine_heartbeat_t", now)
+    if eng is None and not grace:
+        out["engine"] = "never"
+        alerts.raise_alert(
+            "engine_deadman",
+            "no engine heartbeat has EVER been written, seen from the "
+            "dashboard process — the engine is not running.",
+            severity=alerts.P1, dedupe_key="never")
+    elif eng is not None and eng > DEADMAN_STALE_S:
+        out["engine"] = "stalled"
+        alerts.raise_alert(
+            "engine_deadman",
+            "engine heartbeat is %ds old (limit %ds), seen from the dashboard "
+            "process — engine loop stopped, or server.py is gone."
+            % (int(eng), DEADMAN_STALE_S),
+            severity=alerts.P1, dedupe_key="stalled")
+
+    mon = _age("safety_monitor_t", now)
+    if mon is None and not grace:
+        out["monitor"] = "never"
+        alerts.raise_alert(
+            "safety_monitor_down",
+            "the safety monitor in server.py has never checked in — kill "
+            "switches, reconciliation and the dead-man are unwatched.",
+            severity=alerts.P1, dedupe_key="never")
+    elif mon is not None and mon > MONITOR_STALE_S:
+        out["monitor"] = "stalled"
+        alerts.raise_alert(
+            "safety_monitor_down",
+            "the safety monitor in server.py last checked in %ds ago (limit "
+            "%ds) — nothing is watching the rails." % (int(mon), MONITOR_STALE_S),
+            severity=alerts.P1, dedupe_key="stalled")
+
+    if send is None:
+        import notifier                  # only the relay owner needs it
+        notifier.start()
+    out["relay"] = alerts.relay_once(send=send)
+    _watch["ticks"] += 1
+    _watch["last_tick_t"] = now
+    _watch["relay"] = out["relay"]
+    return out
+
+
+def _watchdog_loop(interval: int = WATCHDOG_TICK_S) -> None:
+    _watch["started_t"] = time.time()
+    while True:
+        try:
+            deadman_tick()
+        except Exception as e:            # a watchdog may never die quietly
+            print("[watchdog] tick error:", e)
+        time.sleep(interval)
+
+
+def start_watchdog(interval: int = WATCHDOG_TICK_S) -> None:
+    if _watch["started"]:
+        return
+    _watch["started"] = True
+    threading.Thread(target=_watchdog_loop, args=(interval,),
+                     daemon=True).start()
 
 
 # ---------------------------------------------------------------- pages
@@ -72,7 +211,12 @@ def index():
 # ---------------------------------------------------------------- read views
 @app.get("/api/health")
 def api_health():
-    return analysis.health()
+    h = analysis.health()
+    # A growing undelivered backlog or an unacknowledged page is health
+    # information: it means the relay owner is gone, or a human has not looked.
+    h["alerts"] = alerts.health()
+    h["deadman"] = deadman_state()
+    return h
 
 
 @app.get("/api/performance")
@@ -168,6 +312,62 @@ def api_analysis_now(minutes: int = 90):
         "FROM decisions WHERE t>=? GROUP BY symbol, trade_mode) x ON d.id=x.mid "
         "ORDER BY d.symbol, d.trade_mode", (since,))
     return {"rows": rows, "window_min": minutes}
+
+
+# ------------------------------------------------------- alerts (S4)
+# Reads are open like every other read view here: an alert row carries a kind,
+# a severity and a sentence about what broke, never a credential. Acknowledging
+# one is a mutation — it is a human saying "I have this" and it silences the
+# unacknowledged-pages count — so it is token-gated like every other control.
+@app.get("/api/alerts")
+def api_alerts(limit: int = Query(100, le=1000),
+               severity: Optional[str] = None, kind: Optional[str] = None,
+               since: Optional[int] = None, undelivered: bool = False):
+    rows = alerts.recent(limit, severity=severity, kind=kind, since=since,
+                         undelivered=undelivered)
+    return {"alerts": rows, "health": alerts.health(),
+            "tiers": {"P1": "page", "P2": "alert", "P3": "digest",
+                      "P4": "log only"}}
+
+
+@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_token)])
+def api_alert_ack(alert_id: int):
+    return {"ok": alerts.acknowledge(alert_id), "id": alert_id}
+
+
+# ------------------------------------------------- reconciliation (S4)
+@app.get("/api/reconcile")
+def api_reconcile():
+    """The last reconciliation report, as produced by the engine process.
+
+    This endpoint deliberately does NOT run a reconciliation. Two reasons, and
+    both matter: this process has no MT5 drop copy, so a report built here
+    would compare the book against a strictly smaller set of sources and could
+    reach a different verdict from the one the engine acts on; and
+    venues.positions_all() is a network call, which has no business on a read
+    view a dashboard polls.
+
+    When there is no report, or the report is old, this says so and reports
+    what reconcile.should_halt_entries would make of what we have — which for
+    "no report" is True, because a verdict we do not have is not a clean one.
+    """
+    rep = storage.get_setting("recon_last_report", None)
+    rep = rep if isinstance(rep, dict) else None
+    now = int(time.time())
+    age = (now - int(rep.get("t") or 0)) if rep else None
+    return {
+        "report": rep,
+        "age_s": age,
+        "state": "never run" if rep is None else (
+            "stale" if age is not None and age > 3 * RECON_EXPECTED_EVERY_S
+            else "current"),
+        # Consumed, not reimplemented: the same function the engine gates on.
+        "halt_if_consumed_now": reconcile.should_halt_entries(rep),
+        "halt_reason": reconcile.halt_reason(rep),
+        "halt_new_entries": bool(storage.get_setting("halt_new_entries", False)),
+        "note": "reports are produced by the engine process; resuming after a "
+                "halt is a human act (/api/resume) — reconciliation never heals",
+    }
 
 
 # Anything whose KEY looks like a credential is masked, wherever it appears in the
