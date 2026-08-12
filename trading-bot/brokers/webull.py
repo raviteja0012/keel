@@ -940,4 +940,36 @@ def new_client_order_id(prefix: str = "slc") -> str:
     return cid
 
 
-register("webull", WebullVenue)
+# ---------------------------------------------------------------------------
+# NOT REGISTERED. Deliberately.
+#
+# An adversarial review re-tested this adapter after its five defects were
+# "fixed" and found two of them still open, plus a new one. Each was reproduced:
+#
+#   W1  place_order is still not idempotent. The fix opened a second, ungated
+#       route into PROBE_ABSENT by stamping any numeric JSON envelope code onto
+#       http_status, so an indeterminate probe can still be read as "no such
+#       order" and submit a duplicate.
+#   W4  cancel() still confirms cancels that did not happen: a truthy
+#       success/ok/cancelled marker short-circuits before the lifecycle-status
+#       block that was added to check exactly that.
+#   NEW reduce_only is accepted, used to WAIVE the "selling equity you do not
+#       hold is a short" refusal, and then silently dropped from the payload —
+#       so the gate is skipped and the protection it stood for never reaches
+#       the venue.
+#
+# Two of those put real orders at risk, and idempotency is the one property
+# brokers/__init__ makes mandatory. An adapter nobody can build is inert; an
+# adapter that can be built and double-fills is not. So the module stays in the
+# tree, its 106 tests keep running, and venues.build() cannot construct it until
+# the three are genuinely closed and re-reviewed.
+#
+# To re-arm: fix the three, have them re-tested by someone who did not write the
+# fix, then restore the register() call below.
+#
+# register("webull", WebullVenue)
+# ---------------------------------------------------------------------------
+WEBULL_DISARMED_REASON = (
+    "Webull is disarmed: place_order is not idempotent (W1), cancel() confirms "
+    "cancels that did not happen (W4), and reduce_only waives a safety gate then "
+    "is dropped on the wire. See the note at the bottom of brokers/webull.py.")

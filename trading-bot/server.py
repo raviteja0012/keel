@@ -12,7 +12,7 @@ import os
 import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from flask import Flask, jsonify, request, send_from_directory
@@ -697,10 +697,29 @@ def _deadman_limit() -> float:
 
 
 def _live_open() -> List[Dict[str, Any]]:
+    """Open live trades, or a RAISE if the book cannot be read.
+
+    This used to swallow any storage failure into `return []`, so "I cannot read
+    the book" became "we hold nothing" — and four callers use that answer to
+    decide how loud to be. Every one of them treats an empty list as the calm
+    case: no live exposure, so a stale feed or a dead engine is not urgent. A
+    database that has just started throwing is exactly when the book is most
+    likely to be non-empty and the alert most likely to matter.
+
+    Callers must now handle the exception and decide, rather than being handed a
+    reassuring lie. `_live_open_or_unknown()` is the helper for the ones whose
+    job is to keep running."""
+    return storage.open_trades("live") or []
+
+
+def _live_open_or_unknown() -> Tuple[List[Dict[str, Any]], bool]:
+    """(trades, unknown). unknown=True means the book could not be read at all,
+    which every caller must treat as "assume we are exposed", never as empty."""
     try:
-        return storage.open_trades("live") or []
-    except Exception:
-        return []
+        return _live_open(), False
+    except Exception as e:
+        print("[safety] cannot read the live book:", e)
+        return [], True
 
 
 def _halt_origin() -> str:
@@ -816,14 +835,21 @@ def check_kill_switches(p: Dict[str, Any],
         # The engine is safe either way (it cannot size a trade off a zero
         # balance), but reporting it as "kill switches clear" is exactly the
         # reassuring default this codebase keeps getting bitten by.
-        open_live = _live_open()
+        open_live, book_unknown = _live_open_or_unknown()
+        # An unreadable book counts as exposure. "I could not check whether we
+        # are holding" must escalate like "we are holding", never like "we are
+        # flat" — a database that has started throwing is exactly when the book
+        # is most likely to be non-empty.
+        exposed = bool(open_live) or book_unknown
+        how_much = (" while %d live position(s) are open" % len(open_live)
+                    if open_live else
+                    " and the live book could not be read at all"
+                    if book_unknown else "")
         alerts.raise_alert(
             "kill_switch_unknown",
             "%s balance reads %.2f — the daily/weekly stops cannot be "
-            "evaluated at all%s" % (mode, balance,
-                                    " while %d live position(s) are open"
-                                    % len(open_live) if open_live else ""),
-            severity=alerts.P1 if (mode == "live" and open_live) else alerts.P2,
+            "evaluated at all%s" % (mode, balance, how_much),
+            severity=alerts.P1 if (mode == "live" and exposed) else alerts.P2,
             dedupe_key=mode)
         return "unknown"
     reason = engine.loss_limits_hit(mode, balance, p)
@@ -888,14 +914,20 @@ def check_mt5_reachable(now: Optional[float] = None) -> str:
         return "ok"
     if st["age"] is None and (now - _safety["started_t"]) <= _deadman_limit():
         return "warming up"          # process just started; the EA pushes ~5s
-    open_live = _live_open()
+    open_live, book_unknown = _live_open_or_unknown()
     why = st["reason"] or "mt5 feed unusable"
-    if open_live:
+    # "I could not read the book" resolves to the LOUD branch. The quiet branch
+    # asserts "no live positions open", which is a claim we are in no position
+    # to make when the read failed.
+    if open_live or book_unknown:
         alerts.raise_alert(
             "feed_loss_live",
-            "MT5 is unreachable (%s) while %d live position(s) are open — the "
-            "venue holding real money is not answering."
-            % (why, len(open_live)),
+            "MT5 is unreachable (%s) %s — the venue holding real money is not "
+            "answering." % (why,
+                            "while %d live position(s) are open" % len(open_live)
+                            if open_live else
+                            "and the live book could not be read, so exposure "
+                            "is unknown"),
             severity=alerts.P1, dedupe_key=engine.MT5_SOURCE)
         return "unreachable_holding_positions"
     alerts.raise_alert("feed_stale", "MT5 unreachable (%s); no live positions "
@@ -973,8 +1005,9 @@ def _mt5_is_a_position_source(p: Dict[str, Any]) -> bool:
     """
     if str(p.get("trading_mode")) == "live":
         return True
-    if _live_open():
-        return True
+    open_live, book_unknown = _live_open_or_unknown()
+    if open_live or book_unknown:
+        return True     # unreadable book counts as possibly-holding, like below
     try:
         return storage.query_one(
             "SELECT id FROM trades WHERE mode='live' LIMIT 1") is not None
@@ -1102,7 +1135,10 @@ def reconcile_tick(now: Optional[float] = None,
     # "venue holding an open position went dark". trades carry no venue column,
     # so WHICH venue holds a given row is not knowable here — with any live
     # position open, every blind source is treated as possibly the one.
-    holding = len(_live_open())
+    _lo, _unknown = _live_open_or_unknown()
+    # An unreadable book is treated as holding: a venue going dark matters most
+    # when we cannot confirm we are flat.
+    holding = len(_lo) or (1 if _unknown else 0)
     for name in safe.get("blind") or []:
         src = next((s for s in safe.get("sources") or []
                     if s.get("venue") == name), {})

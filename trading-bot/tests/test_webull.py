@@ -125,33 +125,57 @@ BALANCE_OK = {"account_currency_assets": [
 
 
 # -------------------------------------------------------------- registration
-def test_adapter_is_registered():
-    assert "webull" in brokers.kinds(), brokers.kinds()
+def test_adapter_is_disarmed_and_cannot_be_built():
+    """Webull is deliberately NOT registered. A re-review found W1 (place_order
+    still not idempotent, through a second ungated route into PROBE_ABSENT) and
+    W4 (cancel still short-circuits before the lifecycle check) both still open,
+    plus a new one: reduce_only waives the short-selling refusal and is then
+    dropped from the payload.
+
+    An adapter nobody can build is inert. An adapter that can be built and
+    double-fills is not. So the module and its 100+ tests stay, and construction
+    is refused until all three are genuinely closed and re-reviewed.
+
+    This assertion flips back when register() is restored. It is the tripwire
+    that stops the adapter being re-armed silently."""
+    assert "webull" not in brokers.kinds(), (
+        "webull is registered again — was it re-reviewed? See the note at the "
+        "bottom of brokers/webull.py. kinds()=%r" % (brokers.kinds(),))
+    assert webull.WEBULL_DISARMED_REASON, "the reason must stay documented"
 
 
-def test_brokers_build_makes_one():
-    a = brokers.build("webull", dict(CREDS))
-    assert isinstance(a, webull.WebullVenue)
+def test_brokers_build_refuses_the_disarmed_kind():
+    """The registry is the production door and it is shut. Direct construction
+    still works, which is what keeps the hundred behaviour tests below alive
+    while the adapter is out of service."""
+    try:
+        brokers.build("webull", dict(CREDS))
+        assert False, "the registry built a disarmed adapter"
+    except brokers.VenueError as e:
+        assert "unknown venue kind" in str(e), str(e)
+    a = webull.WebullVenue(dict(CREDS))
     assert a.name == "wb"
 
 
 def test_satisfies_the_broker_adapter_contract():
-    a = brokers.build("webull", dict(CREDS))
+    """Constructed directly, because the registry is shut. The contract still
+    has to hold: when the three defects are closed and register() comes back,
+    it must slot in without reshaping anything around it."""
+    a = webull.WebullVenue(dict(CREDS))
     assert isinstance(a, brokers.BrokerAdapter)
     for m in ("health", "symbol_meta", "balances", "positions", "place_order",
               "cancel", "stream_prices"):
         assert callable(getattr(a, m)), m
 
 
-def test_venues_can_build_and_health_it():
-    import venues
-    venues.upsert({"name": "wb-test", "kind": "webull"})
-    a = venues.adapter("wb-test")
-    assert isinstance(a, webull.WebullVenue)
-    h = venues.health("wb-test")          # must not raise, must not look healthy
-    assert h["reachable"] is False and h["authenticated"] is False
-    assert h["read_only"] is True, "a new venue must arrive disarmed"
-    venues.remove("wb-test")
+def test_health_of_a_directly_built_adapter_is_a_result_not_a_lie():
+    """venues.health() cannot be exercised while the kind is unregistered, so
+    the same property is asserted on the adapter itself: an unconfigured venue
+    reports unhealthy rather than raising, and arrives disarmed."""
+    a = webull.WebullVenue({"name": "wb-direct"})
+    h = a.health()
+    assert h.reachable is False and h.authenticated is False
+    assert h.read_only is True, "a new venue must arrive disarmed"
 
 
 def test_read_only_is_the_default():
@@ -169,40 +193,41 @@ def _subprocess(code, what):
     return p.stdout
 
 
-def test_w3_a_plain_import_of_brokers_registers_webull():
-    """The old suite imported brokers.webull at module top, so `kinds()`
-    contained webull because the TEST had imported it. In production nothing
-    did, and venues.upsert(kind="webull") raised 'unknown kind'."""
+def test_w3_a_plain_import_of_brokers_does_not_offer_webull():
+    """W3 was that the adapter LOOKED registered only because the test module
+    had imported it, so production raised 'unknown kind'. The check still
+    matters — it just runs the other way now, because the adapter is disarmed.
+    Either way the property is the same: what a clean process can build must be
+    the truth, not an artefact of what the tests happened to import."""
     out = _subprocess(
-        "import sys\n"
         "import brokers\n"
-        "assert 'brokers.webull' not in sys.modules or True\n"
         "ks = brokers.kinds()\n"
-        "assert 'webull' in ks, 'kinds() = %r' % (ks,)\n"
-        "assert 'brokers.webull' in sys.modules, 'registered without importing?'\n"
+        "assert 'webull' not in ks, 'disarmed adapter is buildable: %r' % (ks,)\n"
         "print('KINDS ' + ','.join(ks))\n",
         "plain `import brokers`")
-    assert "webull" in out, out
     assert "KINDS" in out, out
+    assert "webull" not in out.split("KINDS")[-1], out
 
 
-def test_w3_venues_builds_a_webull_adapter_in_a_clean_process():
-    """The production path end to end: DB-backed venue registry, no test-side
-    import of the adapter module anywhere."""
+def test_w3_venues_refuses_to_build_a_disarmed_adapter():
+    """The production path end to end, in a clean process with no test-side
+    import: venues.upsert must REFUSE the kind while it is disarmed. An
+    operator must not be able to add a Webull venue through the dashboard and
+    end up with an adapter that can double-fill."""
     out = _subprocess(
         "import os, tempfile\n"
         "import storage\n"
         "storage._DB_PATH = os.path.join(tempfile.mkdtemp(), 'sub.db')\n"
         "storage.init()\n"
         "import venues\n"
-        "venues.upsert({'name': 'wb-sub', 'kind': 'webull'})\n"
-        "a = venues.adapter('wb-sub')\n"
-        "assert a.read_only is True, 'a new venue must arrive disarmed'\n"
-        "h = venues.health('wb-sub')\n"
-        "assert h['authenticated'] is False\n"
-        "print('BUILT ' + type(a).__name__)\n",
+        "try:\n"
+        "    venues.upsert({'name': 'wb-sub', 'kind': 'webull'})\n"
+        "    print('BUILT anyway — the disarm did not hold')\n"
+        "except ValueError as e:\n"
+        "    assert 'unknown kind' in str(e), str(e)\n"
+        "    print('REFUSED ' + str(e)[:60])\n",
         "venues.upsert(kind='webull')")
-    assert "BUILT WebullVenue" in out, out
+    assert "REFUSED" in out, out
 
 
 def test_w3_unknown_kinds_still_refuse():

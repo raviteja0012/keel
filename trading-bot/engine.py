@@ -919,7 +919,21 @@ def trade_upnl(tr: Dict) -> Optional[float]:
                     or "SLC#%d" % tr["id"] in (x.get("comment") or "")), None)
         if pos is not None:
             return round((pos.get("unrealized_pnl") or 0) + (pos.get("swap") or 0), 2)
-    p = feed_state["prices"].get(tr["symbol"])
+    # Recency is REQUIRED here, and it was not checked. This function read the
+    # book raw, so a print frozen an hour ago valued the position, and that value
+    # flows into _open_pnl -> loss_limits_hit. The daily and weekly kill switches
+    # were therefore marking the book against a dead quote: a position that had
+    # since moved hard against us still looked exactly as it did when the feed
+    # died, and the stop that should have fired did not.
+    #
+    # Management deliberately still acts on a stale print, because a stop
+    # breached at the last real price WAS breached - that is price_if_fresh's
+    # job, and de-risk-only is enforced there. But VALUING the book is a
+    # different question, and the honest answer on a dead feed is "I cannot".
+    st = price_state(tr["symbol"])
+    if not st["fresh"]:
+        return None
+    p = st["price"]
     if not p:
         return None
     tick_value = p.get("tick_value") or 0
@@ -937,8 +951,21 @@ def trade_upnl(tr: Dict) -> Optional[float]:
     return round(pnl, 2)
 
 
-def open_pnl_total() -> float:
-    return round(sum(trade_upnl(t) or 0 for t in storage.open_trades()), 2)
+def open_pnl_total() -> Tuple[float, int]:
+    """Marked value of the whole open book, and how much of it could not be
+    valued. The SECOND instance of the `or 0` defect, found by grepping for the
+    first: this fed the equity sample, so an unvaluable position quietly made
+    equity look better than it was, and that equity is what the drawdown
+    forensics and the equity curve are computed from. A wrong sample there is
+    worse than a missing one, because it is indistinguishable from a real one."""
+    total, unvalued = 0.0, 0
+    for t in storage.open_trades():
+        v = trade_upnl(t)
+        if v is None:
+            unvalued += 1
+        else:
+            total += v
+    return round(total, 2), unvalued
 
 
 # ----------------------------------------------------- loss limits
@@ -1837,9 +1864,24 @@ def engine_loop(poll_seconds: int = 20) -> None:
             if balance > 0:
                 if mode == "live":
                     eq = float(feed_state["account"].get("equity", balance) or balance)
+                    storage.record_equity("live", balance, eq)
                 else:
-                    eq = balance + open_pnl_total()   # mark open paper trades
-                storage.record_equity(mode if mode != "off" else "paper", balance, eq)
+                    marked, unvalued = open_pnl_total()
+                    if unvalued:
+                        # Record NOTHING rather than a number that is wrong by an
+                        # unknown amount. This series is the equity curve, and the
+                        # drawdown forensics and the promotion gate read it; a
+                        # sample that silently omits an underwater position is
+                        # indistinguishable from a real one and cannot be
+                        # corrected later. A gap in the curve is visible.
+                        _last_info["equity"] = {
+                            "symbol": "—", "trade_mode": "—",
+                            "note": "equity sample skipped: %d open position%s "
+                                    "cannot be valued (no fresh quote)"
+                                    % (unvalued, "" if unvalued == 1 else "s")}
+                    else:
+                        storage.record_equity(mode if mode != "off" else "paper",
+                                              balance, balance + marked)
 
             # broker clock offset (bar timestamps are broker time, not UTC)
             term = feed_state.get("terminal", {})
