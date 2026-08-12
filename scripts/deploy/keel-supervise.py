@@ -80,6 +80,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Optional
 
 # The app is importable only from the trading-bot directory; the DB path is
 # derived from storage.py's own location, so cwd matters for state/ but not
@@ -295,6 +296,65 @@ def _await_child(grace: int) -> None:
         log("child survived SIGKILL; leaving it to the kernel")
 
 
+def _await_halt_ack(timeout_s: Optional[float] = None) -> bool:
+    """Wait for the engine to acknowledge the closed entry gate.
+
+    engine_loop writes `halt_ack_t` at the top of any cycle that observes
+    halt_new_entries=True, AFTER its params() read. An ack newer than our write
+    is therefore proof that a cycle has actually seen the gate — which is the
+    thing the drain needs and the gate write alone does not give.
+
+    Returns True if acknowledged, False on timeout. False means the stop is
+    NOT drained: it is reported that way and the run state is left undrained, so
+    the next start closes the gate itself rather than resuming into the unknown.
+    A drain that cannot be confirmed is not a drain.
+    """
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("KEEL_HALT_ACK_S")
+                          or max(10, _poll_seconds() * 2 + 5))
+    try:
+        _params_store, storage = _app_modules()
+    except Exception as exc:                        # noqa: BLE001
+        log("cannot confirm the drain (%r) — treating the stop as undrained" % exc)
+        return False
+
+    t0 = time.time()
+
+    # An engine that is not cycling cannot open a position, so there is nothing
+    # to wait for and no ack will ever come. Waiting anyway would burn the whole
+    # timeout on every stop of an already-dead or never-started engine, which is
+    # the common case for a container that failed at boot. Heartbeat older than
+    # a couple of poll intervals, or absent entirely, means not running.
+    stale_after = max(10.0, _poll_seconds() * 3.0)
+    try:
+        hb = float(storage.get_setting("engine_heartbeat_t", 0) or 0)
+    except Exception:
+        hb = 0.0
+    if hb <= 0 or (t0 - hb) > stale_after:
+        log("engine is not cycling (heartbeat %s) — nothing can open a position, "
+            "so no ack is needed"
+            % ("never written" if hb <= 0 else "%.0fs old" % (t0 - hb)))
+        return True
+
+    deadline = t0 + timeout_s
+    while time.time() < deadline:
+        if _child.poll() is not None:
+            log("child exited while waiting for the halt ack")
+            return True                 # nothing left that could open a position
+        try:
+            ack = float(storage.get_setting("halt_ack_t", 0) or 0)
+        except Exception:
+            ack = 0.0
+        if ack >= t0:
+            log("engine acknowledged the entry gate after %.1fs" % (time.time() - t0))
+            return True
+        time.sleep(0.25)
+
+    log("engine did NOT acknowledge the entry gate within %.0fs — a cycle may "
+        "still have been mid-flight, so this stop is NOT drained" % timeout_s)
+    return False
+
+
 def stop_child(signum: int, gate_armed: bool) -> int:
     """The stop sequence. Runs on the main loop, holding nothing."""
     log("received %s" % signal.Signals(signum).name)
@@ -304,6 +364,13 @@ def stop_child(signum: int, gate_armed: bool) -> int:
 
     if os.environ.get("KEEL_DRAIN_ON_STOP", "1") == "1":
         drained = _halt_new_entries()
+        # Writing the gate is not the same as the engine having SEEN it. A cycle
+        # already past its params() read does not observe the halt, so signalling
+        # straight after the write leaves a window where a position can still be
+        # opened AFTER the drain was written and audited — the stop then files as
+        # clean when it was not. Wait, bounded, for the engine to acknowledge.
+        if drained and not already_gone:
+            drained = _await_halt_ack()
 
     if already_gone:
         log("child had already exited (status %s)" % _child.returncode)

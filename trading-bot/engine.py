@@ -1886,6 +1886,21 @@ def engine_loop(poll_seconds: int = 20) -> None:
             except Exception:
                 pass
 
+            # Acknowledge the entry gate, so a shutdown can WAIT for it.
+            #
+            # A container stop writes halt_new_entries=True and then signals the
+            # process immediately. A cycle already past its params() read has not
+            # seen the gate and can still open a position after the halt was
+            # written and audited — the drain looked clean and was not. Writing
+            # the ack here, after the read below, is the only honest evidence
+            # that some cycle actually observed the closed gate. The supervisor
+            # waits for an ack newer than its write before signalling.
+            try:
+                if storage.get_setting("halt_new_entries", False):
+                    storage.set_setting("halt_ack_t", time.time())
+            except Exception:
+                pass
+
             p = params()
 
             tradable = [s for s in p["enabled_pairs"] if s not in p["agent_disabled_pairs"]]

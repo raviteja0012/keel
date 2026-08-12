@@ -825,6 +825,72 @@ def test_stop_sequence_drains_before_it_signals():
     assert "SIGKILL" not in events, "escalated to SIGKILL on a child that exited"
 
 
+def test_the_drain_waits_for_the_engine_to_acknowledge_the_gate():
+    """Writing the gate is not the same as the engine having SEEN it.
+
+    A cycle already past its params() read does not observe halt_new_entries, so
+    signalling straight after the write leaves a window in which a position can
+    still be opened AFTER the drain was written and audited - and the stop then
+    files as a clean, explained one.
+
+    engine_loop writes halt_ack_t at the top of any cycle that observes the
+    closed gate. The supervisor waits for an ack newer than its own write, and a
+    stop it cannot confirm is reported as NOT drained, so the next start closes
+    the gate itself rather than resuming into the unknown.
+    """
+    storage, app = _fresh_app_db()
+    os.environ["KEEL_APP_DIR"] = app
+    os.environ["KEEL_HALT_ACK_S"] = "2"
+    sup = _load_module("keel-supervise.py", "keel_supervise_ack")
+    sup.APP_DIR = app
+
+    class _Running:
+        pid = 4243
+        returncode = None
+
+        def poll(self):
+            return None
+
+    sup._child = _Running()
+
+    # A cycling engine, or the "not running, nothing to wait for" short-circuit
+    # fires and there is no waiting to test.
+    storage.set_setting("engine_heartbeat_t", time.time())
+
+    # no ack ever arrives -> the drain is NOT confirmed
+    storage.set_setting("halt_ack_t", 0)
+    t0 = time.time()
+    assert sup._await_halt_ack() is False, \
+        "an unacknowledged drain was reported as drained"
+    assert time.time() - t0 >= 1.5, "it returned without actually waiting"
+
+    # an ack from BEFORE our write proves nothing about the gate just closed
+    storage.set_setting("halt_ack_t", time.time() - 300)
+    assert sup._await_halt_ack() is False, "a stale ack was accepted"
+
+    # an ack landing during the wait is accepted
+    storage.set_setting("halt_ack_t", 0)
+
+    def _ack_soon():
+        time.sleep(0.4)
+        storage.set_setting("halt_ack_t", time.time())
+
+    threading.Thread(target=_ack_soon, daemon=True).start()
+    assert sup._await_halt_ack() is True, "a real ack was not seen"
+
+    # a child that exits while we wait needs no ack: nothing can open a position
+    class _Gone(_Running):
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    sup._child = _Gone()
+    storage.set_setting("halt_ack_t", 0)
+    assert sup._await_halt_ack() is True, \
+        "waited for an ack from a process that had already exited"
+
+
 # ------------------------------------------------- the stop must not deadlock
 class _CPythonPopenModel:
     """A Popen stand-in that reproduces CPython's POSIX waitpid locking.
