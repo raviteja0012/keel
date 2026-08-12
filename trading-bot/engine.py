@@ -64,6 +64,10 @@ TF_SECONDS = {"15m": 900, "30m": 1800, "1h": 3600,
 # spend its life waiting for a feed that is never coming.
 MT5_SOURCE = "mt5"
 MT5_PRICE_MAX_AGE_S = 60        # the EA pushes every 5s; 12 missed pushes is dead
+# How far in the FUTURE a quote's stamp may sit and still be believed. Beyond
+# this it is a clock problem, not a fresh price, and a clock problem must not
+# read as permanently fresh.
+MAX_CLOCK_SKEW_S = 1.0
 VENUE_PRICE_MAX_AGE_S = 90      # venues are polled at the engine's own cadence
 
 # Venues are polled on their OWN thread at this cadence, never inside the
@@ -105,24 +109,48 @@ class _PriceBook(dict):
         except (TypeError, ValueError):
             src_t = 0.0
         src = rec.get("src")
-        if src and src_t > 0:                       # already stamped: pass through
+        if src and src_t > 0:
+            # Fully attributed: the writer named a source and dated the quote.
+            # That is a CLAIM, not an inference, and a claim is evidence that the
+            # named source produced a print — so register it if we have never
+            # heard of it. Never touch an EXISTING row: a direct write must not
+            # resurrect a source a failed poll already marked unreachable.
+            #
+            # The distinction from the unattributed branch below is the whole
+            # point. Believing a writer who says where a quote came from is
+            # reasonable. Guessing on their behalf, and then declaring the guess
+            # healthy, is what manufactured a feed out of nothing.
+            if src not in (feed_state.get("sources") or {}):
+                _source_rec_locked(src, rec.get("src_kind")
+                                   or ("mt5" if src == MT5_SOURCE else "venue")
+                                   ).update({"last_t": src_t, "reachable": True,
+                                             "detail": ""})
             dict.__setitem__(self, symbol, rec)
             return
         now = time.time()
         rec = dict(rec)
         rec.setdefault("symbol", symbol)
         if not src:
-            src = _declared_source(symbol)
-            rec["src"] = src
-            rec["src_kind"] = "mt5" if src == MT5_SOURCE else "venue"
-            # A source nobody has heard from is unknown, and unknown fails
-            # closed in price_state. A write is evidence that source produced a
-            # quote, so create its health row — but never touch an EXISTING
-            # one: a direct write must not resurrect a source a failed poll
-            # already marked unreachable.
-            if src not in (feed_state.get("sources") or {}):
-                _source_rec_locked(src, rec["src_kind"]).update(
-                    {"last_t": now, "reachable": True, "detail": ""})
+            # Two claims were being made here and only one of them was true.
+            #
+            # Stamping the TIME is honest: we know when this record arrived,
+            # whoever wrote it, so it ages on the same clock as everything else.
+            #
+            # Naming the SOURCE is not. Nobody said where this quote came from.
+            # Inferring it from what instruments happens to declare is a guess,
+            # and the previous version then wrote a health row for that guessed
+            # source with reachable=True — so an unattributed write MANUFACTURED
+            # a healthy feed. Verified directly: a bare price produced
+            # source=mt5, fresh=True, reachable=True out of nothing, inside the
+            # very rail added to stop quotes being trusted blindly.
+            #
+            # An unattributed quote is now recorded and kept, because it is
+            # still worth showing an operator, but attributed to nobody.
+            # price_state resolves that as unreachable and refuses entries. The
+            # cost of being wrong this way is a missed trade; the cost of the
+            # guess was trading against a feed that did not exist.
+            rec["src"] = None
+            rec["src_kind"] = "unattributed"
         if src_t <= 0:
             rec["src_t"] = now
         dict.__setitem__(self, symbol, rec)
@@ -428,13 +456,22 @@ def price_state(symbol: str, now: Optional[float] = None) -> Dict[str, Any]:
                           % (src or symbol)}
     age = now - src_t
     max_age = float((rec or {}).get("max_age_s") or MT5_PRICE_MAX_AGE_S)
-    fresh = age <= max_age
+    # Bounded at BOTH ends. "age <= max_age" alone reads a NEGATIVE age as fresh,
+    # so a quote stamped in the future is fresh forever and never ages out - the
+    # same permanently-tradable state this function was rewritten to remove,
+    # reached from the other direction. A future stamp is not a fresh quote, it
+    # is a clock problem: a venue with a fast clock, an NTP step, a VM resume.
+    # Tolerate a second of skew, then stand aside and say why.
+    fresh = -MAX_CLOCK_SKEW_S <= age <= max_age
     # A source with no health row is a source nobody has ever heard from. That
     # is unknown, not reachable — it used to read `True if rec is None`, so an
     # unregistered source was assumed to be answering.
     reachable = bool(rec) and bool(rec.get("reachable"))
     reason = ""
-    if not fresh:
+    if age < -MAX_CLOCK_SKEW_S:
+        reason = ("%s quote is stamped %.0fs in the FUTURE — clock skew, not a "
+                  "fresh price" % (src or "feed", -age))
+    elif not fresh:
         reason = "%s price stale (%.0fs old, limit %.0fs)" % (
             src or "feed", age, max_age)
     elif not reachable:

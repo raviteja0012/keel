@@ -44,7 +44,8 @@ client = TestClient(dashboard_api.app)
 def _price(symbol, bid, ask, tick=0.0001, tick_value=1.0):
     engine.feed_state["prices"][symbol] = {
         "symbol": symbol, "bid": bid, "ask": ask,
-        "tick_value": tick_value, "tick_size": tick, "spread": 1, "point": tick}
+        "tick_value": tick_value, "tick_size": tick, "spread": 1, "point": tick,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
 
 
 def _open_paper(symbol, side, entry, sl, key):

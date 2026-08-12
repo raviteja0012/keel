@@ -177,7 +177,8 @@ def test_daily_stop_counts_open_drawdown():
                               pnl=-150.0, exit_time=int(time.time())))
     engine.feed_state["prices"]["GBPUSD"] = {
         "symbol": "GBPUSD", "bid": 0.994, "ask": 0.9941,
-        "tick_value": 1.0, "tick_size": 0.0001}
+        "tick_value": 1.0, "tick_size": 0.0001,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
     tid = storage.insert_trade(_mk_trade("GBPUSD", "buy", entry=1.0, lots=1.0))
     try:
         assert engine.loss_limits_hit("paper", 10000.0, p) is not None, \

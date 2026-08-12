@@ -646,24 +646,79 @@ def test_slow_venue_poll_does_not_delay_stop_management():
 
 
 # -------------------------- 7. a quote with no clock fails CLOSED
-def test_unstamped_write_is_stamped_and_ages_out():
-    """An unstamped record used to read age=None / fresh=True forever. The book
-    stamps it on the way in, so it has a real clock and expires like any other
-    quote — that is the property, not "it happens to work today"."""
+def test_unattributed_write_is_dated_but_never_attributed():
+    """This used to assert that the book INFERRED a source for a write that did
+    not name one, and that the inferred quote was tradable. That was the defect,
+    not the specification: resolving a source from whatever instruments happen to
+    declare, then writing a health row for the guess with reachable=True,
+    manufactured a healthy feed out of nothing. Verified against the old code -
+    a bare price produced source=mt5, fresh=True, reachable=True.
+
+    The two halves are separated now. Dating the record is honest, because we do
+    know when it arrived, so it ages like anything else. Naming its source is
+    not, so it belongs to nobody and cannot be opened on."""
     _reset_feed()
     _no_venues()
     engine.feed_state["prices"][FX] = {
         "symbol": FX, "bid": 1.1000, "ask": 1.10008,
         "tick_value": 1.0, "tick_size": 0.0001}
     p = engine.feed_state["prices"][FX]
-    assert p["src"] == engine.MT5_SOURCE and p["src_t"] > 0, p
+    assert p["src"] is None and p["src_kind"] == "unattributed", p
+    assert p["src_t"] > 0, "arrival time is knowable and must be recorded"
+    assert engine.MT5_SOURCE not in (engine.feed_state.get("sources") or {}), \
+        "an unattributed write must not invent a source, let alone a healthy one"
+
     st = engine.price_state(FX)
-    assert st["fresh"] and st["age"] is not None and st["age"] < 5, st
-    # rewind past the source limit: it must stop being tradable
+    assert st["source"] is None and st["reachable"] is False, st
+    assert engine.price_for_entry(FX)[0] is None, \
+        "a quote from nobody is not a quote you may open on"
+
     engine.feed_state["prices"][FX]["src_t"] = \
         time.time() - engine.MT5_PRICE_MAX_AGE_S - 30
-    assert engine.price_for_entry(FX)[0] is None, \
-        "a stamped quote must age out; nothing may be permanently tradable"
+    assert engine.price_state(FX)["fresh"] is False, "it must still age out"
+
+
+def test_a_declared_source_is_believed_but_never_resurrected():
+    """The other side of that line. A writer that NAMES its source is making a
+    claim, and a claim is evidence the source produced a print, so an unknown
+    source becomes known. But a direct write must never revive a source a failed
+    poll already marked down, or one quote undoes an outage."""
+    _reset_feed()
+    _no_venues()
+    engine.feed_state["prices"][FX] = {
+        "symbol": FX, "bid": 1.1000, "ask": 1.10008,
+        "tick_value": 1.0, "tick_size": 0.0001,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
+    assert engine.price_state(FX)["reachable"] is True
+    assert engine.price_for_entry(FX)[0] is not None
+
+    engine.feed_state["sources"][engine.MT5_SOURCE]["reachable"] = False
+    engine.feed_state["prices"][FX] = {
+        "symbol": FX, "bid": 1.1001, "ask": 1.10018,
+        "tick_value": 1.0, "tick_size": 0.0001,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
+    assert engine.price_state(FX)["reachable"] is False, \
+        "a direct write resurrected a source a failed poll had marked down"
+
+
+def test_a_future_stamp_is_clock_skew_not_a_fresh_price():
+    """fresh = age <= max_age had no LOWER bound, so a quote stamped in the
+    future was fresh forever - the same permanently-tradable state this rail
+    exists to prevent, reached from the other direction."""
+    _reset_feed()
+    _no_venues()
+    engine.feed_state["prices"][FX] = {
+        "symbol": FX, "bid": 1.1000, "ask": 1.10008,
+        "tick_value": 1.0, "tick_size": 0.0001,
+        "src": engine.MT5_SOURCE, "src_t": time.time() + 3600}
+    st = engine.price_state(FX)
+    assert st["fresh"] is False, st
+    assert "FUTURE" in st["reason"], st["reason"]
+    assert engine.price_for_entry(FX)[0] is None
+
+    # a fraction of a second is tolerated: clocks are never exactly equal
+    engine.feed_state["prices"][FX]["src_t"] = time.time() + 0.2
+    assert engine.price_state(FX)["fresh"] is True
 
 
 def test_a_quote_with_no_clock_fails_closed():

@@ -103,7 +103,8 @@ def test_engine_blocks_and_audits_blackout():
     news_calendar.add_manual(NOW + 300, "Nonfarm Payrolls", ["USD"], "high")
     engine.feed_state["prices"]["EURUSD"] = {
         "symbol": "EURUSD", "bid": 1.1000, "ask": 1.10008,
-        "tick_value": 1.0, "tick_size": 0.0001, "spread": 1, "point": 0.0001}
+        "tick_value": 1.0, "tick_size": 0.0001, "spread": 1, "point": 0.0001,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
     sig = {"symbol": "EURUSD", "trade_mode": "swing", "side": "buy",
            "grade": "A", "entry": 1.10008, "sl": 1.0950, "tp1": 1.105,
            "tp": 1.1125, "rr": 2.5, "regime": 1.0, "setup": {},

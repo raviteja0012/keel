@@ -31,7 +31,8 @@ storage.set_setting("news_calendar_last_ok", int(time.time()))
 def _price(symbol, bid, ask, tick=0.0001):
     engine.feed_state["prices"][symbol] = {
         "symbol": symbol, "bid": bid, "ask": ask,
-        "tick_value": 1.0, "tick_size": tick, "spread": 1, "point": tick}
+        "tick_value": 1.0, "tick_size": tick, "spread": 1, "point": tick,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}
 
 
 def _sig(symbol, side="buy", entry=1.1000, sl=1.0950, key=None):
