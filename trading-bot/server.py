@@ -644,6 +644,23 @@ load(); setInterval(load,5000);
 MT5_MAGIC = 770001              # the magic engine.py stamps on its own orders
 SAFETY_TICK_S = 15              # cadence of the cheap, in-memory checks
 RECONCILE_EVERY_S = 60          # S2 cadence — venue reads are network-bound
+# Consecutive passes the SAME discrepancy must survive before it halts entries.
+RECON_CONFIRMATIONS = 2
+
+# ...and this is the ONLY thing that gets debounced. The distinction matters more
+# than the count.
+#
+# A mismatch can be a race with ourselves: the engine writes tp1_done and the new
+# stop to the trades row and only THEN enqueues the command, so for one pass the
+# local book and the venue legitimately disagree. Halting on that means the
+# system stops itself for doing its job, which teaches an operator to resume
+# without reading — worse than not halting at all.
+#
+# Blindness is not a race. A venue that cannot be reached, or an orphan position
+# nobody opened, does not resolve itself on the next pass, and waiting another
+# minute to halt buys nothing while we cannot see what we hold. Those still halt
+# on the first pass.
+RECON_DEBOUNCED_KINDS = frozenset({"STOP_MISMATCH", "QTY_MISMATCH"})
 DEADMAN_MIN_STALE_S = 180       # same window analysis.health() calls "alive"
 DEADMAN_POLL_MULT = 3           # ...or three engine cycles, whichever is longer
 
@@ -666,6 +683,8 @@ RECON_REPORT_KEY = "recon_last_report"       # what /api/reconcile renders
 _safety: Dict[str, Any] = {
     "started_t": time.time(), "last_tick_t": 0.0, "last_reconcile_t": 0.0,
     "ticks": 0, "errors": 0, "last_error": "",
+    # (signature, consecutive_count) for the reconciliation debounce
+    "recon_pending": ("", 0),
 }
 
 
@@ -1154,11 +1173,56 @@ def reconcile_tick(now: Optional[float] = None,
            "counts": report.get("counts", {}), "blind": report.get("blind", []),
            "halted_origin": ""}
     if not halt:
+        # The drift cleared. Forget the pending signature so an unrelated one
+        # later has to earn its own confirmations rather than inheriting a count.
+        _safety["recon_pending"] = ("", 0)
         return out
+
+    # DEBOUNCE. The engine writes tp1_done and the new stop to the trades row and
+    # only THEN enqueues the command for the venue, so between those two moments
+    # the local book and the venue legitimately disagree. Halting on a single
+    # pass means the engine's own trade management trips the halt — the system
+    # stopping itself for doing exactly what it is supposed to do, which trains
+    # an operator to resume without reading, which is worse than not halting.
+    #
+    # A real drift persists; an in-flight write resolves within a cycle. So the
+    # SAME discrepancy must be seen on consecutive passes before it halts. The
+    # signature is the reason text, so a different discrepancy starts its own
+    # count rather than borrowing this one's.
+    # Only a drift made ENTIRELY of race-capable mismatches waits. One orphan or
+    # one blind venue in the set and it halts now: those are not races, and the
+    # honest response to "I cannot see what I hold" is to stop opening more.
+    kinds = {str(d.get("kind") or "").upper()
+             for d in (report.get("discrepancies") or [])
+             if d.get("material")}
+    if report.get("blind"):
+        kinds.add("BLIND")
+    debounceable = bool(kinds) and kinds.issubset(RECON_DEBOUNCED_KINDS)
+
+    sig = reason[:200]
+    prev_sig, seen = _safety.get("recon_pending") or ("", 0)
+    seen = seen + 1 if sig == prev_sig else 1
+    _safety["recon_pending"] = (sig, seen)
+    out["confirmations"] = seen
+    out["debounced"] = debounceable
+
+    if debounceable and seen < RECON_CONFIRMATIONS:
+        out["halt"] = False
+        out["reason"] = ("%s — seen %d/%d times, not halting yet (an in-flight "
+                         "stop write looks like this for one pass)"
+                         % (reason, seen, RECON_CONFIRMATIONS))
+        alerts.raise_alert(
+            "recon_drift_unconfirmed",
+            "possible reconciliation drift (%d/%d): %s"
+            % (seen, RECON_CONFIRMATIONS, reason),
+            severity=alerts.P2, dedupe_key=sig[:60] or "drift")
+        return out
+
     alerts.raise_alert(
         "recon_drift",
-        "reconciliation found %d material discrepancy(ies): %s — new entries "
-        "halted, nothing was healed." % (report.get("material", 0), reason),
+        "reconciliation found %d material discrepancy(ies) on %d consecutive "
+        "passes: %s — new entries halted, nothing was healed."
+        % (report.get("material", 0), seen, reason),
         severity=alerts.P1, dedupe_key=reason[:60] or "drift",
         detail={"counts": report.get("counts"), "blind": report.get("blind")})
     out["halted_origin"] = apply_safety_halt("reconciliation: %s" % reason)
