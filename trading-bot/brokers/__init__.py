@@ -235,6 +235,10 @@ try:
 except ImportError:                   # pragma: no cover - optional dependency
     pass
 try:
+    from . import robinhood           # noqa: F401
+except ImportError:                   # pragma: no cover - optional dependency
+    pass
+try:
     from . import webull              # noqa: F401
 except ImportError:                   # pragma: no cover - optional dependency
     pass
