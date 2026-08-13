@@ -1,0 +1,202 @@
+# Keel — one Linux host, three processes, one SQLite database.
+#
+#   docker compose build
+#   docker compose up -d
+#   docker compose ps
+#
+# Runbook: docs/DEPLOYMENT-LINUX.md
+#
+# ---------------------------------------------------------------------------
+# THE ONE RULE IN THIS FILE
+# ---------------------------------------------------------------------------
+# Every published port is bound to 127.0.0.1 on the host. Not one is on
+# 0.0.0.0. Two of these ports place trades:
+#
+#   8767  the control plane. live_switch mounts here. A stranger who reaches it
+#         can halt your trading, or arm it.
+#   8766  server.py. `POST /api/commands` currently authenticates NOTHING — it
+#         checks only that the type is one of trail_sl / move_sl_be /
+#         close_trade and that a ticket is present. On a public interface that
+#         is a remote-close primitive for the whole internet.
+#
+# `ports: - "8767:8767"` publishes on 0.0.0.0 and would undo this silently.
+# Reach these over an SSH tunnel or a tailnet instead — docs §6. The default
+# posture is: nothing on this box answers a stranger.
+# ---------------------------------------------------------------------------
+
+name: keel
+
+# --------------------------------------------------------------- shared bits
+x-keel-base: &keel-base
+  image: keel:${KEEL_VERSION:-local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  # unless-stopped, and the engine is allowed to come back, because coming back
+  # is how open positions keep being managed. What it must NOT do is come back
+  # TRADING after a stop nobody can explain. A segfault, an OOM kill or a
+  # `docker kill` never reaches the SIGTERM handler, so no drain happens and
+  # halt_new_entries is left exactly as open as the crash found it. That is
+  # closed on the way IN instead: keel-supervise.py writes a run-state marker
+  # before it launches the engine and only clears it on a drained stop, so a
+  # start that finds the marker still set halts entries before the engine
+  # exists. Manage, do not resume — keel-resume.sh is the way back.
+  restart: unless-stopped
+  stop_signal: SIGTERM          # keel-supervise.py handles it; see Dockerfile
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  # A full disk is a SQLite corruption mechanism, and these three processes are
+  # chatty. Cap the logs before the kernel caps the database.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-keel-env: &keel-env
+  TZ: ${KEEL_TZ:-UTC}
+  PYTHONUNBUFFERED: "1"
+
+services:
+  # ------------------------------------------------------------------ engine
+  # server.py: Flask + the EA/webhook routes, with engine_loop and agent_loop
+  # as daemon threads inside the same process. They cannot be split — feed_state
+  # is written by the Flask handlers and read by the loop.
+  engine:
+    <<: *keel-base
+    container_name: keel-engine
+    environment:
+      <<: *keel-env
+      # config.yaml still says 0.0.0.0 (it was written for an EA on another
+      # machine). Inside a container namespace that is correct and necessary:
+      # the published mapping below is what keeps it on host loopback.
+      SLC_HOST: "0.0.0.0"
+      SLC_PORT: "8766"
+      KEEL_DRAIN_ON_STOP: "1"   # halt_new_entries before this container stops
+      # KEEL_CHILD_GRACE_S is deliberately NOT set. keel-supervise derives it
+      # from engine.poll_seconds (poll + 10s, floor 20s) so that raising the
+      # poll interval cannot quietly start truncating stops. A hardcoded 20
+      # here would silently win over that.
+    ports:
+      - "127.0.0.1:${KEEL_ENGINE_PORT:-8766}:8766"
+    volumes:
+      - keel_data:/app/trading-bot/data
+      - keel_state:/app/trading-bot/state
+    # Docker SIGKILLs whatever is left at the end of this window, so it has to
+    # cover the whole worst case: write halt_new_entries, SIGINT the child,
+    # engine_loop finishes the pass it is in and returns (grace = poll+10s,
+    # 30s at the default poll), then the supervisor's SIGTERM and SIGKILL
+    # rungs at 10s each. ~50s worst case, and the common case is under two
+    # seconds because engine.stop() interrupts the inter-cycle wait
+    # immediately. The headroom is for a pass stuck in a slow venue call —
+    # cutting this below the grace reintroduces exactly the mid-position kill
+    # the supervisor exists to prevent.
+    stop_grace_period: 90s
+    # If the box runs out of memory, the kernel should take the news agent,
+    # never the process holding the open positions.
+    oom_score_adj: -500
+    healthcheck:
+      test: ["CMD", "python", "/app/bin/keel-healthcheck.py", "--role", "engine"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          memory: 256M
+
+  # --------------------------------------------------------------- dashboard
+  # The control plane. Separate process by design (dashboard_api.py docstring)
+  # and separate container for the same reason: a wedged dashboard must never
+  # be able to take the engine down with it.
+  dashboard:
+    <<: *keel-base
+    container_name: keel-dashboard
+    entrypoint: ["python", "/app/bin/keel-supervise.py", "--role", "dashboard", "--"]
+    command: ["python", "/app/bin/keel-run-dashboard.py"]
+    environment:
+      <<: *keel-env
+      # Binds 0.0.0.0 INSIDE this container's own network namespace only. The
+      # `ports` line below is the actual exposure decision, and it is loopback.
+      # Read scripts/deploy/keel-run-dashboard.py before changing this.
+      KEEL_DASHBOARD_HOST: "0.0.0.0"
+      KEEL_DASHBOARD_PORT: "8767"
+    ports:
+      - "127.0.0.1:${KEEL_DASHBOARD_PORT:-8767}:8767"
+    volumes:
+      - keel_data:/app/trading-bot/data
+      - keel_state:/app/trading-bot/state
+    # Nothing here manages a position; a short stop is fine.
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "python", "/app/bin/keel-healthcheck.py", "--role", "dashboard"]
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+
+  # -------------------------------------------------------------- news agent
+  # No listener, no database. news_agent.py does not import storage — it reaches
+  # the engine over HTTP and reads state/dashboard_token. So it does NOT get the
+  # data volume: the container that parses arbitrary RSS from the open internet
+  # is the last one that should hold the file containing the venue API keys.
+  newsagent:
+    <<: *keel-base
+    container_name: keel-newsagent
+    entrypoint: ["python", "/app/bin/keel-supervise.py", "--role", "newsagent", "--"]
+    command: ["python", "news_agent.py"]
+    environment:
+      <<: *keel-env
+      SLC_SERVER_URL: "http://engine:8766"
+    volumes:
+      - keel_state:/app/trading-bot/state
+    depends_on:
+      engine:
+        condition: service_healthy
+    stop_grace_period: 30s
+    oom_score_adj: 500          # first to be sacrificed under memory pressure
+    healthcheck:
+      test: ["CMD", "python", "/app/bin/keel-healthcheck.py", "--role", "newsagent"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s        # first cycle fetches every configured RSS feed
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+# ------------------------------------------------------------------- volumes
+# Named volumes on the local driver: a directory on the host's own filesystem.
+# That is a hard requirement, not a default.
+#
+# trading.db is SQLite in WAL mode. WAL coordinates its readers and writers with
+# POSIX advisory locks and a shared-memory index (-shm), and both of those are
+# only correct on a real local filesystem. Point these at NFS, CIFS/SMB, a
+# Hetzner Storage Box, an sshfs mount or a Docker Desktop virtiofs/gRPC-FUSE
+# share and the locks silently stop meaning anything — which is the one file
+# whose corruption takes the kill switches with it (CLAUDE.md invariant 7,
+# ARCHITECTURE-V3 §2 failure mode 4).
+#
+# Back it up instead: scripts/deploy/keel-backup.sh, docs §7.
+volumes:
+  keel_data:
+    driver: local
+  keel_state:
+    driver: local
+
+networks:
+  default:
+    name: keel

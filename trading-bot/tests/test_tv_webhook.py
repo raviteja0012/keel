@@ -87,7 +87,8 @@ def _fresh_db_and_feed():
     # synthetic live feed: tight spread + tick sizing so calc_lots works
     engine.feed_state["prices"] = {"EURUSD": {
         "symbol": "EURUSD", "bid": 1.09998, "ask": 1.10002,
-        "tick_value": 1.0, "tick_size": 0.0001}}
+        "tick_value": 1.0, "tick_size": 0.0001,
+        "src": engine.MT5_SOURCE, "src_t": time.time()}}
     engine.feed_state["account"] = {"balance": 10000.0, "equity": 10000.0}
     engine.feed_state["last_feed_t"] = time.time()
     engine._recent_keys.clear()

@@ -9,6 +9,7 @@ These tests pin the behaviour that closes it.
 """
 import os
 import sys
+import time
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,7 +34,9 @@ def check(name, cond, detail=""):
 storage.init()
 SYM = "EURUSD"
 engine.feed_state["prices"][SYM] = {"tick_size": 0.00001, "tick_value": 0.1,
-                                    "bid": 1.10500, "ask": 1.10502}
+                                    "bid": 1.10500, "ask": 1.10502,
+                                    "src": engine.MT5_SOURCE,
+                                    "src_t": time.time()}
 
 
 def _trade(lots=0.10, entry=1.10000, sl=1.09500):

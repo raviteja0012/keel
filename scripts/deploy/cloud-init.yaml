@@ -1,0 +1,138 @@
+#cloud-config
+# Keel node bootstrap. Consumed by scripts/deploy/provision-hetzner.sh, but it
+# is plain cloud-init and works unmodified on DigitalOcean, Vultr, Linode or any
+# provider that accepts user-data.
+#
+# What this box is: one Linux host that runs the engine, the control dashboard
+# and the news agent, with SQLite on a local disk. Nothing on it answers a
+# stranger — every application port is published on 127.0.0.1 only, and the
+# firewall opens exactly one port, for SSH.
+#
+# Placeholders replaced by the provisioning script:
+#   __SSH_KEY__   the operator's public key
+#   __TZ__        timezone (UTC recommended: the broker day boundaries in
+#                 sessions.py are reasoned about in UTC)
+
+package_update: true
+package_upgrade: true
+
+users:
+  - name: keel
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - __SSH_KEY__
+
+timezone: __TZ__
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - sqlite3
+
+write_files:
+  # ---------------------------------------------------------------------
+  # THE MOST IMPORTANT FILE ON THIS BOX.
+  #
+  # When the host reboots, dockerd stops containers with its own shutdown
+  # timeout and then SIGKILLs whatever is left. The default is 15 seconds.
+  # keel-supervise.py needs longer than that: it writes halt_new_entries,
+  # waits for the engine to observe it and to reach the quiet part of its
+  # cycle, then stops the child — around 35s at the default 20s poll, and
+  # docker-compose.yml allows 90s for it.
+  #
+  # Leave this at 15 and every `reboot` is precisely the mid-position kill
+  # the supervisor exists to prevent. The container-level stop_grace_period
+  # cannot save you here; only the daemon's own timeout can.
+  # ---------------------------------------------------------------------
+  - path: /etc/docker/daemon.json
+    content: |
+      {
+        "shutdown-timeout": 120,
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "5" },
+        "live-restore": false
+      }
+
+  - path: /etc/ssh/sshd_config.d/99-keel.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      KbdInteractiveAuthentication no
+
+  # A full disk corrupts SQLite. Journald is the other thing that fills one.
+  - path: /etc/systemd/journald.conf.d/99-keel.conf
+    content: |
+      [Journal]
+      SystemMaxUse=500M
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+  # Security updates only, and never an automatic reboot: a reboot chosen by
+  # apt at 06:00 is a reboot chosen while a position is open.
+  - path: /etc/apt/apt.conf.d/50unattended-upgrades-keel
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+runcmd:
+  # --- docker engine from the official repo (distro packages lag) -----------
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - >
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc]
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable"
+    > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+  - usermod -aG docker keel
+
+  # --- firewall: SSH in, nothing else ---------------------------------------
+  # Every Keel port is published to 127.0.0.1, so there is nothing to open.
+  # Reach the dashboard over an SSH tunnel or a tailnet (docs §6).
+  #
+  # NOTE: ufw does not filter traffic docker publishes on 0.0.0.0 — docker's
+  # iptables rules sit in front of ufw's. That is a well-known trap and the
+  # reason the loopback bindings in docker-compose.yml are the real control
+  # here, not this firewall. ufw is defence in depth for everything else.
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow OpenSSH
+  - ufw --force enable
+
+  - systemctl enable --now fail2ban
+  - systemctl restart ssh || systemctl restart sshd
+
+  # --- swap: cheap insurance against the OOM killer ------------------------
+  # 2 GB boxes run three Python processes plus a build. The engine is
+  # oom_score_adj -500 so it is the last victim, but not being a victim at all
+  # is better.
+  - fallocate -l 2G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - sh -c 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
+  # SQLite likes to actually be in memory; do not swap it out eagerly.
+  - sh -c 'echo "vm.swappiness=10" > /etc/sysctl.d/99-keel.conf'
+  - sysctl --system
+
+  - mkdir -p /opt/keel
+  - chown keel:keel /opt/keel
+
+final_message: |
+  Keel node ready.
+    ssh keel@<ip>
+    git clone <your private repo> /opt/keel/slc-trading-bot
+    cd /opt/keel/slc-trading-bot && docker compose build && docker compose up -d
+  Nothing is listening publicly. Tunnel to the dashboard:
+    ssh -N -L 8767:127.0.0.1:8767 keel@<ip>

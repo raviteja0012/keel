@@ -24,14 +24,23 @@ from typing import Any, Dict, Iterator, List, Optional, Protocol, runtime_checka
 
 
 class VenueError(RuntimeError):
-    """Adapter could not complete the call. Carries whether a retry is safe."""
+    """Adapter could not complete the call. Carries whether a retry is safe.
+
+    `http_status` is the venue's own status code when there was one, and None
+    when the call never got an answer (DNS, timeout, connection refused). An
+    adapter deciding whether an order exists needs that distinction: a status
+    code is the venue saying something, None is the venue saying nothing, and
+    the two must never be handled alike.
+    """
 
     def __init__(self, message: str, retryable: bool = False,
-                 venue: str = "", cause: Optional[BaseException] = None):
+                 venue: str = "", cause: Optional[BaseException] = None,
+                 http_status: Optional[int] = None):
         super().__init__(message)
         self.retryable = retryable
         self.venue = venue
         self.cause = cause
+        self.http_status = http_status
 
 
 class VenueReadOnly(VenueError):
@@ -175,5 +184,9 @@ except ImportError:                   # pragma: no cover - optional dependency
     pass
 try:
     from . import threecommas         # noqa: F401
+except ImportError:                   # pragma: no cover - optional dependency
+    pass
+try:
+    from . import webull              # noqa: F401
 except ImportError:                   # pragma: no cover - optional dependency
     pass

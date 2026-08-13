@@ -12,11 +12,13 @@ import os
 import secrets
 import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from flask import Flask, jsonify, request, send_from_directory
 
 import agent
+import alerts
 import decisions
 import engine
 import exposure
@@ -25,8 +27,10 @@ from dash_auth import get_token
 import news_calendar
 import notifier
 import params_store
+import reconcile
 import storage
 import tv_webhook
+import venues
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, static_folder=None)
@@ -615,6 +619,705 @@ load(); setInterval(load,5000);
 
 
 # ======================================================================
+# Safety wiring — S1 alerts, S2 reconciliation, S3 dead-man
+# (docs/ARCHITECTURE-V3.md Increment 1, items 6-8)
+#
+# alerts.py and reconcile.py were finished, tested, and imported by nothing
+# outside their own suites. A pager nobody wired is not a pager. This process
+# wires them, because it is the process that runs the engine loop and the only
+# one that calls notifier.start():
+#
+#   RAISE   any process, any time. alerts.raise_alert records and never sends,
+#           never blocks and never throws — a caller already handling a kill
+#           switch must not also have to handle an alerting failure.
+#   RELAY   exactly one process delivers, decided by the DB lease in
+#           alerts.own_relay(). Normally this one; dashboard_api takes over
+#           about two minutes after this process stops renewing, which is what
+#           makes the dead-man in S3 able to page about this process dying.
+#
+# Nothing here places, cancels or modifies an order, and nothing here resumes.
+# The only lever is halt_new_entries = True — monotonically de-risking, read by
+# engine.try_execute as a fail-safe. It is never written False from here:
+# healing is a human act (/api/resume), because a reconciler that un-halts
+# itself is a reconciler that argues with the evidence.
+# ======================================================================
+MT5_MAGIC = 770001              # the magic engine.py stamps on its own orders
+SAFETY_TICK_S = 15              # cadence of the cheap, in-memory checks
+RECONCILE_EVERY_S = 60          # S2 cadence — venue reads are network-bound
+# Consecutive passes the SAME discrepancy must survive before it halts entries.
+RECON_CONFIRMATIONS = 2
+
+# ...and this is the ONLY thing that gets debounced. The distinction matters more
+# than the count.
+#
+# A mismatch can be a race with ourselves: the engine writes tp1_done and the new
+# stop to the trades row and only THEN enqueues the command, so for one pass the
+# local book and the venue legitimately disagree. Halting on that means the
+# system stops itself for doing its job, which teaches an operator to resume
+# without reading — worse than not halting at all.
+#
+# Blindness is not a race. A venue that cannot be reached, or an orphan position
+# nobody opened, does not resolve itself on the next pass, and waiting another
+# minute to halt buys nothing while we cannot see what we hold. Those still halt
+# on the first pass.
+RECON_DEBOUNCED_KINDS = frozenset({"STOP_MISMATCH", "QTY_MISMATCH"})
+DEADMAN_MIN_STALE_S = 180       # same window analysis.health() calls "alive"
+DEADMAN_POLL_MULT = 3           # ...or three engine cycles, whichever is longer
+
+# The truthful origin for an automated de-risking write, in order of honesty.
+# params_store.WHITELISTS has no entry for "system" today, so set_param would
+# REFUSE it (and a refused halt is a halt that did not happen), which leaves
+# "human" — the origin every dashboard control already uses — as the only key
+# that works. This is a lie in the audit trail and it is deliberate rather than
+# hidden: the reason string and the agent_log row both name the reconciler.
+# The one-line fix lives in a file this change does not own — add
+# `"system": {"halt_new_entries"}` to params_store.WHITELISTS — and the moment
+# somebody makes it, this tuple starts recording the truth with no edit here.
+_HALT_ORIGINS = ("system", "reconciler", "human")
+
+_WATCHED_SETTINGS = ("trading_mode", "halt_new_entries")
+_LAST_SEEN_KEY = "safety_last_seen"          # watched setting -> last value
+MONITOR_HEARTBEAT_KEY = "safety_monitor_t"   # this monitor's own liveness
+RECON_REPORT_KEY = "recon_last_report"       # what /api/reconcile renders
+
+_safety: Dict[str, Any] = {
+    "started_t": time.time(), "last_tick_t": 0.0, "last_reconcile_t": 0.0,
+    "ticks": 0, "errors": 0, "last_error": "",
+    # (signature, consecutive_count) for the reconciliation debounce
+    "recon_pending": ("", 0),
+}
+
+
+def _stamp(key: str) -> Optional[float]:
+    """A timestamp out of settings, or None when it is missing/unreadable.
+
+    Deliberately not `or 0` and never `or time.time()`. This value decides
+    whether a process is alive, and an absent heartbeat is the exact thing
+    being detected: a numeric default here makes "we have never heard from the
+    engine" indistinguishable from "the engine checked in at the epoch" or,
+    worse, "the engine checked in just now".
+    """
+    try:
+        v = storage.get_setting(key, None)
+    except Exception:
+        return None
+    if v in (None, "", 0):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _deadman_limit() -> float:
+    poll = int((CFG.get("engine") or {}).get("poll_seconds", 20) or 20)
+    return float(max(DEADMAN_MIN_STALE_S, DEADMAN_POLL_MULT * poll))
+
+
+def _live_open() -> List[Dict[str, Any]]:
+    """Open live trades, or a RAISE if the book cannot be read.
+
+    This used to swallow any storage failure into `return []`, so "I cannot read
+    the book" became "we hold nothing" — and four callers use that answer to
+    decide how loud to be. Every one of them treats an empty list as the calm
+    case: no live exposure, so a stale feed or a dead engine is not urgent. A
+    database that has just started throwing is exactly when the book is most
+    likely to be non-empty and the alert most likely to matter.
+
+    Callers must now handle the exception and decide, rather than being handed a
+    reassuring lie. `_live_open_or_unknown()` is the helper for the ones whose
+    job is to keep running."""
+    return storage.open_trades("live") or []
+
+
+def _live_open_or_unknown() -> Tuple[List[Dict[str, Any]], bool]:
+    """(trades, unknown). unknown=True means the book could not be read at all,
+    which every caller must treat as "assume we are exposed", never as empty."""
+    try:
+        return _live_open(), False
+    except Exception as e:
+        print("[safety] cannot read the live book:", e)
+        return [], True
+
+
+def _halt_origin() -> str:
+    for cand in _HALT_ORIGINS:
+        if "halt_new_entries" in params_store.WHITELISTS.get(cand, set()):
+            return cand
+    return "human"
+
+
+def apply_safety_halt(why: str) -> str:
+    """Set the fail-safe. True only, through the write layer, once.
+
+    Returns "" when nothing needed doing, else the origin the write was
+    recorded under. A failure to apply the halt is itself a page: the caller
+    believing it halted while entries keep flowing is the worst outcome
+    available here.
+    """
+    try:
+        if storage.get_setting("halt_new_entries", False):
+            return ""                      # already standing aside
+    except Exception:
+        pass                               # cannot read it -> try the write
+    origin = _halt_origin()
+    try:
+        params_store.set_param("halt_new_entries", True, origin=origin,
+                               reason="automated safety halt: %s" % why[:300],
+                               trigger_data={"by": "safety monitor (server.py)",
+                                             "why": why[:300]})
+        storage.log_agent("change", "halt_new_entries",
+                          "safety monitor halted new entries: %s" % why[:300])
+        return origin
+    except Exception as e:
+        alerts.raise_alert(
+            "halt_write_failed",
+            "COULD NOT HALT NEW ENTRIES (%s) — the reason was: %s"
+            % (str(e)[:200], why[:200]),
+            severity=alerts.P1, dedupe_key="halt_write")
+        return ""
+
+
+# ------------------------------------------------------------------ S1
+def check_trading_mode(now: Optional[float] = None) -> Dict[str, Any]:
+    """Live mode enabled, and the other watched state transitions.
+
+    Watches the STATE, not the endpoint. live_switch.confirm_live writes
+    trading_mode with storage.set_setting, and the notice it queues into
+    notifier from the dashboard process is never delivered because that
+    process has no notifier worker — the one message announcing real money at
+    risk. Instrumenting that call site would fix that path and only that path;
+    watching the value catches every path to live, including a hand-edited DB.
+
+    The last seen value is persisted, so this reports the TRANSITION and does
+    not re-page every cycle for a mode that is simply still live.
+    """
+    del now
+    out: Dict[str, Any] = {"changes": {}}
+    try:
+        seen = storage.get_setting(_LAST_SEEN_KEY, None)
+    except Exception:
+        return out
+    seen = seen if isinstance(seen, dict) else None
+    current = {k: storage.get_setting(k, None) for k in _WATCHED_SETTINGS}
+    if seen is None:
+        # First observation on this database. Record the baseline — and if we
+        # are booting straight into live, that still deserves the page.
+        storage.set_setting(_LAST_SEEN_KEY, current)
+        if str(current.get("trading_mode")) == "live":
+            alerts.raise_alert(
+                "trading_mode",
+                "engine started with trading_mode = LIVE — real money is at "
+                "risk. The EA's AllowTradeExecution input is the other half of "
+                "the gate.", severity=alerts.P1, dedupe_key="live")
+            out["changes"]["trading_mode"] = (None, "live")
+        return out
+    for key in _WATCHED_SETTINGS:
+        was, is_ = seen.get(key), current.get(key)
+        if was == is_:
+            continue
+        out["changes"][key] = (was, is_)
+        if key == "trading_mode":
+            live = str(is_) == "live"
+            msg = ("LIVE TRADING ENABLED (%s -> LIVE). Real money is at risk; "
+                   "the EA's AllowTradeExecution input is the other half of "
+                   "the gate." % (was,) if live
+                   else "trading_mode %s -> %s" % (was, is_))
+            alerts.raise_alert(
+                "trading_mode", msg,
+                # P1, not the registry's P2. A mode change is a state change,
+                # but THIS state change is the one the whole promotion gate
+                # exists to guard, and P2 can be held through quiet hours.
+                severity=alerts.P1 if live else alerts.P2,
+                dedupe_key=str(is_))
+        else:
+            alerts.raise_alert(
+                "halt", "halt_new_entries %s -> %s" % (was, is_),
+                dedupe_key=str(is_))
+    if out["changes"]:            # only on an edge — no settings write per tick
+        storage.set_setting(_LAST_SEEN_KEY, current)
+    return out
+
+
+def check_kill_switches(p: Dict[str, Any],
+                        now: Optional[float] = None) -> str:
+    """Daily/weekly stops. Hard stops in paper AND live (invariant 9)."""
+    del now
+    mode = p.get("trading_mode", "paper")
+    if mode == "off":
+        return "off"
+    balance = engine._balance(mode, p)
+    if balance <= 0:
+        # engine.loss_limits_hit returns None when balance <= 0, so "no limit
+        # hit" and "I could not read the account" are the same value there.
+        # The engine is safe either way (it cannot size a trade off a zero
+        # balance), but reporting it as "kill switches clear" is exactly the
+        # reassuring default this codebase keeps getting bitten by.
+        open_live, book_unknown = _live_open_or_unknown()
+        # An unreadable book counts as exposure. "I could not check whether we
+        # are holding" must escalate like "we are holding", never like "we are
+        # flat" — a database that has started throwing is exactly when the book
+        # is most likely to be non-empty.
+        exposed = bool(open_live) or book_unknown
+        how_much = (" while %d live position(s) are open" % len(open_live)
+                    if open_live else
+                    " and the live book could not be read at all"
+                    if book_unknown else "")
+        alerts.raise_alert(
+            "kill_switch_unknown",
+            "%s balance reads %.2f — the daily/weekly stops cannot be "
+            "evaluated at all%s" % (mode, balance, how_much),
+            severity=alerts.P1 if (mode == "live" and exposed) else alerts.P2,
+            dedupe_key=mode)
+        return "unknown"
+    reason = engine.loss_limits_hit(mode, balance, p)
+    if not reason:
+        return "clear"
+    # loss_limits_hit answers one question with two meanings: a stop was
+    # breached, or the drawdown could not be computed because a position has
+    # no usable quote. Ask _open_pnl which one it is rather than parsing the
+    # sentence — and if the two ever disagree, the fired branch is the louder
+    # one, so a misclassification pages harder instead of softer.
+    try:
+        _, unvalued = engine._open_pnl(mode)
+    except Exception:
+        unvalued = 0
+    if unvalued:
+        alerts.raise_alert(
+            "kill_switch_unknown", "%s: %s" % (mode, reason),
+            # A live position we cannot value is money whose drawdown is
+            # unknown. In paper it is a data gap, loud enough at P2.
+            severity=alerts.P1 if mode == "live" else alerts.P2,
+            dedupe_key="%s|unvalued" % mode,
+            detail={"mode": mode, "balance": balance, "unvalued": unvalued})
+        return "unknown"
+    alerts.raise_alert(
+        "kill_switch_fired", "%s: %s — new entries are standing aside"
+        % (mode, reason), severity=alerts.P1,
+        dedupe_key="%s|%s" % (mode, reason[:40]),
+        detail={"mode": mode, "balance": round(balance, 2)})
+    return "fired"
+
+
+def check_db_integrity(p: Dict[str, Any]) -> str:
+    """storage latched suspect: every number the kill switches read comes out
+    of that file, so this is P1 in any mode, not only live."""
+    try:
+        suspect = storage.integrity_suspect()
+    except Exception as e:
+        suspect = "integrity_suspect() itself failed: %s" % (str(e)[:120])
+    if not suspect:
+        return ""
+    alerts.raise_alert(
+        "db_integrity_live",
+        "DB integrity SUSPECT (%s) — mode=%s. Balances, open trades and the "
+        "kill-switch arithmetic all read this file."
+        % (suspect, p.get("trading_mode")),
+        severity=alerts.P1, dedupe_key=str(p.get("trading_mode")))
+    return suspect
+
+
+def check_mt5_reachable(now: Optional[float] = None) -> str:
+    """The venue that holds the positions going dark.
+
+    MT5 reaches this process through the EA drop copy rather than venues.py,
+    so its reachability is the freshness of that feed. engine.source_state
+    already fails closed on "never reported"; this consumes that verdict.
+    """
+    now = time.time() if now is None else now
+    if not engine.mt5_configured():
+        return "not configured"      # a crypto-only node has no EA, ever
+    st = engine.source_state(engine.MT5_SOURCE, now)
+    if st["fresh"] and st["reachable"]:
+        return "ok"
+    if st["age"] is None and (now - _safety["started_t"]) <= _deadman_limit():
+        return "warming up"          # process just started; the EA pushes ~5s
+    open_live, book_unknown = _live_open_or_unknown()
+    why = st["reason"] or "mt5 feed unusable"
+    # "I could not read the book" resolves to the LOUD branch. The quiet branch
+    # asserts "no live positions open", which is a claim we are in no position
+    # to make when the read failed.
+    if open_live or book_unknown:
+        alerts.raise_alert(
+            "feed_loss_live",
+            "MT5 is unreachable (%s) %s — the venue holding real money is not "
+            "answering." % (why,
+                            "while %d live position(s) are open" % len(open_live)
+                            if open_live else
+                            "and the live book could not be read, so exposure "
+                            "is unknown"),
+            severity=alerts.P1, dedupe_key=engine.MT5_SOURCE)
+        return "unreachable_holding_positions"
+    alerts.raise_alert("feed_stale", "MT5 unreachable (%s); no live positions "
+                       "open" % why, dedupe_key=engine.MT5_SOURCE)
+    return "unreachable"
+
+
+# ------------------------------------------------------------------ S3
+def check_engine_heartbeat(now: Optional[float] = None) -> str:
+    """Dead-man switch: make the ABSENCE of a heartbeat produce an alert.
+
+    engine.py writes engine_heartbeat_t every cycle and the only reader is
+    analysis.health(), which renders to a dashboard. Pull-only telemetry tells
+    you the engine is dead if and only if somebody was already looking.
+
+    WHAT THIS CATCHES: the engine LOOP dying or wedging while this process
+    lives — an unhandled exception out of engine_loop, a thread blocked on a
+    venue socket, a deadlock on storage._lock. That is the common failure and
+    nothing observed it before.
+
+    WHAT THIS CANNOT CATCH, stated plainly because a dead-man you believe in
+    wrongly is worse than none: this watchdog is a thread inside the same
+    process as its subject. Kill the process, lose the box, blue-screen the
+    host, and the watchdog dies with the engine and no alert is ever raised.
+    Two things narrow that gap and neither closes it. First, dashboard_api.py
+    runs the same check from a SEPARATE process and inherits the alerts relay
+    lease about two minutes after this process stops renewing it, so a dead
+    server.py does page — as long as the dashboard process is up. Second, only
+    an OUTBOUND ping to something off this machine (an inverted watchdog such
+    as healthchecks.io, pinged at the END of a successful engine cycle) can
+    survive the whole box going away, and that ping has to be written inside
+    engine_loop, which this change does not own. Until it exists, a total host
+    failure is silent. That is a real hole, and it is on the record here.
+    """
+    now = time.time() if now is None else now
+    limit = _deadman_limit()
+    hb = _stamp("engine_heartbeat_t")
+    if hb is None:
+        if (now - _safety["started_t"]) <= limit:
+            return "warming up"
+        alerts.raise_alert(
+            "engine_deadman",
+            "no engine heartbeat has EVER been written (watched for %ds). The "
+            "engine loop is not running: nothing is managing stops, and every "
+            "dashboard number is a fossil." % int(now - _safety["started_t"]),
+            severity=alerts.P1, dedupe_key="never")
+        return "never"
+    age = now - hb
+    if age <= limit:
+        return "alive"
+    alerts.raise_alert(
+        "engine_deadman",
+        "engine heartbeat is %ds old (limit %ds) — the engine loop has "
+        "stopped cycling. Open positions are unmanaged until it returns."
+        % (int(age), int(limit)),
+        severity=alerts.P1, dedupe_key="stalled",
+        detail={"heartbeat_t": hb, "age_s": int(age), "limit_s": int(limit)})
+    return "stalled"
+
+
+# ------------------------------------------------------------------ S2
+def _mt5_is_a_position_source(p: Dict[str, Any]) -> bool:
+    """Is MT5 somewhere we might HOLD something, or only a price feed?
+
+    This decides whether a silent EA is blindness (which halts) or merely a
+    stale quote (which does not). It has to be answered honestly in both
+    directions. Answer yes too eagerly and a paper-only node latches a halt
+    every time the EA blinks, and a rail that fires forever is a rail the
+    operator switches off. Answer no too eagerly and an orphan sits behind the
+    silence with nobody looking.
+
+    So: yes if we are live, yes if a live row is open, and yes if this database
+    has EVER recorded a live trade — an account that has traded live can still
+    be holding something we lost track of, whatever mode we are in today.
+    """
+    if str(p.get("trading_mode")) == "live":
+        return True
+    open_live, book_unknown = _live_open_or_unknown()
+    if open_live or book_unknown:
+        return True     # unreadable book counts as possibly-holding, like below
+    try:
+        return storage.query_one(
+            "SELECT id FROM trades WHERE mode='live' LIMIT 1") is not None
+    except Exception:
+        return True                     # cannot tell -> assume we might hold
+
+
+def _mt5_positions(p: Dict[str, Any], now: float):
+    """(rows, declared names) for the MT5 drop copy.
+
+    reconcile._sources reads a {"venue", "error"} row as a source that went
+    dark, which is exactly what a stale drop copy is. Handing it the stale
+    POSITIONS instead would let a dead feed's last frame masquerade as the
+    venue's current book.
+    """
+    if not _mt5_is_a_position_source(p):
+        return [], []
+    st = engine.source_state(engine.MT5_SOURCE, now)
+    if st["fresh"] and st["reachable"]:
+        feed = engine.get_feed()
+        return (reconcile.from_mt5_feed(feed.get("open_positions"),
+                                        magic=MT5_MAGIC,
+                                        venue=engine.MT5_SOURCE),
+                [engine.MT5_SOURCE])
+    return ([{"venue": engine.MT5_SOURCE,
+              "error": st["reason"] or "EA drop copy stale or absent"}],
+            [engine.MT5_SOURCE])
+
+
+def _scrub(text: Any) -> str:
+    """Mask any stored venue credential that an adapter error echoed back.
+
+    A venue error is the one string in this module that this process did not
+    write itself: venues.positions_all() stores `str(e)` from the adapter, and
+    an exchange that replies with the request it rejected can hand back the key
+    that signed it. From here that string travels into an alert message, i.e.
+    into Telegram — and constraint 3 puts a credential nowhere near a
+    notification or a persisted reason string.
+
+    Masking the VALUES rather than classifying the whole string (which is what
+    engine._safe_detail does, against a strict allow-list) keeps "connection
+    reset by peer" readable. Being unable to enumerate the secrets means being
+    unable to prove the text is clean, so that path prints nothing.
+    """
+    s = "" if text is None else str(text)[:400]
+    if not s:
+        return s
+    try:
+        fields = getattr(venues, "_SECRET_FIELDS",
+                         ("api_key", "api_secret", "password"))
+        for v in venues.list_venues():
+            cfg = venues.get(str(v.get("name"))) or {}
+            for f in fields:
+                secret = cfg.get(f)
+                if isinstance(secret, str) and len(secret) >= 8 and secret in s:
+                    s = s.replace(secret, "•••redacted•••")
+    except Exception:
+        return "venue error (withheld: could not verify it carries no secret)"
+    return s
+
+
+def _trim_report(rep: Dict[str, Any], keep: int = 20) -> Dict[str, Any]:
+    """A storable, scrubbed summary. Material findings are kept FIRST so the
+    trimmed report answers should_halt_entries exactly as the full one did."""
+    disc = [d for d in rep.get("discrepancies", []) if isinstance(d, dict)]
+    material = [d for d in disc if d.get("material")]
+    rest = [d for d in disc if not d.get("material")]
+    out = {k: rep.get(k) for k in
+           ("t", "mode", "venue_backed", "blind", "local_open",
+            "venue_positions", "counts", "material", "halt")}
+    out["sources"] = [dict(s, error=_scrub(s.get("error")))
+                      for s in (rep.get("sources") or []) if isinstance(s, dict)]
+    out["discrepancies"] = [dict(d, detail=_scrub(d.get("detail")))
+                            for d in material[:keep] + rest[:keep]]
+    out["reason"] = _scrub(rep.get("reason"))
+    out["truncated"] = len(disc) > len(out["discrepancies"])
+    out["clean_n"] = len(rep.get("clean") or [])
+    out["stops_unverified"] = (rep.get("stops_unverified") or [])[:keep]
+    return out
+
+
+def reconcile_tick(now: Optional[float] = None,
+                   force: bool = False) -> Dict[str, Any]:
+    """S2: compare the book against the venues, halt on material drift, page.
+
+    Never heals. Closing a LOCAL_ONLY row or re-sending a stop would make this
+    a second execution path beside engine.py. The report is stored for
+    /api/reconcile, the classification is annotated onto the trade rows (one
+    column no rail reads), and the only lever pulled is halt_new_entries.
+
+    The comparison always runs against mode="live" whichever mode the engine is
+    in: only live trades exist at a venue, and reconciling the CONFIGURED mode
+    would stop checking live rows the moment somebody flipped back to paper —
+    which is precisely when an orphaned live position is most dangerous.
+    """
+    now = time.time() if now is None else now
+    if not force and (now - _safety["last_reconcile_t"]) < RECONCILE_EVERY_S:
+        return {"ran": False, "reason": "not due"}
+    _safety["last_reconcile_t"] = now
+    try:
+        p = engine.params()
+    except Exception:
+        p = {"trading_mode": storage.get_setting("trading_mode", "paper")}
+
+    rows, names = _mt5_positions(p, now)
+    halt, raw_reason, report = reconcile.gate("live", positions=rows,
+                                              venue_names=names, now=int(now))
+    # Everything that leaves this function — the stored report, the page, the
+    # reason recorded against the halt — is derived from the scrubbed copy, so
+    # venue text is cleaned in one place with no way to route around it. The
+    # VERDICT still comes from the gate's own full report.
+    safe = _trim_report(report)
+    reason = reconcile.halt_reason(safe) or _scrub(raw_reason)
+
+    try:
+        storage.set_setting(RECON_REPORT_KEY, safe)
+    except Exception as e:
+        print("[safety] could not store recon report:", e)
+    try:
+        reconcile.apply_recon_state(report)      # annotation only, never status
+    except Exception as e:                        # it swallows its own errors
+        print("[safety] recon annotate:", e)
+
+    # A venue that cannot be reached while we hold something is S1's
+    # "venue holding an open position went dark". trades carry no venue column,
+    # so WHICH venue holds a given row is not knowable here — with any live
+    # position open, every blind source is treated as possibly the one.
+    _lo, _unknown = _live_open_or_unknown()
+    # An unreadable book is treated as holding: a venue going dark matters most
+    # when we cannot confirm we are flat.
+    holding = len(_lo) or (1 if _unknown else 0)
+    for name in safe.get("blind") or []:
+        src = next((s for s in safe.get("sources") or []
+                    if s.get("venue") == name), {})
+        alerts.raise_alert(
+            "venue_unreachable",
+            "%s is unreachable (%s)%s" % (name, src.get("error") or "no detail",
+                                          " while %d live position(s) are open"
+                                          % holding if holding else ""),
+            severity=alerts.P1 if holding else alerts.P2, dedupe_key=str(name))
+
+    out = {"ran": True, "halt": halt, "reason": reason,
+           "material": report.get("material", 0),
+           "counts": report.get("counts", {}), "blind": report.get("blind", []),
+           "halted_origin": ""}
+    if not halt:
+        # The drift cleared. Forget the pending signature so an unrelated one
+        # later has to earn its own confirmations rather than inheriting a count.
+        _safety["recon_pending"] = ("", 0)
+        return out
+
+    # DEBOUNCE. The engine writes tp1_done and the new stop to the trades row and
+    # only THEN enqueues the command for the venue, so between those two moments
+    # the local book and the venue legitimately disagree. Halting on a single
+    # pass means the engine's own trade management trips the halt — the system
+    # stopping itself for doing exactly what it is supposed to do, which trains
+    # an operator to resume without reading, which is worse than not halting.
+    #
+    # A real drift persists; an in-flight write resolves within a cycle. So the
+    # SAME discrepancy must be seen on consecutive passes before it halts. The
+    # signature is the reason text, so a different discrepancy starts its own
+    # count rather than borrowing this one's.
+    # Only a drift made ENTIRELY of race-capable mismatches waits. One orphan or
+    # one blind venue in the set and it halts now: those are not races, and the
+    # honest response to "I cannot see what I hold" is to stop opening more.
+    kinds = {str(d.get("kind") or "").upper()
+             for d in (report.get("discrepancies") or [])
+             if d.get("material")}
+    if report.get("blind"):
+        kinds.add("BLIND")
+    debounceable = bool(kinds) and kinds.issubset(RECON_DEBOUNCED_KINDS)
+
+    sig = reason[:200]
+    prev_sig, seen = _safety.get("recon_pending") or ("", 0)
+    seen = seen + 1 if sig == prev_sig else 1
+    _safety["recon_pending"] = (sig, seen)
+    out["confirmations"] = seen
+    out["debounced"] = debounceable
+
+    if debounceable and seen < RECON_CONFIRMATIONS:
+        out["halt"] = False
+        out["reason"] = ("%s — seen %d/%d times, not halting yet (an in-flight "
+                         "stop write looks like this for one pass)"
+                         % (reason, seen, RECON_CONFIRMATIONS))
+        alerts.raise_alert(
+            "recon_drift_unconfirmed",
+            "possible reconciliation drift (%d/%d): %s"
+            % (seen, RECON_CONFIRMATIONS, reason),
+            severity=alerts.P2, dedupe_key=sig[:60] or "drift")
+        return out
+
+    alerts.raise_alert(
+        "recon_drift",
+        "reconciliation found %d material discrepancy(ies) on %d consecutive "
+        "passes: %s — new entries halted, nothing was healed."
+        % (report.get("material", 0), seen, reason),
+        severity=alerts.P1, dedupe_key=reason[:60] or "drift",
+        detail={"counts": report.get("counts"), "blind": report.get("blind")})
+    out["halted_origin"] = apply_safety_halt("reconciliation: %s" % reason)
+    return out
+
+
+# --------------------------------------------------------------- the tick
+def _guard(name: str, fn, *args, **kw):
+    """Run one check. A check that throws must not take the others with it, and
+    must not be silent about having thrown."""
+    try:
+        return fn(*args, **kw)
+    except Exception as e:
+        _safety["errors"] += 1
+        _safety["last_error"] = "%s: %s" % (name, str(e)[:200])
+        print("[safety] check %s failed: %s" % (name, e))
+        alerts.raise_alert("safety_monitor_error",
+                           "safety check %s raised %s" % (name, str(e)[:200]),
+                           dedupe_key=name)
+        return None
+
+
+def _relay(send=None) -> Dict[str, Any]:
+    if send is None:
+        # The relay owner must have a worker running, or "delivered" means
+        # "queued into a process that drains nothing" — the live_switch bug
+        # wearing a different hat. notifier.start() is idempotent.
+        notifier.start()
+    return alerts.relay_once(send=send)
+
+
+def safety_tick(now: Optional[float] = None, send=None) -> Dict[str, Any]:
+    """One pass of the monitor. Record everything first, deliver last: a relay
+    that is down must never cost us the recording."""
+    now = time.time() if now is None else now
+    out: Dict[str, Any] = {"t": now}
+    try:
+        p = engine.params()
+    except Exception as e:
+        # Do NOT substitute a plausible-looking parameter set here. The kill
+        # switch would then be evaluated against invented stops and report
+        # "clear" on numbers nobody chose. Skip the checks that need it and
+        # say loudly that they did not run.
+        p = None
+        _safety["last_error"] = "params(): %s" % (str(e)[:200])
+        alerts.raise_alert(
+            "safety_monitor_error",
+            "engine.params() failed (%s) — the kill-switch check did not run "
+            "this cycle." % (str(e)[:200]),
+            severity=alerts.P1, dedupe_key="params")
+    out["mode"] = _guard("trading_mode", check_trading_mode, now)
+    if p is not None:
+        out["db"] = _guard("db_integrity", check_db_integrity, p)
+        out["kill_switch"] = _guard("kill_switches", check_kill_switches, p, now)
+    out["mt5"] = _guard("mt5_reachable", check_mt5_reachable, now)
+    out["engine"] = _guard("engine_heartbeat", check_engine_heartbeat, now)
+    out["reconcile"] = _guard("reconcile", reconcile_tick, now)
+    out["relay"] = _guard("relay", _relay, send)
+    out["digest"] = _guard("digest", alerts.digest_once, send)
+    _safety["ticks"] += 1
+    _safety["last_tick_t"] = now
+    try:
+        # This monitor's own liveness, so the dashboard process can tell
+        # "engine stalled" from "the whole watchdog went away".
+        storage.set_setting(MONITOR_HEARTBEAT_KEY, int(now))
+    except Exception:
+        pass
+    return out
+
+
+def safety_loop(interval: int = SAFETY_TICK_S) -> None:
+    _safety["started_t"] = time.time()
+    print("safety monitor: started (tick %ds, reconcile %ds)"
+          % (interval, RECONCILE_EVERY_S))
+    while True:
+        try:
+            safety_tick()
+        except Exception as e:            # the monitor may never die quietly
+            _safety["errors"] += 1
+            _safety["last_error"] = str(e)[:200]
+            print("[safety] tick error:", e)
+        time.sleep(interval)
+
+
+def start_safety_monitor(interval: int = SAFETY_TICK_S) -> None:
+    notifier.start()                      # this process is the relay owner
+    threading.Thread(target=safety_loop, args=(interval,), daemon=True).start()
+
+
+def safety_state() -> Dict[str, Any]:
+    return dict(_safety, deadman_limit_s=_deadman_limit(),
+                relay_owner=alerts.relay_owner())
+
+
+# ======================================================================
 if __name__ == "__main__":
     storage.init()
     seed_settings()
@@ -628,6 +1331,7 @@ if __name__ == "__main__":
                      args=(CFG["engine"]["poll_seconds"],), daemon=True).start()
     threading.Thread(target=agent.agent_loop,
                      args=(CFG["agent"], notifier.send), daemon=True).start()
+    start_safety_monitor()           # S1/S2/S3 — and this process relays
 
     # SLC_HOST / SLC_PORT env vars override config.yaml — lets a second
     # instance run in parallel with an existing bot without editing tracked
