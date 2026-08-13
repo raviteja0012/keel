@@ -73,6 +73,50 @@ button.act:disabled{opacity:.45;cursor:default}
 .view{display:none}.view.on{display:block}
 .badge{background:var(--crit);color:#fff;border-radius:9px;font-size:11px;
        padding:0 6px;margin-left:4px}
+
+/* ---- hierarchy: one hero, then a quiet strip -------------------------------
+   The landing page had seven equal boxes and two empty tables, so nothing was
+   emphasised and the one question a person actually arrives with — "what do I
+   do next?" — was not answered anywhere. */
+.hero{background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--s1);
+  border-radius:12px;padding:18px 22px;margin-bottom:20px}
+.hero.good{border-left-color:var(--good)} .hero.warn{border-left-color:var(--warn)}
+.hero.crit{border-left-color:var(--crit)}
+.hero .state{font-size:20px;font-weight:680;letter-spacing:-.01em;margin-bottom:4px}
+.hero .because{color:var(--ink2);font-size:13.5px;max-width:78ch}
+.hero .next{margin-top:14px;padding-top:14px;border-top:1px solid var(--grid)}
+.hero .next .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);margin-bottom:6px}
+.hero .next ol{margin:0;padding-left:20px;color:var(--ink);font-size:13.5px;line-height:1.9}
+.hero .next code{background:var(--surface2);padding:1px 6px;border-radius:5px;font-size:12.5px}
+
+/* the seven boxes, demoted to a dense strip */
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:1px;
+  background:var(--border);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.strip .cell{background:var(--surface);padding:10px 13px}
+.strip .cell .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.strip .cell .v{font-size:15px;font-weight:640;margin-top:3px}
+.strip .cell .s{font-size:11px;color:var(--muted);margin-top:1px}
+
+.split{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+@media(max-width:900px){.split{grid-template-columns:1fr}}
+
+.gaterow{display:flex;align-items:center;gap:10px;margin:7px 0}
+.gaterow .nm{width:120px;font-size:12.5px;color:var(--ink2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gtrack{flex:1;height:8px;background:var(--surface2);border-radius:99px;overflow:hidden}
+.gfill{height:100%;background:var(--s1);border-radius:99px;transition:width .4s}
+.gfill.low{background:var(--crit)} .gfill.mid{background:var(--warn)}
+.gaterow .ct{width:62px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+
+.fnl{display:grid;grid-template-columns:118px 1fr 46px;gap:9px;align-items:center;margin:5px 0}
+.fnl .l{font-size:12.5px;color:var(--ink2)}
+.fnl .b{height:8px;background:var(--surface2);border-radius:99px;overflow:hidden}
+.fnl .b i{display:block;height:100%;background:var(--s2);border-radius:99px}
+.fnl .n{text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+
+.blank{padding:22px;text-align:center;color:var(--muted);font-size:13px;
+  background:var(--surface);border:1px dashed var(--border);border-radius:10px}
 </style>
 </head>
 <body>
@@ -95,7 +139,25 @@ button.act:disabled{opacity:.45;cursor:default}
 <main>
 
 <section class="view on" id="v-health">
-  <div class="cards" id="healthCards"></div>
+  <!-- ONE thing at the top, not seven. What is the system doing, and what does
+       it need from me? The old version gave "Unacked changes 0" the same visual
+       weight as "Mode PAPER", which is how a status page becomes wallpaper. -->
+  <div id="hero" class="hero"></div>
+
+  <div class="split">
+    <div>
+      <h2>Progress to live</h2>
+      <div id="gateSummary"></div>
+    </div>
+    <div>
+      <h2>Decisions <span class="note">last 24h</span></h2>
+      <div id="funnelMini"></div>
+    </div>
+  </div>
+
+  <h2>System <span class="note">detail</span></h2>
+  <div class="strip" id="healthCards"></div>
+
   <h2>Data freshness by asset class</h2>
   <table id="freshTable"><thead><tr><th>Asset class</th><th class="num">Newest bar age</th><th>State</th></tr></thead><tbody></tbody></table>
   <h2>News calendar</h2>
@@ -444,22 +506,112 @@ function plainBars(el,entries){const max=Math.max(...entries.map(e=>e.v),1);
     <span class="v">${e.v}</span></div>`).join('')||'<span class="note">no data</span>';}
 
 /* ---------- health ---------- */
+/* One sentence about what the system is doing, and the next action.
+   Ordered by severity: the first condition that matches wins, so the loudest
+   true thing is what you read. */
+function heroFor(h, venues, gate){
+  const nVen=(venues&&venues.venues||[]).length;
+  const armed=(venues&&venues.venues||[]).filter(v=>!v.read_only).length;
+  const cells=Object.entries((gate&&gate.cells)||{});
+  const closed=cells.reduce((a,[,c])=>a+((c.stats&&c.stats.n)||0),0);
+
+  if(h.db_integrity_suspect) return {t:'crit',s:'Database integrity is suspect',
+    b:`${esc(h.db_integrity_suspect)}. Nothing may be trusted from this database until it is resolved — run <code>hallucination_check.py</code> before acting on any number here.`,n:[]};
+
+  if(!h.engine_alive) return {t:'crit',s:'The engine is not running',
+    b:'No cycle heartbeat. Nothing is watching your positions, and no stop is being evaluated.',
+    n:['<code>docker compose ps</code> to see whether the container is up',
+       '<code>docker compose logs engine --tail 50</code> for why it stopped']};
+
+  if(h.halt_new_entries) return {t:'warn',s:'Entries are halted',
+    b:'The engine is running and managing whatever is already open, but it will not take new positions. Something closed the gate — a kill switch, reconciliation drift, or a container stop.',
+    n:['Check <b>Controls</b> for who closed it and why',
+       'Resume there once you have read the reason. Resuming is a human act, deliberately.']};
+
+  if(nVen===0) return {t:'warn',s:'No venue is connected',
+    b:'The engine is running and healthy, but it has no source of prices and nowhere to trade. It will sit here indefinitely doing nothing, which is correct and also useless.',
+    n:['Open <b>Venues</b> and add an exchange — start read-only, no arming',
+       'Use <b>Test reachability</b> first: it probes without credentials, so you can check the venue answers from where this runs',
+       'Confirm it shows <b>auth: yes</b> with your balances, then arm it as a separate step']};
+
+  if(!h.ea_connected && armed===0) return {t:'warn',s:'Connected, but nothing is armed',
+    b:`${nVen} venue${nVen===1?'':'s'} configured and all read-only. The engine can see prices but cannot act on them.`,
+    n:['Arm a venue in <b>Venues</b> when you are ready for it to trade',
+       'Arming is logged separately from adding, on purpose']};
+
+  if(closed===0) return {t:'good',s:'Running — waiting for the first closed trade',
+    b:'Everything is connected. The promotion gate needs 50 closed trades per strategy and asset class before live is even requestable, and there are none yet. This is the long pole; nothing else substitutes for it.',
+    n:['Leave it running. Check <b>Decisions</b> to see what it is deciding not to trade — that is usually more informative than the trades',
+       'Come back to <b>Progress to live</b> as the sample builds']};
+
+  return {t:'good',s:`Running — ${closed} closed trade${closed===1?'':'s'} in the sample`,
+    b:`Mode ${esc(String(h.trading_mode))}, ${h.open_trades} open, ${armed} venue${armed===1?'':'s'} armed.`,n:[]};
+}
+
 async function loadHealth(){
   const h=await GET('/api/health');
+  let venues=null,gate=null;
+  try{venues=await GET('/api/venues');}catch(e){}
+  try{gate=await GET('/api/studies/promotion');}catch(e){}
+
+  const hero=heroFor(h,venues,gate);
+  $('#hero').className='hero '+hero.t;
+  $('#hero').innerHTML=`<div class="state">${hero.s}</div>
+    <div class="because">${hero.b}</div>` +
+    (hero.n.length?`<div class="next"><div class="lbl">Next</div><ol>${
+      hero.n.map(x=>`<li>${x}</li>`).join('')}</ol></div>`:'');
+
+  // progress to live: the number that actually decides when this goes live
+  const cells=Object.entries((gate&&gate.cells)||{});
+  $('#gateSummary').innerHTML = cells.length ? cells.map(([k,c])=>{
+    const n=(c.stats&&c.stats.n)||0;
+    const need=(c.checks&&c.checks.sample_size&&c.checks.sample_size.required)||50;
+    const pct=Math.min(100,Math.round(n/need*100));
+    return `<div class="gaterow"><span class="nm" title="${esc(k)}">${esc(k)}</span>
+      <span class="gtrack"><i class="gfill ${pct<40?'low':pct<100?'mid':''}" style="width:${pct}%"></i></span>
+      <span class="ct">${n}/${need}</span></div>`;
+  }).join('') : `<div class="blank">No closed trades yet. Each strategy and asset
+      class needs ${'50'} before the gate will even consider live.</div>`;
+
+  // what it decided NOT to do: the data nothing else in this category shows
+  // funnel.by_stage is [{stage, action, n}], not flat counters. An earlier pass
+  // iterated the top-level numeric keys and rendered "since_hours 24" as if it
+  // were a decision stage.
+  try{
+    const d=await GET('/api/decisions?hours=24&limit=1');
+    const rows=(d.funnel&&d.funnel.by_stage||[])
+      .filter(r=>Number(r.n)>0)
+      .sort((a,b)=>b.n-a.n).slice(0,8);
+    const max=rows.length?Math.max(...rows.map(r=>r.n)):1;
+    $('#funnelMini').innerHTML = rows.length ? rows.map(r=>
+      `<div class="fnl">
+         <span class="l" title="${esc(r.stage)} / ${esc(r.action)}">${esc(r.stage)} <span class="note">${esc((r.action||'').replace(/_/g,' '))}</span></span>
+         <span class="b"><i style="width:${Math.round(r.n/max*100)}%"></i></span>
+         <span class="n">${r.n}</span></div>`).join('')
+      : `<div class="blank">Nothing decided yet. Every stand-aside and skip lands
+         here once prices are arriving — including the decisions NOT to trade,
+         which is the part nothing else shows you.</div>`;
+  }catch(e){ $('#funnelMini').innerHTML='<div class="blank">unavailable</div>'; }
+
+  const cell=(k,v,s,c)=>`<div class="cell"><div class="k">${k}</div>
+    <div class="v"${c?` style="color:${c}"`:''}>${v}</div>
+    <div class="s">${s||''}</div></div>`;
   const okc=(b,inv)=>b?(inv?'var(--crit)':'var(--good)'):(inv?'var(--good)':'var(--crit)');
   const engSub=h.engine_alive
-    ?(h.ea_connected?`cycle ${h.engine_last_seen_s}s ago`:'up — waiting for EA feed')
-    :(h.engine_last_seen_s!=null?`last seen ${ago(Date.now()/1000-h.engine_last_seen_s)} ago`:'never seen — is server.py running?');
+    ?(h.ea_connected?`cycle ${h.engine_last_seen_s}s ago`:'up, no EA feed')
+    :(h.engine_last_seen_s!=null?`last seen ${ago(Date.now()/1000-h.engine_last_seen_s)} ago`:'never seen');
   $('#healthCards').innerHTML=
-    statCard('Engine',h.engine_alive?'RUNNING':'DOWN',engSub,okc(h.engine_alive))+
-    statCard('EA feed',h.ea_connected?'LIVE':'NO FEED',
-      h.ea_feed_age_s!=null?`last push ${ago(Date.now()/1000-h.ea_feed_age_s)} ago`:'nothing received on this port yet',
-      okc(h.ea_connected))+
-    statCard('Mode',esc(String(h.trading_mode).toUpperCase()),'',h.trading_mode==='live'?'var(--warn)':'var(--s2)')+
-    statCard('New entries',h.halt_new_entries?'HALTED':'allowed','',okc(!h.halt_new_entries))+
-    statCard('DB integrity',h.db_integrity_suspect?'SUSPECT':'ok',esc(h.db_integrity_suspect||''),okc(!h.db_integrity_suspect))+
-    statCard('Open trades',h.open_trades,`${h.open_shadow} shadow`)+
-    statCard('Unacked changes',h.unacked_param_changes,'agent/sanity tuning',h.unacked_param_changes?'var(--warn)':undefined);
+    cell('Engine',h.engine_alive?'running':'DOWN',engSub,okc(h.engine_alive))+
+    cell('EA feed',h.ea_connected?'live':'none',
+      h.ea_feed_age_s!=null?`${ago(Date.now()/1000-h.ea_feed_age_s)} ago`:'MT5 not attached',
+      h.ea_connected?'var(--good)':'var(--muted)')+
+    cell('Mode',esc(String(h.trading_mode)),'',h.trading_mode==='live'?'var(--crit)':'var(--s2)')+
+    cell('Entries',h.halt_new_entries?'HALTED':'allowed','',okc(!h.halt_new_entries))+
+    cell('Integrity',h.db_integrity_suspect?'SUSPECT':'ok',esc(h.db_integrity_suspect||''),okc(!h.db_integrity_suspect))+
+    cell('Open',h.open_trades,`${h.open_shadow} shadow`)+
+    cell('Venues',(venues&&venues.venues||[]).length,
+      `${(venues&&venues.venues||[]).filter(v=>!v.read_only).length} armed`)+
+    cell('Unacked',h.unacked_param_changes,'tuning',h.unacked_param_changes?'var(--warn)':'var(--muted)');
   $('#unackBadge').style.display=h.unacked_param_changes?'':'none';
   $('#unackBadge').textContent=h.unacked_param_changes;
   const ft=$('#freshTable tbody');ft.innerHTML='';
