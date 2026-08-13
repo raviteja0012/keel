@@ -12,8 +12,22 @@
   --page:#0d0d0d; --surface:#1a1a19; --surface2:#222220;
   --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
   --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
-  --s1:#3987e5; --s2:#199e70; --neg:#e66767;
-  --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --crit:#d03b3b;
+  --s1:#3987e5; --s2:#199e70;
+
+  /* STATUS colours — how a system is behaving. Every one of these is checked
+     against --surface #1a1a19 for WCAG AA normal text (4.5:1).
+     --crit was #d03b3b at 3.62:1 and carried the words DOWN, HALTED and
+     SUSPECT at 15px, so the most urgent text on the page was the least
+     legible. --good was #0ca30c at 3.4:1. Both raised. */
+  --good:#3ec13e; --warn:#fab219; --serious:#ec835a; --crit:#ff6b6b;
+
+  /* P&L colours — which way money moved. Deliberately DIFFERENT tokens from
+     the status set even where the hue is close, because a green number was
+     ambiguous: healthy, or profitable? These are only ever a reinforcement;
+     every signed number also carries an explicit +/- and a direction glyph,
+     so the page reads correctly in greyscale and with red-green colour
+     deficiency (~8% of men). WCAG 1.4.1 forbids colour as the sole carrier. */
+  --pos:#4bbf73; --neg:#ff7b7b; --flat:var(--muted);
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--page);color:var(--ink);
@@ -40,8 +54,52 @@ table{width:100%;border-collapse:collapse;font-size:13px;background:var(--surfac
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--grid)}
 th{color:var(--muted);font-weight:500;font-size:12px}
 tr:last-child td{border-bottom:none}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
-.pos{color:var(--good)} .negt{color:var(--neg)}
+/* Tabular figures EVERYWHERE a number appears, not only in table cells.
+   Proportional digits make a value re-rendered every 15 seconds jitter
+   sideways, and the biggest numbers on the page were the ones missing it. */
+td.num,th.num,.num,.card .val,.strip .cell .v{
+  font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+td.num,th.num{text-align:right}
+
+.pos{color:var(--pos)} .negt{color:var(--neg)} .flat{color:var(--flat)}
+.dim{color:var(--muted)}
+/* The direction glyph. Small, low-emphasis, and the reason this page does not
+   depend on hue to tell a profit from a loss. */
+.sg{display:inline-block;width:.85em;margin-right:.15em;font-size:.8em;
+    opacity:.85;text-align:center}
+
+/* Failures are shown where the reader is looking, not in the console. */
+.err{background:rgba(255,107,107,0.09);border:1px solid var(--crit);
+     border-radius:8px;padding:12px 14px;color:var(--ink);margin:8px 0}
+
+/* Persistent mode bar. */
+.modebar{position:sticky;top:0;z-index:50;display:flex;align-items:center;
+  gap:12px;padding:7px 18px;font-size:13px;letter-spacing:.02em;
+  border-bottom:1px solid var(--border)}
+.modebar .mb-mode{font-weight:800;letter-spacing:.08em}
+.modebar .mb-detail{color:var(--ink2)}
+.modebar.paper{background:#16243a;color:#cfe0f7}
+.modebar.paper .mb-mode{color:#8fbcf5}
+.modebar.live{background:#4a1414;color:#ffd9d9}
+.modebar.live .mb-mode{color:#ff9b9b}
+.modebar.halted{background:#3d2c07;color:#ffe6b0}
+.modebar.halted .mb-mode{color:var(--warn)}
+.modebar.unknown{background:#242422;color:var(--ink2)}
+
+/* Keyboard users must be able to see where they are on a page whose buttons
+   include HALT and Arm. There was no focus style at all. */
+:focus-visible{outline:2px solid #8fbcf5;outline-offset:2px;border-radius:4px}
+
+/* Long tables keep their headers. Twelve unlabelled columns by row 40 is not
+   a table, it is a grid of unattributed numbers. */
+.tscroll{overflow:auto;max-height:70vh;border:1px solid var(--border);
+         border-radius:8px}
+.tscroll thead th{position:sticky;top:0;z-index:2;background:var(--surface2);
+                  box-shadow:0 1px 0 var(--border)}
+th[data-sort]{cursor:pointer;user-select:none}
+th[data-sort]:hover{color:var(--ink)}
+th[data-sort] .ind{opacity:.45;font-size:10px;margin-left:3px}
+th[aria-sort="ascending"] .ind,th[aria-sort="descending"] .ind{opacity:1}
 .pill{display:inline-block;padding:1px 8px;border-radius:6px;background:var(--surface2);
       font-size:12px;color:var(--ink2)}
 .barrow{display:flex;align-items:center;gap:10px;margin:3px 0}
@@ -120,6 +178,18 @@ button.act:disabled{opacity:.45;cursor:default}
 </style>
 </head>
 <body>
+<!-- The mode bar is persistent and sits above everything, on every view.
+     Mode used to appear once, as one of eight equal cells in a strip labelled
+     "System detail", on the Health view only — so nine of ten views gave a
+     reader no way to know whether they were looking at real money. That is
+     the most consequential fact on the page and it now cannot be navigated
+     away from. Colour is a reinforcement here, never the carrier: the word
+     itself says LIVE or PAPER. -->
+<div id="modebar" class="modebar unknown" role="status" aria-live="polite">
+  <span class="mb-mode" id="mbMode">MODE UNKNOWN</span>
+  <span class="mb-detail" id="mbDetail">reading engine state…</span>
+</div>
+
 <header>
   <h1>Keel · multi-asset</h1>
   <nav id="nav">
@@ -219,7 +289,8 @@ button.act:disabled{opacity:.45;cursor:default}
       <select id="vMarket"><option value="spot">spot</option><option value="swap">swap</option><option value="future">future</option></select>
     </div>
     <div class="row">
-      <input type="text" id="vKey" placeholder="API key" style="width:230px">
+      <input type="password" id="vKey" placeholder="API key" autocomplete="off"
+             spellcheck="false" style="width:230px">
       <input type="password" id="vSecret" placeholder="API secret" style="width:230px">
       <input type="password" id="vPass" placeholder="passphrase (okx, kucoin)" style="width:180px">
     </div>
@@ -242,6 +313,12 @@ button.act:disabled{opacity:.45;cursor:default}
 </section>
 
 <section class="view" id="v-exposure">
+  <div class="filters">
+    <label for="exMode">Mode</label>
+    <select id="exMode"><option value="paper">paper</option><option value="live">live</option></select>
+    <span class="note">This view used to request paper exposure unconditionally,
+      so in live mode it showed the wrong book while looking correct.</span>
+  </div>
   <h2>Net factor-bucket exposure <span class="note">(risk-weighted units · amber line = cap)</span></h2>
   <div class="chartbox" id="bucketBars"></div>
   <h2>Open positions per asset class</h2>
@@ -315,7 +392,7 @@ button.act:disabled{opacity:.45;cursor:default}
   <h2>Kill switch</h2>
   <div class="row">
     <button class="act danger" onclick="halt(true)">HALT new entries</button>
-    <button class="act ghost" onclick="halt(false)">Resume</button>
+    <button class="act ghost" onclick="resumeEntries()">Resume…</button>
     <span class="note" id="haltState"></span>
   </div>
 
@@ -329,20 +406,165 @@ button.act:disabled{opacity:.45;cursor:default}
 
 </main>
 <script>
-const $=q=>document.querySelector(q), fmt=(x,d=2)=>x==null?'—':Number(x).toFixed(d);
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const ago=t=>{if(!t)return '—';const s=Math.max(0,Date.now()/1000-t);
-  return s<90?`${s|0}s`:s<5400?`${s/60|0}m`:s<172800?`${(s/3600).toFixed(1)}h`:`${(s/86400).toFixed(1)}d`;};
+const $=q=>document.querySelector(q);
+
+/* ---------- formatting -------------------------------------------------
+   Rules this file follows, because a trading readout that lies quietly is
+   worse than one that is ugly:
+     - a value we do not have renders as an em dash, never as 0 and never as
+       the strings "NaN" or "Infinity", both of which used to reach P&L cells
+     - sign is never carried by colour alone (WCAG 1.4.1). Every signed number
+       gets an explicit +/- and a direction glyph, so it reads correctly in
+       greyscale and to the ~8% of men with red-green colour deficiency
+     - prices are formatted by magnitude, not by a hardcoded 5 decimals, which
+       printed BTC as 67432.00000                                        */
+const FIN=x=>x!=null&&x!==''&&Number.isFinite(Number(x));
+const fmt=(x,d=2)=>FIN(x)?Number(x).toFixed(d):'—';
+const int=x=>FIN(x)?Number(x).toLocaleString('en-US',{maximumFractionDigits:0}):'—';
+const pct=(x,d=1)=>FIN(x)?Number(x).toFixed(d)+'%':'—';
+
+/* Price precision follows magnitude, because a single hardcoded 5 was right
+   for EURUSD and wrong for everything else: it printed BTC as 67432.00000,
+   padding three meaningless zeros and pushing the significant digits left.
+     >=1000  BTC 67432.10, XAU 2650.45      -> 2
+     >=100   USDJPY 148.234                 -> 3
+     >=10    XAG 31.4210                    -> 4
+     >=0.01  EURUSD 1.08432 (pipettes)      -> 5
+     else    small-cap crypto               -> 8                            */
+const price=x=>{if(!FIN(x))return '—';const a=Math.abs(Number(x));
+  return Number(x).toFixed(a>=1000?2:a>=100?3:a>=10?4:a>=0.01?5:8);};
+
+/* A signed number with a non-colour cue. Returns HTML. */
+const signed=(x,d=2,unit='')=>{
+  if(!FIN(x))return '<span class="num dim">—</span>';
+  const n=Number(x), k=n>0?'pos':n<0?'negt':'flat', g=n>0?'▲':n<0?'▼':'–';
+  return `<span class="num ${k}"><span class="sg" aria-hidden="true">${g}</span>`
+       + `${n>0?'+':''}${n.toFixed(d)}${unit}</span>`;};
+
+/* esc() must also escape the single quote and the backtick. Venue names are
+   free text and are interpolated into single-quoted inline handlers such as
+   armVenue('NAME',true); without this, a venue called  ',this)//  is script
+   injection into a page that holds the control token. */
+const esc=s=>String(s??'').replace(/[&<>"'`]/g,c=>({'&':'&amp;','<':'&lt;',
+  '>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
+
+/* ago() must NOT clamp at zero. A future timestamp means the clock is skewed,
+   and rendering it as "0s" reports the freshest possible reading at exactly
+   the moment the data is least trustworthy. This is the same defect as
+   engine.py's `fresh = age <= max_age` with no lower bound, which shipped.  */
+const ago=t=>{if(!t)return '—';const s=Date.now()/1000-t;
+  if(s<-1)return `+${Math.abs(s)|0}s ahead`;
+  const a=Math.abs(s);
+  return a<90?`${a|0}s`:a<5400?`${a/60|0}m`:a<172800?`${(a/3600).toFixed(1)}h`
+       :`${(a/86400).toFixed(1)}d`;};
+const skewed=t=>!!t&&(Date.now()/1000-t)<-1;
+
 const tok=()=>$('#token').value.trim();
 $('#token').value=localStorage.getItem('dashTok')||'';
 $('#token').addEventListener('change',()=>localStorage.setItem('dashTok',tok()));
+
 async function GET(u){const r=await fetch(u);if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
-async function POST(u,body){const r=await fetch(u,{method:'POST',
-  headers:{'Content-Type':'application/json','X-Dashboard-Token':tok()},
-  body:body?JSON.stringify(body):null});
-  const j=await r.json().catch(()=>({}));
-  if(r.status===401){alert('Control token missing/invalid — set it in Controls.');throw new Error('401');}
-  return j;}
+
+/* POST used to swallow every failure except 401 and return {}. Callers test
+   `if(!r)` — and {} is truthy — so a 500 reported success for a request that
+   was never persisted. Anything that is not ok now throws, and the caller
+   decides. Silence is not consent. */
+async function POST(u,body){
+  let r;
+  try{
+    r=await fetch(u,{method:'POST',
+      headers:{'Content-Type':'application/json','X-Dashboard-Token':tok()},
+      body:body?JSON.stringify(body):null});
+  }catch(e){throw new Error('network failure: '+e.message);}
+  const j=await r.json().catch(()=>null);
+  if(r.status===401){alert('Control token missing or invalid — set it in Controls.');
+    throw new Error('401 unauthorised');}
+  if(!r.ok){
+    const d=(j&&(j.detail||j.error||j.message))||('HTTP '+r.status);
+    throw new Error(String(d).slice(0,300));}
+  return j??{};}
+
+/* Report a failure where the user is looking, rather than in the console. */
+function fail(sel,e){const el=$(sel);if(!el)return;
+  el.innerHTML=`<div class="err" role="alert"><b>Could not load.</b> `
+    +`${esc(e&&e.message||e)}<br><span class="note">This panel is showing `
+    +`nothing because the request failed — not because there is nothing to `
+    +`show.</span></div>`;}
+
+/* ---------- the mode bar -----------------------------------------------
+   Refreshed on its own timer regardless of which view is open, because the
+   old page only refreshed the Health view and a reader could sit on Trades
+   for an hour while the engine went live, halted, or died underneath them. */
+function paintMode(h){
+  const bar=$('#modebar'),m=$('#mbMode'),d=$('#mbDetail');
+  if(!h){bar.className='modebar unknown';m.textContent='MODE UNKNOWN';
+    d.textContent='the engine did not answer — assume nothing';return;}
+  const mode=String(h.trading_mode||'').toLowerCase();
+  const live=mode==='live';
+  if(h.halt_new_entries){
+    bar.className='modebar halted';
+    m.textContent=(live?'LIVE':'PAPER')+' · ENTRIES HALTED';
+    d.textContent='managing open positions; taking no new ones';
+  }else if(live){
+    bar.className='modebar live';
+    m.textContent='LIVE — REAL MONEY';
+    d.textContent=`${int(h.open_trades)} open · orders placed here are real`;
+  }else if(mode){
+    bar.className='modebar paper';
+    m.textContent='PAPER';
+    d.textContent=`${int(h.open_trades)} open · simulated, no orders leave this machine`;
+  }else{
+    bar.className='modebar unknown';m.textContent='MODE UNKNOWN';
+    d.textContent='the engine did not report a trading mode';
+  }
+  if(!h.engine_alive){bar.className='modebar unknown';
+    m.textContent='ENGINE NOT RUNNING';
+    d.textContent='no heartbeat — nothing is watching your positions';}
+}
+async function tickMode(){try{paintMode(await GET('/api/health'));}
+                          catch(e){paintMode(null);}}
+
+/* ---------- dangerous actions ------------------------------------------
+   Resume after a kill switch was a single unconfirmed click, while the hero
+   copy two panels away read "Resuming is a human act, deliberately." Typing
+   the word is the cheapest way to make the hand agree with the sentence. */
+function confirmPhrase(word,what){
+  const got=prompt(`${what}\n\nType ${word} to confirm.`);
+  return got!==null&&got.trim().toUpperCase()===word;
+}
+async function resumeEntries(){
+  if(!confirmPhrase('RESUME',
+    'This lets the engine take new positions again.\n\n'
+   +'Something closed this gate — a kill switch, reconciliation drift, or a '
+   +'stop. Read the reason in the activity log below before you reopen it.'))return;
+  try{await POST('/api/commands',{command:'halt_new_entries',value:false});
+      await loadControls();await tickMode();}
+  catch(e){alert('Resume failed: '+e.message);}
+}
+
+/* ---------- sortable tables --------------------------------------------
+   Click a header to sort. Numeric columns sort numerically; an em dash is
+   always least, so "unknown" never sorts as a large or small value.        */
+function sortable(tableSel){
+  const t=$(tableSel);if(!t||t.dataset.sortable)return;t.dataset.sortable='1';
+  t.querySelectorAll('thead th').forEach((th,i)=>{
+    th.dataset.sort='';th.insertAdjacentHTML('beforeend','<span class="ind">▲▼</span>');
+    th.onclick=()=>{
+      const asc=th.getAttribute('aria-sort')!=='ascending';
+      t.querySelectorAll('thead th').forEach(o=>o.removeAttribute('aria-sort'));
+      th.setAttribute('aria-sort',asc?'ascending':'descending');
+      const body=t.tBodies[0],rows=[...body.rows];
+      const num=th.classList.contains('num');
+      rows.sort((a,b)=>{
+        const av=(a.cells[i]?.innerText||'').trim(),bv=(b.cells[i]?.innerText||'').trim();
+        if(num){
+          const an=parseFloat(av.replace(/[^0-9.+-]/g,'')),bn=parseFloat(bv.replace(/[^0-9.+-]/g,''));
+          const aok=Number.isFinite(an),bok=Number.isFinite(bn);
+          if(!aok&&!bok)return 0; if(!aok)return 1; if(!bok)return -1;  /* unknown sinks */
+          return asc?an-bn:bn-an;}
+        return asc?av.localeCompare(bv):bv.localeCompare(av);});
+      rows.forEach(r=>body.appendChild(r));};});
+}
 
 /* ---------- nav ---------- */
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
@@ -383,7 +605,7 @@ async function loadVenues(){
         <td>${h.reachable?'<span class="pos">yes</span>':'<span class="negt">no</span>'}</td>
         <td>${h.authenticated?'<span class="pos">yes</span>':(v.api_key?'<span class="negt">failed</span>':'<span class="note">no key</span>')}</td>
         <td class="num">${h.latency_ms??'—'}${h.latency_ms?'ms':''}</td>
-        <td class="num"${skewBad?' class="negt"':''}>${skew}</td>
+        <td class="num${skewBad?' negt':''}">${skew}</td>
         <td>${v.read_only
               ? `<span class="pill">read-only</span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',true)">Arm</button>`
               : `<span class="negt"><b>ARMED</b></span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',false)">Disarm</button>`}</td>
@@ -509,7 +731,8 @@ function plainBars(el,entries){const max=Math.max(...entries.map(e=>e.v),1);
 /* One sentence about what the system is doing, and the next action.
    Ordered by severity: the first condition that matches wins, so the loudest
    true thing is what you read. */
-function heroFor(h, venues, gate){
+function heroFor(h, venues, gate, broke){
+  broke=broke||[];
   const nVen=(venues&&venues.venues||[]).length;
   const armed=(venues&&venues.venues||[]).filter(v=>!v.read_only).length;
   const cells=Object.entries((gate&&gate.cells)||{});
@@ -527,6 +750,21 @@ function heroFor(h, venues, gate){
     b:'The engine is running and managing whatever is already open, but it will not take new positions. Something closed the gate — a kill switch, reconciliation drift, or a container stop.',
     n:['Check <b>Controls</b> for who closed it and why',
        'Resume there once you have read the reason. Resuming is a human act, deliberately.']};
+
+  /* Everything below reads venues and the promotion gate. If either request
+     failed, those arrive as null and count as zero — and a zero here reads as
+     GOOD NEWS: "no venues configured yet", "no closed trades yet". A failed
+     request would paint a green all-clear.
+
+     That is the same shape as the four fail-open defects already fixed in the
+     engine, so it gets the same answer: an absence we could not verify is not
+     an absence. We say we cannot see, and we stop. */
+  if(broke.length) return {t:'warn',s:'Cannot see the whole picture',
+    b:`The engine answered, but ${broke.map(esc).join(' and ')} did not. `
+     +`Whatever this page shows below is incomplete, and the parts that look `
+     +`empty may not be empty — they may just be unread.`,
+    n:['Reload. If it persists, <code>docker compose logs dashboard --tail 50</code>',
+       'Do not read a blank panel as "nothing there" until this clears']};
 
   if(nVen===0) return {t:'warn',s:'No venue is connected',
     b:'The engine is running and healthy, but it has no source of prices and nowhere to trade. It will sit here indefinitely doing nothing, which is correct and also useless.',
@@ -550,11 +788,15 @@ function heroFor(h, venues, gate){
 
 async function loadHealth(){
   const h=await GET('/api/health');
-  let venues=null,gate=null;
-  try{venues=await GET('/api/venues');}catch(e){}
-  try{gate=await GET('/api/studies/promotion');}catch(e){}
+  /* Independent calls, so fetch them together rather than in series — and
+     record WHICH failed instead of discarding the fact. */
+  let venues=null,gate=null;const broke=[];
+  const [rv,rg]=await Promise.allSettled([GET('/api/venues'),
+                                          GET('/api/studies/promotion')]);
+  if(rv.status==='fulfilled')venues=rv.value; else broke.push('the venue list');
+  if(rg.status==='fulfilled')gate=rg.value;   else broke.push('the promotion gate');
 
-  const hero=heroFor(h,venues,gate);
+  const hero=heroFor(h,venues,gate,broke);
   $('#hero').className='hero '+hero.t;
   $('#hero').innerHTML=`<div class="state">${hero.s}</div>
     <div class="because">${hero.b}</div>` +
@@ -615,11 +857,25 @@ async function loadHealth(){
   $('#unackBadge').style.display=h.unacked_param_changes?'':'none';
   $('#unackBadge').textContent=h.unacked_param_changes;
   const ft=$('#freshTable tbody');ft.innerHTML='';
+  /* The limit is the limit. This used to test `a > lim*2`, so a class was only
+     called stale after FOUR hours against a two-hour policy, and a 3h59m-old
+     bar showed a green dot labelled "fresh". A warn band sits below the limit
+     rather than above it. */
   const lim={crypto:2*3600,forex:2*3600,metals:2*3600,indices:2*3600,energies:2*3600};
-  Object.entries(h.newest_bar_age_s_by_class||{}).forEach(([c,a])=>{
-    const bad=a>(lim[c]||7200)*2;
-    ft.insertAdjacentHTML('beforeend',`<tr><td>${esc(c)}</td><td class="num">${ago(Date.now()/1000-a)}</td>
-      <td><span class="status"><span class="dot" style="background:${bad?'var(--crit)':'var(--good)'}"></span>${bad?'stale':'fresh'}</span></td></tr>`);});
+  const rows=Object.entries(h.newest_bar_age_s_by_class||{});
+  if(!rows.length){
+    ft.innerHTML=`<tr><td colspan="3" class="dim">No bar ages reported. `
+      +`That is not the same as "bars are fresh" — the engine has not published `
+      +`this field.</td></tr>`;
+  }
+  rows.forEach(([c,a])=>{
+    const L=lim[c]||7200, ageOk=FIN(a);
+    const st=!ageOk?['dim','unknown']:a<0?['crit','clock skew']
+            :a>L?['crit','stale']:a>L*0.75?['warn','ageing']:['good','fresh'];
+    ft.insertAdjacentHTML('beforeend',
+      `<tr><td>${esc(c)}</td><td class="num">${ageOk?ago(Date.now()/1000-a):'—'}</td>
+       <td><span class="status"><span class="dot" style="background:var(--${st[0]})"></span>${st[1]}
+       <span class="dim"> · limit ${(L/3600).toFixed(0)}h</span></span></td></tr>`);});
   const cal=h.news_calendar||{};
   $('#calBox').innerHTML=`blackout policy on stale: <b>${esc(cal.on_stale||'?')}</b> ·
     calendar ${cal.calendar_stale?'<span class="negt">STALE</span>':'fresh'} ·
@@ -689,10 +945,13 @@ async function loadTrades(){
 
 /* ---------- exposure ---------- */
 async function loadExposure(){
-  const ex=await GET('/api/studies/exposure?mode=paper');
-  divergingBars($('#bucketBars'),Object.entries(ex.buckets||{}).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
-    .map(([k,v])=>({k,v})),ex.cap);
-  plainBars($('#classBars'),Object.entries(ex.by_class||{}).map(([k,v])=>({k,v})));
+  const m=$('#exMode').value;
+  try{
+    const ex=await GET('/api/studies/exposure?mode='+encodeURIComponent(m));
+    divergingBars($('#bucketBars'),Object.entries(ex.buckets||{}).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
+      .map(([k,v])=>({k,v})),ex.cap);
+    plainBars($('#classBars'),Object.entries(ex.by_class||{}).map(([k,v])=>({k,v})));
+  }catch(e){fail('#bucketBars',e);$('#classBars').innerHTML='';}
 }
 
 /* ---------- regime & session ---------- */
@@ -878,7 +1137,20 @@ setInterval(()=>{if($('#v-health').classList.contains('on'))loadHealth();},15000
 ['perfMode','perfDays'].forEach(id=>$('#'+id).onchange=loadPerf);
 ['rsMode','rsDays'].forEach(id=>$('#'+id).onchange=loadRegime);
 $('#ddMode').onchange=loadDrawdown;
+$('#exMode').onchange=loadExposure;
 window.addEventListener('resize',()=>drawEq());
+
+/* Every long table gets sticky headers and click-to-sort. */
+['#trTable','#venPos','#decTable','#sessTable','#regTable','#calTable',
+ '#freshTable','#actTable'].forEach(sel=>{
+  const t=$(sel);if(!t)return;
+  if(!t.parentElement.classList.contains('tscroll')){
+    const w=document.createElement('div');w.className='tscroll';
+    t.parentNode.insertBefore(w,t);w.appendChild(t);}
+  sortable(sel);});
+
+/* The mode bar runs on its own clock, independent of the open view. */
+tickMode();setInterval(tickMode,10000);
 loadHealth();
 </script>
 </body>
