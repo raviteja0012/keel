@@ -20,7 +20,8 @@ Two properties are mandatory for anything that touches real money:
                 does not let the engine trade it.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Protocol, runtime_checkable
+from typing import (Any, Dict, Iterator, List, NamedTuple, Optional, Protocol,
+                    runtime_checkable)
 
 
 class VenueError(RuntimeError):
@@ -45,6 +46,53 @@ class VenueError(RuntimeError):
 
 class VenueReadOnly(VenueError):
     """Trading was attempted on a venue that has not been enabled for it."""
+
+
+class VenueIndeterminate(VenueError):
+    """We do not know whether the order exists, and therefore must not act.
+
+    This is the exception that keeps the promise made by `idempotency` below.
+    It is raised when a submission may or may not have landed and the probe
+    that would settle it could not be completed. It is deliberately NOT
+    retryable: a retry is exactly the action that turns "might have landed"
+    into two positions.
+
+    The only correct responses are to reconcile against the venue, or to ask
+    a human. Both are slower than a retry. Both are cheaper than a double fill.
+    """
+
+    def __init__(self, message: str, venue: str = "",
+                 cause: Optional[BaseException] = None,
+                 http_status: Optional[int] = None,
+                 client_order_id: str = ""):
+        super().__init__(message, retryable=False, venue=venue, cause=cause,
+                         http_status=http_status)
+        self.client_order_id = client_order_id
+
+
+# The idempotency probe has exactly three answers, and "indeterminate" is not a
+# spelling of "absent". Every adapter that probes before or after submitting
+# MUST use this vocabulary rather than Optional[Dict], because Optional collapses
+# "the venue says no such order" and "I could not find out" into one value —
+# and an adapter reading the second as the first is the single most expensive
+# bug this codebase has produced. It shipped in webull (disarmed) and again in
+# ccxt_venue (fixed), both times undetected by a full green test suite.
+PROBE_FOUND = "found"
+PROBE_ABSENT = "absent"
+PROBE_INDETERMINATE = "indeterminate"
+
+
+class Probe(NamedTuple):
+    outcome: str                       # PROBE_FOUND | PROBE_ABSENT | PROBE_INDETERMINATE
+    order: Optional[Dict[str, Any]] = None   # only ever set for PROBE_FOUND
+    reason: str = ""                   # why, in words, for the refusal message
+    retryable: bool = False            # is the *cause* of indeterminacy transient
+
+    @property
+    def is_absent(self) -> bool:
+        """True only for a definite venue-confirmed absence. Read this rather
+        than `not probe.order`, which is true for indeterminate too."""
+        return self.outcome == PROBE_ABSENT
 
 
 @dataclass(frozen=True)

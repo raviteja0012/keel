@@ -17,8 +17,10 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import ccxt
 
-from . import (Balance, BrokerAdapter, Order, OrderResult, Position, SymbolMeta,
-               Tick, VenueError, VenueHealth, VenueReadOnly, register)
+from . import (PROBE_ABSENT, PROBE_FOUND, PROBE_INDETERMINATE, Balance,
+               BrokerAdapter, Order, OrderResult, Position, Probe, SymbolMeta,
+               Tick, VenueError, VenueHealth, VenueIndeterminate, VenueReadOnly,
+               register)
 
 # Exchanges known to honour clientOrderId on order creation. For anything not
 # listed we still send it, but we do not TRUST it for idempotency and take the
@@ -178,16 +180,44 @@ class CcxtVenue:
         return out
 
     # --------------------------------------------------------------- writes
-    def _find_by_client_id(self, client_order_id: str, vs: str) -> Optional[Dict]:
-        """Has this client_order_id already been placed? The idempotency check."""
-        for fetch in (self._x.fetch_open_orders, self._x.fetch_closed_orders):
+    def _find_by_client_id(self, client_order_id: str, vs: str) -> Probe:
+        """Has this client_order_id already been placed? The idempotency check.
+
+        Returns a three-state Probe, never Optional. The previous version
+        swallowed every exception and returned None, so a probe that could not
+        reach the exchange was indistinguishable from one that reached it and
+        was told "no such order". place_order then reported "order not found on
+        venue" with retryable=True, inviting the caller to submit again — the
+        one action guaranteed to double-fill if the first request had landed.
+
+        Both order books must answer. An order that is neither open nor closed
+        is absent; an order we could not ask about is unknown, and unknown is
+        not a kind of no.
+        """
+        errors: List[str] = []
+        retryable = False
+        for label, fetch in (("open", self._x.fetch_open_orders),
+                             ("closed", self._x.fetch_closed_orders)):
             try:
                 for o in fetch(vs, limit=50) or []:
                     if (o.get("clientOrderId") or "") == client_order_id:
-                        return o
-            except Exception:
-                continue
-        return None
+                        return Probe(PROBE_FOUND, order=o,
+                                     reason="matched in %s orders" % label)
+            except ccxt.NotSupported as e:
+                # The exchange cannot answer this question at all. That is a
+                # permanent property of the venue, not a transient failure.
+                errors.append("%s orders: not supported (%s)" % (label, e))
+            except _RETRYABLE as e:
+                errors.append("%s orders: %s" % (label, e))
+                retryable = True
+            except Exception as e:                       # noqa: BLE001
+                errors.append("%s orders: %s" % (label, e))
+
+        if errors:
+            return Probe(PROBE_INDETERMINATE,
+                         reason="; ".join(errors), retryable=retryable)
+        return Probe(PROBE_ABSENT,
+                     reason="not present in open or closed orders")
 
     def place_order(self, order: Order) -> OrderResult:
         if self.read_only:
@@ -199,10 +229,19 @@ class CcxtVenue:
         # Idempotency. On venues we do not trust to honour clientOrderId we look
         # first: a retry after a dropped response must not open a second position.
         if self.exchange_id not in _TRUSTED_CLIENT_ID:
-            existing = self._find_by_client_id(order.client_order_id, vs)
-            if existing:
-                return self._to_result(order.client_order_id, existing,
+            probe = self._find_by_client_id(order.client_order_id, vs)
+            if probe.outcome == PROBE_FOUND:
+                return self._to_result(order.client_order_id, probe.order,
                                        "recovered existing order (idempotent retry)")
+            if probe.outcome == PROBE_INDETERMINATE:
+                # We cannot prove this order is not already there, and this
+                # venue is not trusted to enforce the key itself. Submitting
+                # now is a coin-flip on a duplicate position, so we stand aside.
+                raise VenueIndeterminate(
+                    "%s: cannot verify whether %s was already placed, refusing "
+                    "to submit (%s)" % (self.name, order.client_order_id,
+                                        probe.reason),
+                    venue=self.name, client_order_id=order.client_order_id)
 
         params: Dict[str, Any] = {"clientOrderId": order.client_order_id}
         if order.reduce_only:
@@ -217,12 +256,28 @@ class CcxtVenue:
                                        order.qty, order.limit_price, params)
         except _RETRYABLE as e:
             # The request may or may not have landed. Never blind-retry: look.
-            existing = self._find_by_client_id(order.client_order_id, vs)
-            if existing:
-                return self._to_result(order.client_order_id, existing,
+            probe = self._find_by_client_id(order.client_order_id, vs)
+            if probe.outcome == PROBE_FOUND:
+                return self._to_result(order.client_order_id, probe.order,
                                        "order landed despite transport error")
-            raise VenueError("network error, order not found on venue: %s" % e,
-                             retryable=True, venue=self.name, cause=e)
+            if probe.is_absent:
+                # The venue answered, and answered no. Nothing landed, so a
+                # retry is genuinely safe. This is the ONLY branch that may
+                # say retryable.
+                raise VenueError(
+                    "network error, venue confirms order not placed: %s" % e,
+                    retryable=True, venue=self.name, cause=e)
+            # Indeterminate. The order may be live on the exchange right now.
+            # Retrying could double it; reporting failure could strand it. The
+            # honest answer is that we do not know, said loudly enough that a
+            # reconciler or a human resolves it.
+            raise VenueIndeterminate(
+                "%s: order %s may or may not have been placed — transport "
+                "failed (%s) and the probe could not settle it (%s). Reconcile "
+                "against the venue before any retry."
+                % (self.name, order.client_order_id, e, probe.reason),
+                venue=self.name, cause=e,
+                client_order_id=order.client_order_id)
         except ccxt.BaseError as e:
             raise VenueError(str(e), venue=self.name, cause=e)
 

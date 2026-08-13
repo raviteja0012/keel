@@ -39,26 +39,28 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip -r requirements.txt
 
-      - name: Risk rails and circuit breakers
-        run: python tests/test_risk_rails.py
-
-      - name: Execution flow through the shared rails
-        run: python tests/test_execution_flow.py
-
-      - name: Live-promotion gate
-        run: python tests/test_live_switch.py
-
-      - name: Regime and news adaptation
-        run: python tests/test_news_regime.py
-
-      - name: Dashboard and analysis library
-        run: python tests/test_dashboard.py
-
-      - name: Strategy plugin registry
-        run: python tests/test_strategy_registry.py
-
-      - name: External-signal webhook
-        run: python tests/test_tv_webhook.py
+      # Discovered, not listed. This step used to name seven files by hand, and
+      # eight others — including every broker-adapter suite — were therefore
+      # never run in CI. Adding a test file is not supposed to be a two-part
+      # job where forgetting the second part fails silently and looks green.
+      #
+      # Each file is run in its own process on purpose: they are scripts, not
+      # pytest modules, and several set TRADING_DB at import time.
+      - name: Every test suite in tests/
+        run: |
+          set -u
+          failed=""
+          shopt -s nullglob
+          for f in tests/test_*.py; do
+            echo "::group::$f"
+            if python "$f"; then echo "PASS $f"; else failed="$failed $f"; fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failing suites:$failed"
+            exit 1
+          fi
+          echo "all suites passed"
 
       - name: Compile-check every module
         run: python -m compileall -q . ../hallucination_check.py
