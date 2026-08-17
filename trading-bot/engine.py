@@ -43,6 +43,11 @@ try:
     _VENUES_AVAILABLE = True
 except ImportError:                            # optional: no venue kind installed
     _VENUES_AVAILABLE = False
+try:
+    import hosts as _hosts                     # strategy-host registry (their bots, our risk)
+    _HOSTS_AVAILABLE = True
+except ImportError:                            # optional: no host kind installed
+    _HOSTS_AVAILABLE = False
 
 # Smallest position that can actually be halved at TP1. The live path already
 # gates its partial close on this (0.01 lots cannot be split), so paper must model
@@ -1091,6 +1096,36 @@ def loss_limits_hit(mode: str, balance: float, p: Dict) -> Optional[str]:
                 % (unvalued, "" if unvalued == 1 else "s"))
 
     open_dd = min(0.0, open_pnl)
+
+    # Hosted bots (3Commas / Cryptohopper / Altrady) are real money whichever
+    # mode Keel itself is in, but they only gate the LIVE switches: a paper
+    # entry risks nothing, so a hosted drawdown has no business halting it.
+    # In live mode their unrealized losses stack onto open drawdown under the
+    # same two rules as our own book: profit never offsets, and a bot we
+    # cannot value — or a host we cannot reach — is not a bot worth zero.
+    # hosts.exposure() is cached (60s TTL), so this is not a network call per
+    # cycle, and with no hosts configured it is a dict literal.
+    if mode == "live" and _HOSTS_AVAILABLE:
+        hx = _hosts.exposure()
+        if not hx.get("trustworthy", False):
+            n_unread = int(hx.get("unreadable_hosts") or 0)
+            n_unval = int(hx.get("unvalued_bots") or 0)
+            return ("hosted-bot exposure is unknown (%d host%s unreadable, "
+                    "%d bot%s unvalued) — total drawdown cannot be computed, "
+                    "so new entries stand aside%s"
+                    % (n_unread, "" if n_unread == 1 else "s",
+                       n_unval, "" if n_unval == 1 else "s",
+                       (": " + hx["detail"]) if hx.get("detail") else ""))
+        # No `or 0.0` here on purpose: trustworthy=True promises a real
+        # number, and if that promise is ever broken we want the loud
+        # TypeError, not a silent zero — the zero is how the last four
+        # fail-open defects hid.
+        hosted_pnl = hx["unrealized_pnl"]
+        if hosted_pnl is None:
+            return ("hosted-bot exposure reported trustworthy but carries no "
+                    "P&L value — refusing to treat that as zero; new entries "
+                    "stand aside")
+        open_dd += min(0.0, float(hosted_pnl))
     if _pnl_since(mode, day0) + open_dd <= -balance * p["daily_stop_pct"] / 100:
         return "daily stop (-%.1f%%) hit" % p["daily_stop_pct"]
     if _pnl_since(mode, week0) + open_dd <= -balance * p["weekly_stop_pct"] / 100:

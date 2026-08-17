@@ -462,6 +462,94 @@ def api_venue_delete(name: str):
     return {"ok": venues.remove(name)}
 
 
+# ------------------------------------------------------------- strategy hosts
+# Same shape and same rules as venues: reads open, every state change
+# token-gated, and arming bot control a separate act from adding credentials.
+# A host is NOT a venue — Keel never places orders through one; it starts and
+# stops the host's own bots and counts their positions as money at risk.
+@app.get("/api/hosts")
+def api_hosts():
+    import hosts
+    from brokers import strategy_host
+    return {"hosts": hosts.list_hosts(), "kinds": strategy_host.host_kinds(),
+            "health": hosts.health_all()}
+
+
+@app.get("/api/hosts/bots")
+def api_hosts_bots():
+    """Every bot on every configured host. Error rows are rows, not omissions:
+    a host that cannot answer must not look like a host with no bots."""
+    import hosts
+    return {"bots": hosts.bots_all()}
+
+
+@app.get("/api/hosts/exposure")
+def api_hosts_exposure():
+    """The same snapshot the live kill switches read, unvalued counts and all."""
+    import hosts
+    return hosts.exposure()
+
+
+@app.post("/api/hosts", dependencies=[Depends(require_token)])
+def api_host_upsert(body: Dict[str, Any] = Body(...)):
+    import hosts
+    try:
+        h = hosts.upsert(body)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "host": h, "health": hosts.health(h["name"])}
+
+
+@app.post("/api/hosts/{name}/test", dependencies=[Depends(require_token)])
+def api_host_test(name: str):
+    import hosts
+    return {"health": hosts.health(name)}
+
+
+@app.post("/api/hosts/{name}/control", dependencies=[Depends(require_token)])
+def api_host_control(name: str, body: Dict[str, Any] = Body(...)):
+    """Arm or disarm bot control. Starting someone's grid bot commits real
+    money, so pasting a key and enabling control stay two separate acts."""
+    import hosts
+    try:
+        return {"ok": True, "host": hosts.set_control_enabled(
+            name, bool(body.get("enabled", False)))}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/hosts/{name}/delete", dependencies=[Depends(require_token)])
+def api_host_delete(name: str):
+    import hosts
+    return {"ok": hosts.remove(name)}
+
+
+@app.post("/api/hosts/{name}/bots/{bot_id}/start",
+          dependencies=[Depends(require_token)])
+def api_host_bot_start(name: str, bot_id: str):
+    import hosts
+    from brokers.strategy_host import HostError, HostReadOnly
+    try:
+        return {"ok": True, "action": hosts.start_bot(name, bot_id)}
+    except HostReadOnly as e:
+        raise HTTPException(403, str(e))
+    except (HostError, ValueError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/hosts/{name}/bots/{bot_id}/stop",
+          dependencies=[Depends(require_token)])
+def api_host_bot_stop(name: str, bot_id: str):
+    import hosts
+    from brokers.strategy_host import HostError, HostReadOnly
+    try:
+        return {"ok": True, "action": hosts.stop_bot(name, bot_id)}
+    except HostReadOnly as e:
+        raise HTTPException(403, str(e))
+    except (HostError, ValueError) as e:
+        raise HTTPException(400, str(e))
+
+
 # ------------------------------------------------------------- controls
 @app.post("/api/params", dependencies=[Depends(require_token)])
 def api_set_params(body: Dict[str, Any] = Body(...)):
