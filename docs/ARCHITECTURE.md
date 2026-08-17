@@ -1,5 +1,8 @@
 # Architecture — multi-strategy, multi-venue trading platform
 
+> **Superseded — historical.** This predates the venue/host split, the Robinhood adapter, the strategy hosts, the three-state idempotency probe and the current dashboard. For the platform as it actually is now, read [PLATFORM.md](PLATFORM.md). Kept for the design history and the reasoning that led here.
+
+
 > Target state and the reasoning behind it. Written August 2026, when the system was
 > one strategy (SLC), one venue (MT5), and zero closed trades. Read
 > `PLATFORM-REQUIREMENTS-ANALYSIS.md` first for the venue landscape; this document is

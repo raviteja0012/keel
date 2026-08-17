@@ -1,5 +1,8 @@
 # Architecture V3 — the deployment topology decision
 
+> **Superseded — historical.** This predates the venue/host split, the Robinhood adapter, the strategy hosts, the three-state idempotency probe and the current dashboard. For the platform as it actually is now, read [PLATFORM.md](PLATFORM.md). Kept for the design history and the reasoning that led here.
+
+
 **Status:** decided. Supersedes the deployment sections of ARCHITECTURE-V2; retires `docs/LIVE-EXECUTION-VPS.md`.
 **Decided against:** repo HEAD `7821968` (`feat(research): ingest paid research newsletters from the mailbox`), working tree `C:\dev\slc-trading-bot`.
 **Not** the Desktop/OneDrive clone. That copy is stale, lacks `venues.py`, `brokers/`, `alerts.py`, `reconcile.py` and `docs/ARCHITECTURE-V2.md`, and sits under file sync where a live SQLite WAL triple would be a sync target. Delete it.

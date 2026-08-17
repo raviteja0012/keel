@@ -169,11 +169,12 @@ aimed at the file the kill switches read.
 
 | Doc | Read it for |
 |---|---|
+| [`docs/PLATFORM.md`](docs/PLATFORM.md) | **the current platform reference** — the model, the rails, every venue and host, and how to run it. Written from the shipped code with file:line citations. Start here. |
 | [`CLAUDE.md`](CLAUDE.md) | the safety invariants — non-negotiable, they win over everything |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | house rules, fail-closed, the six files that need a second look |
 | [`TEAM-ONBOARDING.md`](TEAM-ONBOARDING.md) | orientation for an engineer who has never seen this repo |
 | [`SETUP-GUIDE.md`](SETUP-GUIDE.md) | attaching the MT5 EA, and connecting an exchange |
-| [`docs/ARCHITECTURE-V2.md`](docs/ARCHITECTURE-V2.md) | the decisive design doc: defect register, phased plan, kill list |
+| [`docs/ARCHITECTURE-V2.md`](docs/ARCHITECTURE-V2.md) | historical design doc: defect register, phased plan, kill list (superseded by `PLATFORM.md`, kept for the reasoning) |
 | [`docs/PLATFORM-REQUIREMENTS-ANALYSIS.md`](docs/PLATFORM-REQUIREMENTS-ANALYSIS.md) | the venue landscape this layer was designed against |
 | [`SLC-Price-Action-Playbook.md`](SLC-Price-Action-Playbook.md) | what strategy #1 is trying to do |
 | [`WEBHOOKS-AND-INTEGRATIONS.md`](WEBHOOKS-AND-INTEGRATIONS.md) | every endpoint, webhook, port and magic number |

@@ -1,5 +1,8 @@
 # Architecture V2 — the decisive version
 
+> **Superseded — historical.** This predates the venue/host split, the Robinhood adapter, the strategy hosts, the three-state idempotency probe and the current dashboard. For the platform as it actually is now, read [PLATFORM.md](PLATFORM.md). Kept for the design history and the reasoning that led here.
+
+
 > Supersedes `docs/ARCHITECTURE.md`. That document is a good design for a problem this
 > system does not yet have. This one is grounded in the code as it stands on
 > 2026-08-08: one strategy (SLC), one venue (MT5 via the EA HTTP bridge), zero closed
