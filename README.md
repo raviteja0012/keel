@@ -169,7 +169,8 @@ aimed at the file the kill switches read.
 
 | Doc | Read it for |
 |---|---|
-| [`docs/PLATFORM.md`](docs/PLATFORM.md) | **the current platform reference** — the model, the rails, every venue and host, and how to run it. Written from the shipped code with file:line citations. Start here. |
+| [`docs/QUICKSTART.md`](docs/QUICKSTART.md) | **connecting your first account** — token, add venue, test, arm, and what actually happens next. The operator's path. |
+| [`docs/PLATFORM.md`](docs/PLATFORM.md) | **the current platform reference** — the model, the rails, every venue and host, and how to run it. Written from the shipped code with file:line citations. |
 | [`CLAUDE.md`](CLAUDE.md) | the safety invariants — non-negotiable, they win over everything |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | house rules, fail-closed, the six files that need a second look |
 | [`TEAM-ONBOARDING.md`](TEAM-ONBOARDING.md) | orientation for an engineer who has never seen this repo |
