@@ -39,7 +39,15 @@ nav{display:flex;gap:4px;flex-wrap:wrap}
 nav button{background:none;border:1px solid transparent;color:var(--ink2);
   padding:6px 12px;border-radius:8px;font-size:13px;cursor:pointer}
 nav button.on{background:var(--surface);border-color:var(--border);color:var(--ink)}
+/* nav groups: Operate (things that act) vs Analyze (things that read) */
+.navgrp{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.navgrp+.navgrp{margin-left:10px;padding-left:14px;border-left:1px solid var(--border)}
+.grplbl{font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);margin-right:4px;user-select:none}
 main{padding:18px 22px;max-width:1180px;margin:0 auto}
+/* Table-heavy views get room: 1180px crushes the 12-column trades table.
+   Prose views keep the comfortable measure. */
+body.wide main{max-width:1600px}
 .cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
       padding:12px 16px;min-width:140px}
@@ -110,7 +118,9 @@ th[aria-sort="ascending"] .ind,th[aria-sort="descending"] .ind{opacity:1}
 .bar.neg{border-radius:4px 0 0 4px}
 .bar.plain{border-radius:0 4px 4px 0;background:var(--s1)}
 .barrow .v{width:64px;font-variant-numeric:tabular-nums;font-size:12px;color:var(--ink)}
-.capline{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--warn)}
+.capline{position:absolute;top:-2px;bottom:-2px;width:3px;background:var(--warn)}
+.caplbl{position:absolute;top:-15px;transform:translateX(-50%);font-size:10px;
+  color:var(--warn);white-space:nowrap;pointer-events:none}
 .chartbox{background:var(--surface);border:1px solid var(--border);border-radius:10px;
           padding:14px;position:relative}
 #eqtip{position:absolute;pointer-events:none;background:var(--surface2);
@@ -129,8 +139,22 @@ button.act:disabled{opacity:.45;cursor:default}
 @media(max-width:900px){.grid2{grid-template-columns:1fr}}
 .filters{display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap;align-items:center}
 .view{display:none}.view.on{display:block}
-.badge{background:var(--crit);color:#fff;border-radius:9px;font-size:11px;
-       padding:0 6px;margin-left:4px}
+/* Unacked changes are advisory, not an emergency: warn in the badge AND in the
+   strip cell, so the same number never wears two severities at once. Dark text
+   on the amber, because white on #fab219 fails contrast. */
+.badge{background:var(--warn);color:#0d0d0d;border-radius:9px;font-size:11px;
+       font-weight:700;padding:0 6px;margin-left:4px}
+/* ARMED is the boundary between "cannot lose money" and "can". It must be
+   louder than the read-only pill, not quieter. */
+.armed{display:inline-block;background:var(--crit);color:#fff;font-weight:700;
+       padding:2px 10px;border-radius:6px;font-size:12px;letter-spacing:.05em}
+/* Per-view fetch stamp: when did the numbers on this screen last arrive. */
+.stamp{margin:0 0 10px;min-height:1em}
+/* Venue row actions: real click targets with space between them, because one
+   of them deletes stored credentials. */
+#venTable td .act{min-height:24px;min-width:24px}
+#venTable td .act+.act{margin-left:8px}
+#venTable td .pill+.act,#venTable td .armed+.act{margin-left:8px}
 
 /* ---- hierarchy: one hero, then a quiet strip -------------------------------
    The landing page had seven equal boxes and two empty tables, so nothing was
@@ -192,23 +216,28 @@ button.act:disabled{opacity:.45;cursor:default}
 
 <header>
   <h1>Keel · multi-asset</h1>
-  <nav id="nav">
-    <button data-v="health" class="on">Health</button>
-    <button data-v="perf">Performance</button>
-    <button data-v="trades">Trades</button>
-    <button data-v="exposure">Exposure</button>
-    <button data-v="regime">Regime &amp; session</button>
-    <button data-v="drawdown">Drawdown</button>
-    <button data-v="promotion">Promotion gate</button>
-    <button data-v="decisions">Decisions</button>
-    <button data-v="venues">Venues</button>
-    <button data-v="controls">Controls<span id="unackBadge" class="badge" style="display:none"></span></button>
+  <nav id="nav" role="tablist" aria-label="Dashboard views">
+    <span class="navgrp" role="presentation"><span class="grplbl" aria-hidden="true">Operate</span>
+      <button role="tab" id="tab-health" aria-controls="v-health" aria-selected="true" data-v="health" class="on">Health</button>
+      <button role="tab" id="tab-venues" aria-controls="v-venues" aria-selected="false" tabindex="-1" data-v="venues">Venues</button>
+      <button role="tab" id="tab-controls" aria-controls="v-controls" aria-selected="false" tabindex="-1" data-v="controls">Controls<span id="unackBadge" class="badge" style="display:none"></span></button>
+    </span>
+    <span class="navgrp" role="presentation"><span class="grplbl" aria-hidden="true">Analyze</span>
+      <button role="tab" id="tab-perf" aria-controls="v-perf" aria-selected="false" tabindex="-1" data-v="perf">Performance</button>
+      <button role="tab" id="tab-trades" aria-controls="v-trades" aria-selected="false" tabindex="-1" data-v="trades">Trades</button>
+      <button role="tab" id="tab-exposure" aria-controls="v-exposure" aria-selected="false" tabindex="-1" data-v="exposure">Exposure</button>
+      <button role="tab" id="tab-regime" aria-controls="v-regime" aria-selected="false" tabindex="-1" data-v="regime">Regime &amp; session</button>
+      <button role="tab" id="tab-drawdown" aria-controls="v-drawdown" aria-selected="false" tabindex="-1" data-v="drawdown">Drawdown</button>
+      <button role="tab" id="tab-promotion" aria-controls="v-promotion" aria-selected="false" tabindex="-1" data-v="promotion">Promotion gate</button>
+      <button role="tab" id="tab-decisions" aria-controls="v-decisions" aria-selected="false" tabindex="-1" data-v="decisions">Decisions</button>
+    </span>
   </nav>
   <span class="note" id="clock"></span>
 </header>
 <main>
 
-<section class="view on" id="v-health">
+<section class="view on" id="v-health" role="tabpanel" aria-labelledby="tab-health">
+  <div class="note stamp" id="st-health"></div>
   <!-- ONE thing at the top, not seven. What is the system doing, and what does
        it need from me? The old version gave "Unacked changes 0" the same visual
        weight as "Mode PAPER", which is how a status page becomes wallpaper. -->
@@ -235,7 +264,8 @@ button.act:disabled{opacity:.45;cursor:default}
   <table id="calTable"><thead><tr><th>When (UTC)</th><th>Impact</th><th>Entities</th><th>Event</th></tr></thead><tbody></tbody></table>
 </section>
 
-<section class="view" id="v-perf">
+<section class="view" id="v-perf" role="tabpanel" aria-labelledby="tab-perf">
+  <div class="note stamp" id="st-perf"></div>
   <div class="filters">
     <select id="perfMode"><option value="paper">paper</option><option value="live">live</option></select>
     <select id="perfDays"><option value="">all time</option><option>7</option><option>30</option><option selected>90</option></select>
@@ -250,7 +280,8 @@ button.act:disabled{opacity:.45;cursor:default}
     <th>Grade</th><th class="num">Risk %</th><th>Factors</th></tr></thead><tbody></tbody></table>
 </section>
 
-<section class="view" id="v-trades">
+<section class="view" id="v-trades" role="tabpanel" aria-labelledby="tab-trades">
+  <div class="note stamp" id="st-trades"></div>
   <h2>Engine analysis right now <span class="note" id="anWindow"></span></h2>
   <table id="anTable"><thead><tr><th>Symbol</th><th>Speed</th><th>Stage</th>
     <th>Action</th><th>Age</th><th>Note</th></tr></thead><tbody></tbody></table>
@@ -263,12 +294,13 @@ button.act:disabled{opacity:.45;cursor:default}
     <select id="trDays"><option value="">all time</option><option>7</option><option>30</option><option>90</option></select>
     <button class="act ghost" onclick="loadTrades()">Apply</button>
   </div>
-  <table id="trTable"><thead><tr><th>Opened</th><th>Symbol</th><th>Side</th><th>Strat</th>
+  <table id="trTable"><thead><tr><th>Opened (UTC)</th><th>Symbol</th><th>Side</th><th>Strat</th>
     <th>Class</th><th>Grade</th><th class="num">Entry</th><th class="num">Exit</th>
     <th class="num">R</th><th class="num">P&amp;L</th><th>Status</th><th>Exit reason</th></tr></thead><tbody></tbody></table>
 </section>
 
-<section class="view" id="v-venues">
+<section class="view" id="v-venues" role="tabpanel" aria-labelledby="tab-venues">
+  <div class="note stamp" id="st-venues"></div>
   <p class="note">Credentials are stored in the runtime DB and never in the repo. Every exchange ccxt
     supports is offered here: which ones answer depends on where this bot runs, not on this list
     (binance.com refuses US traffic with 451 and works from India). Add a venue read-only first,
@@ -312,7 +344,8 @@ button.act:disabled{opacity:.45;cursor:default}
     <th class="num">Qty</th><th class="num">Entry</th><th class="num">Unrealised</th></tr></thead><tbody></tbody></table>
 </section>
 
-<section class="view" id="v-exposure">
+<section class="view" id="v-exposure" role="tabpanel" aria-labelledby="tab-exposure">
+  <div class="note stamp" id="st-exposure"></div>
   <div class="filters">
     <label for="exMode">Mode</label>
     <select id="exMode"><option value="paper">paper</option><option value="live">live</option></select>
@@ -327,7 +360,8 @@ button.act:disabled{opacity:.45;cursor:default}
   buckets — this view is the rail that blocks the 30-of-47 correlated-loser pattern.</p>
 </section>
 
-<section class="view" id="v-regime">
+<section class="view" id="v-regime" role="tabpanel" aria-labelledby="tab-regime">
+  <div class="note stamp" id="st-regime"></div>
   <div class="filters">
     <select id="rsMode"><option value="paper">paper</option><option value="live">live</option></select>
     <select id="rsDays"><option value="">all time</option><option>30</option><option selected>90</option></select>
@@ -343,13 +377,16 @@ button.act:disabled{opacity:.45;cursor:default}
     <th class="num">Win %</th><th class="num">Exp (R)</th><th class="num">Total R</th></tr></thead><tbody></tbody></table>
 </section>
 
-<section class="view" id="v-drawdown">
+<section class="view" id="v-drawdown" role="tabpanel" aria-labelledby="tab-drawdown">
+  <div class="note stamp" id="st-drawdown"></div>
   <div class="filters">
     <select id="ddMode"><option value="paper">paper</option><option value="live">live</option></select>
   </div>
   <div class="cards" id="ddCards"></div>
   <h2>Cumulative R (closed trades)</h2>
   <div class="chartbox"><canvas id="eq" height="220" style="width:100%"></canvas><div id="eqtip"></div></div>
+  <h2>Drawdown from peak <span class="note">(underwater — same closed-trade series as the curve above)</span></h2>
+  <div class="chartbox" id="underBox"></div>
   <h2>Loss concentration</h2>
   <div class="grid2">
     <div><table id="lossSym"><thead><tr><th>Symbol</th><th class="num">Losses</th><th class="num">Lost R</th></tr></thead><tbody></tbody></table></div>
@@ -357,13 +394,15 @@ button.act:disabled{opacity:.45;cursor:default}
   </div>
 </section>
 
-<section class="view" id="v-promotion">
+<section class="view" id="v-promotion" role="tabpanel" aria-labelledby="tab-promotion">
+  <div class="note stamp" id="st-promotion"></div>
   <p class="note">A green gate only permits <b>requesting</b> live through the
   two-step switch — nothing flips automatically, ever.</p>
   <div id="promoCells"></div>
 </section>
 
-<section class="view" id="v-decisions">
+<section class="view" id="v-decisions" role="tabpanel" aria-labelledby="tab-decisions">
+  <div class="note stamp" id="st-decisions"></div>
   <div class="filters">
     <select id="decStage"><option value="">all stages</option><option>fail_safe</option><option>session</option>
       <option>news</option><option>concurrency</option><option>exposure</option><option>loss_limit</option>
@@ -377,11 +416,12 @@ button.act:disabled{opacity:.45;cursor:default}
   <h2>Rejections by stage <span class="note" id="funnelTotal"></span></h2>
   <div class="chartbox" id="funnelBars"></div>
   <h2>Recent decisions</h2>
-  <table id="decTable"><thead><tr><th>Time</th><th>Strat</th><th>Symbol</th><th>Stage</th>
+  <table id="decTable"><thead><tr><th>Time (UTC)</th><th>Strat</th><th>Symbol</th><th>Stage</th>
     <th>Action</th><th>Session</th><th>Reason</th></tr></thead><tbody></tbody></table>
 </section>
 
-<section class="view controls" id="v-controls">
+<section class="view controls" id="v-controls" role="tabpanel" aria-labelledby="tab-controls">
+  <div class="note stamp" id="st-controls"></div>
   <h2>Control token</h2>
   <div class="row"><input type="text" id="token" placeholder="X-Dashboard-Token">
     <span class="note">from <code>state/dashboard_token</code> (or DASHBOARD_TOKEN env) — controls only, kept in this browser</span></div>
@@ -397,7 +437,7 @@ button.act:disabled{opacity:.45;cursor:default}
   </div>
 
   <h2>Parameter changes <span class="note">(agent/sanity changes need your ack)</span></h2>
-  <table id="pcTable"><thead><tr><th>Time</th><th>Origin</th><th>Key</th>
+  <table id="pcTable"><thead><tr><th>Time (UTC)</th><th>Origin</th><th>Key</th>
     <th>Old → New</th><th>Why / data</th><th></th></tr></thead><tbody></tbody></table>
 
   <h2>Live trading</h2>
@@ -459,6 +499,22 @@ const ago=t=>{if(!t)return '—';const s=Date.now()/1000-t;
        :`${(a/86400).toFixed(1)}d`;};
 const skewed=t=>!!t&&(Date.now()/1000-t)<-1;
 
+/* Full timestamp for trade/decision rows: "YYYY-MM-DD HH:MM", UTC. Truncated
+   years ("26-08-17") and missing dates ("08-17 14:02") made history rows
+   ambiguous the moment a sample spanned a year boundary. */
+const utc=t=>t?new Date(t*1000).toISOString().slice(0,16).replace('T',' '):'—';
+
+/* Profit factor: a ratio, so fmt() — but a run with zero losses divides by
+   zero, and the float prints "Infinity" in a money cell. Explicit check. */
+const profitFactor=t=>{
+  if(!t||!t.n)return '—';
+  const pf=t.profit_factor;
+  if(pf==null)return '—';
+  if(pf==='Infinity'||pf==='inf'||!Number.isFinite(Number(pf)))
+    return '∞ <span class="note">(no losses yet)</span>';
+  return fmt(pf,2);
+};
+
 const tok=()=>$('#token').value.trim();
 $('#token').value=localStorage.getItem('dashTok')||'';
 $('#token').addEventListener('change',()=>localStorage.setItem('dashTok',tok()));
@@ -490,6 +546,19 @@ function fail(sel,e){const el=$(sel);if(!el)return;
     +`${esc(e&&e.message||e)}<br><span class="note">This panel is showing `
     +`nothing because the request failed — not because there is nothing to `
     +`show.</span></div>`;}
+
+/* Same message, but as a full-width row inside a table body, so a failed
+   request never leaves a table silently blank or silently stale. */
+function failRow(tableSel,cols,e){const tb=$(tableSel+' tbody');if(!tb)return;
+  tb.innerHTML=`<tr><td colspan="${cols}"><div class="err" role="alert">`
+    +`<b>Could not load.</b> ${esc(e&&e.message||e)}<br><span class="note">`
+    +`Empty because the request failed — not because there is nothing to show.`
+    +`</span></div></td></tr>`;}
+
+/* Every view stamps when its numbers last arrived, so "quietly stale" is
+   visible instead of indistinguishable from "fresh". */
+function stamp(view){const el=$('#st-'+view);if(!el)return;
+  el.textContent='as of '+new Date().toISOString().slice(11,19)+' UTC';}
 
 /* ---------- the mode bar -----------------------------------------------
    Refreshed on its own timer regardless of which view is open, because the
@@ -546,7 +615,8 @@ async function resumeEntries(){
    Click a header to sort. Numeric columns sort numerically; an em dash is
    always least, so "unknown" never sorts as a large or small value.        */
 function sortable(tableSel){
-  const t=$(tableSel);if(!t||t.dataset.sortable)return;t.dataset.sortable='1';
+  const t=typeof tableSel==='string'?$(tableSel):tableSel;
+  if(!t||t.dataset.sortable)return;t.dataset.sortable='1';
   t.querySelectorAll('thead th').forEach((th,i)=>{
     th.dataset.sort='';th.insertAdjacentHTML('beforeend','<span class="ind">▲▼</span>');
     th.onclick=()=>{
@@ -566,57 +636,90 @@ function sortable(tableSel){
       rows.forEach(r=>body.appendChild(r));};});
 }
 
-/* ---------- nav ---------- */
-document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
+/* ---------- nav ----------
+   One loader map, used by clicks, arrow keys AND the refresh interval, so the
+   15-second refresh follows whichever view is actually open instead of only
+   ever reloading Health underneath the reader. */
+const LOADERS={health:loadHealth,perf:loadPerf,trades:loadTrades,exposure:loadExposure,
+  regime:loadRegime,drawdown:loadDrawdown,promotion:loadPromotion,
+  decisions:loadDecisions,venues:loadVenues,controls:loadControls};
+/* Views whose main content is a wide table get the wide measure (finding: the
+   12-column trades table was crushed at 1180px). Prose views stay narrow. */
+const WIDE=new Set(['perf','trades','venues','decisions']);
+let activeView='health';
+
+function showView(name){
+  if(!LOADERS[name])return;
+  activeView=name;
+  document.querySelectorAll('#nav button').forEach(x=>{
+    const on=x.dataset.v===name;
+    x.classList.toggle('on',on);
+    x.setAttribute('aria-selected',on?'true':'false');
+    x.tabIndex=on?0:-1;               /* roving tabindex for the tablist */
+  });
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
-  $('#v-'+b.dataset.v).classList.add('on');
-  ({health:loadHealth,perf:loadPerf,trades:loadTrades,exposure:loadExposure,
-    regime:loadRegime,drawdown:loadDrawdown,promotion:loadPromotion,
-    decisions:loadDecisions,venues:loadVenues,controls:loadControls})[b.dataset.v]();
+  $('#v-'+name).classList.add('on');
+  document.body.classList.toggle('wide',WIDE.has(name));
+  LOADERS[name]();
+}
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>showView(b.dataset.v));
+
+/* Arrow-key navigation across the tablist (ARIA tabs pattern). */
+$('#nav').addEventListener('keydown',e=>{
+  if(!['ArrowRight','ArrowLeft','Home','End'].includes(e.key))return;
+  const tabs=[...document.querySelectorAll('#nav button')];
+  let i=tabs.indexOf(document.activeElement);
+  if(i<0)i=tabs.findIndex(t=>t.classList.contains('on'));
+  if(e.key==='ArrowRight')i=(i+1)%tabs.length;
+  else if(e.key==='ArrowLeft')i=(i-1+tabs.length)%tabs.length;
+  else if(e.key==='Home')i=0;
+  else i=tabs.length-1;
+  e.preventDefault();tabs[i].focus();showView(tabs[i].dataset.v);
 });
 
 /* ---------- venues ---------- */
 let _exchangesLoaded=false;
 
 async function loadVenues(){
-  const d=await GET('/api/venues');
-  if(!_exchangesLoaded && d.exchanges && d.exchanges.length){
-    $('#vExchange').innerHTML=d.exchanges.map(e=>
-      `<option${e==='binanceus'?' selected':''}>${esc(e)}</option>`).join('');
-    _exchangesLoaded=true;
-  }
-  const byName={}; (d.health||[]).forEach(h=>byName[h.name]=h);
+  try{
+    const d=await GET('/api/venues');
+    if(!_exchangesLoaded && d.exchanges && d.exchanges.length){
+      $('#vExchange').innerHTML=d.exchanges.map(e=>
+        `<option${e==='binanceus'?' selected':''}>${esc(e)}</option>`).join('');
+      _exchangesLoaded=true;
+    }
+    const byName={}; (d.health||[]).forEach(h=>byName[h.name]=h);
 
-  const tb=$('#venTable tbody');
-  if(!(d.venues||[]).length){
-    tb.innerHTML='<tr><td colspan="9" class="note">No venues configured. '+
-      'Add one below; it is read-only until you arm it.</td></tr>';
-  }else{
-    tb.innerHTML=d.venues.map(v=>{
-      const h=byName[v.name]||{};
-      const bal=(h.balances||[]).slice(0,4)
-        .map(b=>`${esc(b.currency)} ${Number(b.total).toFixed(4)}`).join(', ')||'—';
-      const skew=h.clock_skew_s==null?'—':Number(h.clock_skew_s).toFixed(2)+'s';
-      const skewBad=h.clock_skew_s!=null&&Math.abs(h.clock_skew_s)>2;
-      return `<tr>
-        <td><b>${esc(v.name)}</b>${v.exchange?`<div class="note">${esc(v.exchange)}${v.market_type?' · '+esc(v.market_type):''}</div>`:''}</td>
-        <td><span class="pill">${esc(v.kind)}</span></td>
-        <td>${h.reachable?'<span class="pos">yes</span>':'<span class="negt">no</span>'}</td>
-        <td>${h.authenticated?'<span class="pos">yes</span>':(v.api_key?'<span class="negt">failed</span>':'<span class="note">no key</span>')}</td>
-        <td class="num">${h.latency_ms??'—'}${h.latency_ms?'ms':''}</td>
-        <td class="num${skewBad?' negt':''}">${skew}</td>
-        <td>${v.read_only
-              ? `<span class="pill">read-only</span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',true)">Arm</button>`
-              : `<span class="negt"><b>ARMED</b></span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',false)">Disarm</button>`}</td>
-        <td class="note">${esc(bal)}</td>
-        <td><button class="act ghost" onclick="testVenue('${esc(v.name)}')">Test</button>
-            <button class="act danger" onclick="delVenue('${esc(v.name)}')">×</button></td>
-      </tr>`;}).join('');
-  }
-  const problems=(d.health||[]).filter(h=>h.detail);
-  $('#venDetail').innerHTML=problems.map(h=>
-    `<div><b>${esc(h.name)}</b>: ${esc(h.detail)}</div>`).join('');
+    const tb=$('#venTable tbody');
+    if(!(d.venues||[]).length){
+      tb.innerHTML='<tr><td colspan="9" class="note">No venues configured yet. '+
+        'Add one below; it is read-only until you arm it.</td></tr>';
+    }else{
+      tb.innerHTML=d.venues.map(v=>{
+        const h=byName[v.name]||{};
+        const bal=(h.balances||[]).slice(0,4)
+          .map(b=>`${esc(b.currency)} ${fmt(b.total,4)}`).join(', ')||'—';
+        const skew=h.clock_skew_s==null?'—':Number(h.clock_skew_s).toFixed(2)+'s';
+        const skewBad=h.clock_skew_s!=null&&Math.abs(h.clock_skew_s)>2;
+        return `<tr>
+          <td><b>${esc(v.name)}</b>${v.exchange?`<div class="note">${esc(v.exchange)}${v.market_type?' · '+esc(v.market_type):''}</div>`:''}</td>
+          <td><span class="pill">${esc(v.kind)}</span></td>
+          <td>${h.reachable?'<span class="pos">yes</span>':'<span class="negt">no</span>'}</td>
+          <td>${h.authenticated?'<span class="pos">yes</span>':(v.api_key?'<span class="negt">failed</span>':'<span class="note">no key</span>')}</td>
+          <td class="num">${h.latency_ms??'—'}${h.latency_ms?'ms':''}</td>
+          <td class="num${skewBad?' negt':''}">${skew}</td>
+          <td>${v.read_only
+                ? `<span class="pill">read-only</span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',true)">Arm</button>`
+                : `<span class="armed">ARMED</span> <button class="act ghost" onclick="armVenue('${esc(v.name)}',false)">Disarm</button>`}</td>
+          <td class="note">${esc(bal)}</td>
+          <td><button class="act ghost" onclick="testVenue('${esc(v.name)}')">Test</button>
+              <button class="act danger" onclick="delVenue('${esc(v.name)}')">Delete</button></td>
+        </tr>`;}).join('');
+    }
+    const problems=(d.health||[]).filter(h=>h.detail);
+    $('#venDetail').innerHTML=problems.map(h=>
+      `<div><b>${esc(h.name)}</b>: ${esc(h.detail)}</div>`).join('');
+  }catch(e){failRow('#venTable',9,e);}
 
   try{
     const p=await GET('/api/venues/positions');
@@ -625,10 +728,11 @@ async function loadVenues(){
       ? p.positions.map(r=>r.error
           ? `<tr><td>${esc(r.venue)}</td><td colspan="5" class="negt">${esc(r.error)}</td></tr>`
           : `<tr><td>${esc(r.venue)}</td><td>${esc(r.symbol)}</td><td>${esc(r.side)}</td>
-             <td class="num">${r.qty}</td><td class="num">${r.entry_price}</td>
-             <td class="num ${r.unrealized_pnl>=0?'pos':'negt'}">${Number(r.unrealized_pnl).toFixed(2)}</td></tr>`).join('')
-      : '<tr><td colspan="6" class="note">No open positions reported by any venue.</td></tr>';
-  }catch(e){}
+             <td class="num">${FIN(r.qty)?r.qty:'—'}</td><td class="num">${price(r.entry_price)}</td>
+             <td class="num">${signed(r.unrealized_pnl,2)}</td></tr>`).join('')
+      : '<tr><td colspan="6" class="note">No open positions reported by any venue yet.</td></tr>';
+  }catch(e){failRow('#venPos',6,e);}
+  stamp('venues');
 }
 
 $('#vKind').addEventListener('change',()=>{
@@ -653,17 +757,20 @@ function venueBody(){
   return b;
 }
 
+/* POST throws on any non-ok response, so every caller catches and reports
+   where the user acted — the old `if(!r)` pattern read {} as success. */
 async function saveVenue(){
   const b=venueBody();
   if(!b.name){ $('#vMsg').textContent='name is required'; return; }
   $('#vMsg').textContent='saving…';
-  const r=await POST('/api/venues',b);
-  if(!r){ $('#vMsg').textContent='needs the control token'; return; }
-  const h=r.health||{};
-  $('#vMsg').textContent = h.authenticated ? 'saved and authenticated'
-    : h.reachable ? 'saved; reachable but not authenticated — '+(h.detail||'check the key')
-    : 'saved; NOT reachable — '+(h.detail||'').slice(0,120);
-  ['vKey','vSecret','vPass'].forEach(i=>$('#'+i).value='');
+  try{
+    const r=await POST('/api/venues',b);
+    const h=r.health||{};
+    $('#vMsg').textContent = h.authenticated ? 'saved and authenticated'
+      : h.reachable ? 'saved; reachable but not authenticated — '+(h.detail||'check the key')
+      : 'saved; NOT reachable — '+(h.detail||'').slice(0,120);
+    ['vKey','vSecret','vPass'].forEach(i=>$('#'+i).value='');
+  }catch(e){ $('#vMsg').textContent='save failed: '+e.message; return; }
   loadVenues();
 }
 
@@ -672,60 +779,78 @@ async function probeVenue(){
   // where the bot runs" before anyone pastes a key.
   const b=venueBody(); b.name='__probe'; b.api_key=''; b.api_secret='';
   $('#vMsg').textContent='probing…';
-  const r=await POST('/api/venues',b);
-  if(!r){ $('#vMsg').textContent='needs the control token'; return; }
-  const h=r.health||{};
-  $('#vMsg').textContent = h.reachable
-    ? `reachable, ${h.latency_ms}ms from here`
-    : `NOT reachable from here: ${(h.detail||'').slice(0,140)}`;
-  await POST('/api/venues/__probe/delete');
+  try{
+    const r=await POST('/api/venues',b);
+    const h=r.health||{};
+    $('#vMsg').textContent = h.reachable
+      ? `reachable, ${h.latency_ms}ms from here`
+      : `NOT reachable from here: ${(h.detail||'').slice(0,140)}`;
+  }catch(e){ $('#vMsg').textContent='probe failed: '+e.message; return; }
+  try{ await POST('/api/venues/__probe/delete'); }
+  catch(e){ $('#vMsg').textContent+=' (probe row cleanup failed: '+e.message+')'; }
   loadVenues();
 }
 
 async function testVenue(n){
   $('#vMsg').textContent='testing '+n+'…';
-  const r=await POST('/api/venues/'+encodeURIComponent(n)+'/test');
-  if(r){ const h=r.health||{};
-    $('#vMsg').textContent=`${n}: reachable=${h.reachable} auth=${h.authenticated} ${h.latency_ms||'—'}ms ${h.detail||''}`; }
+  try{
+    const r=await POST('/api/venues/'+encodeURIComponent(n)+'/test');
+    const h=r.health||{};
+    $('#vMsg').textContent=`${n}: reachable=${h.reachable} auth=${h.authenticated} ${h.latency_ms||'—'}ms ${h.detail||''}`;
+  }catch(e){ $('#vMsg').textContent='test failed: '+e.message; }
   loadVenues();
 }
 
 async function armVenue(n,enable){
-  if(enable && !confirm(
-    `Arm ${n} for execution?\n\nThe engine will be able to place real orders on this venue.\n`+
-    `Every rail still applies, and the promotion gate still governs live mode.`)) return;
-  await POST('/api/venues/'+encodeURIComponent(n)+'/trading',{enabled:!!enable});
+  if(enable && !confirmPhrase('ARM',
+    `Arm ${n} for execution?\n\nAn ARMED venue lets the engine place REAL orders — real money can leave `+
+    `the account on ${n}. Every rail still applies, and the promotion gate still governs live mode.`)) return;
+  try{ await POST('/api/venues/'+encodeURIComponent(n)+'/trading',{enabled:!!enable}); }
+  catch(e){ alert((enable?'Arm':'Disarm')+' failed: '+e.message); }
   loadVenues();
 }
 
 async function delVenue(n){
-  if(!confirm('Remove venue '+n+'? Stored credentials are deleted.')) return;
-  await POST('/api/venues/'+encodeURIComponent(n)+'/delete');
+  if(!confirmPhrase('DELETE',
+    `Delete venue ${n}?\n\nThis removes the venue AND its stored API credentials from the runtime DB. `+
+    `You will have to paste the key and secret again to get it back.`)) return;
+  try{ await POST('/api/venues/'+encodeURIComponent(n)+'/delete'); }
+  catch(e){ alert('Delete failed: '+e.message); }
   loadVenues();
 }
 
 /* ---------- shared renderers ---------- */
 function statCard(label,val,sub,color){return `<div class="card"><div class="label">${esc(label)}</div>
   <div class="val" ${color?`style="color:${color}"`:''}>${val}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;}
-function statsRow(name,st){const e=st.expectancy_r;return `<tr><td>${esc(name)}</td>
-  <td class="num">${st.n}</td><td class="num">${fmt(st.win_rate,1)}</td>
-  <td class="num ${e>0?'pos':e<0?'negt':''}">${fmt(e,3)}</td></tr>`;}
+function statsRow(name,st){return `<tr><td>${esc(name)}</td>
+  <td class="num">${int(st.n)}</td><td class="num">${pct(st.win_rate,1)}</td>
+  <td class="num">${signed(st.expectancy_r,3)}</td></tr>`;}
 /* diverging horizontal bars around a zero midline (blue=+ / red=−), with an
-   optional cap marker. One measure -> one hue per sign; labels wear ink. */
-function divergingBars(el,entries,cap){
+   optional cap marker. One measure -> one hue per sign; labels wear ink.
+   The cap line is labelled on the first row so the amber tick is not a
+   mystery mark. */
+function divergingBars(el,entries,cap,empty){
+  if(!entries.length){el.innerHTML=`<span class="note">${esc(empty||'nothing open yet')}</span>`;return;}
   const max=Math.max(cap||0,...entries.map(e=>Math.abs(e.v)),0.1)*1.15;
-  el.innerHTML=entries.map(e=>{const pct=Math.abs(e.v)/max*50;
-    const side=e.v>=0?`left:50%;width:${pct}%`:`right:50%;width:${pct}%`;
+  el.innerHTML=entries.map((e,idx)=>{const w=Math.abs(e.v)/max*50;
+    const side=e.v>=0?`left:50%;width:${w}%`:`right:50%;width:${w}%`;
     const capHtml=cap?`<span class="capline" style="left:${50+cap/max*50}%"></span>
-                       <span class="capline" style="left:${50-cap/max*50}%"></span>`:'';
+                       <span class="capline" style="left:${50-cap/max*50}%"></span>`
+      +(idx===0?`<span class="caplbl" style="left:${50+cap/max*50}%">cap ${fmt(cap,2)}</span>`:''):'';
     return `<div class="barrow"><span class="lbl">${esc(e.k)}</span>
       <span class="bartrack"><span class="mid"></span>${capHtml}
       <span class="bar ${e.v<0?'neg':''}" style="${side};background:${e.v>=0?'var(--s1)':'var(--neg)'}"></span></span>
-      <span class="v">${fmt(e.v,2)}</span></div>`;}).join('')||'<span class="note">nothing open</span>';}
-function plainBars(el,entries){const max=Math.max(...entries.map(e=>e.v),1);
-  el.innerHTML=entries.map(e=>`<div class="barrow"><span class="lbl">${esc(e.k)}</span>
-    <span class="bartrack"><span class="bar plain" style="left:0;width:${e.v/max*100}%"></span></span>
-    <span class="v">${e.v}</span></div>`).join('')||'<span class="note">no data</span>';}
+      <span class="v">${fmt(e.v,2)}</span></div>`;}).join('');}
+/* single-measure bars: a sequential single-hue ramp (light→dark by row), so
+   the stages read as ordered steps of one thing, not ten categories. */
+function plainBars(el,entries,empty){
+  if(!entries.length){el.innerHTML=`<span class="note">${esc(empty||'no data yet')}</span>`;return;}
+  const max=Math.max(...entries.map(e=>e.v),1),n=entries.length;
+  el.innerHTML=entries.map((e,i)=>{
+    const L=n<2?46:58-Math.round(i/(n-1)*26);   /* lightness 58% → 32% */
+    return `<div class="barrow"><span class="lbl">${esc(e.k)}</span>
+    <span class="bartrack"><span class="bar plain" style="left:0;width:${e.v/max*100}%;background:hsl(215,45%,${L}%)"></span></span>
+    <span class="v">${int(e.v)}</span></div>`;}).join('');}
 
 /* ---------- health ---------- */
 /* One sentence about what the system is doing, and the next action.
@@ -787,7 +912,9 @@ function heroFor(h, venues, gate, broke){
 }
 
 async function loadHealth(){
-  const h=await GET('/api/health');
+  let h;
+  try{h=await GET('/api/health');}
+  catch(e){fail('#hero',e);stamp('health');return;}
   /* Independent calls, so fetch them together rather than in series — and
      record WHICH failed instead of discarding the fact. */
   let venues=null,gate=null;const broke=[];
@@ -833,7 +960,7 @@ async function loadHealth(){
       : `<div class="blank">Nothing decided yet. Every stand-aside and skip lands
          here once prices are arriving — including the decisions NOT to trade,
          which is the part nothing else shows you.</div>`;
-  }catch(e){ $('#funnelMini').innerHTML='<div class="blank">unavailable</div>'; }
+  }catch(e){ fail('#funnelMini',e); }
 
   const cell=(k,v,s,c)=>`<div class="cell"><div class="k">${k}</div>
     <div class="v"${c?` style="color:${c}"`:''}>${v}</div>
@@ -883,64 +1010,84 @@ async function loadHealth(){
     ${cal.upcoming_48h??'?'} events next 48h`;
   try{const c=await GET('/api/news_calendar?hours=48');const tb=$('#calTable tbody');tb.innerHTML='';
     (c.upcoming||[]).slice(0,25).forEach(ev=>tb.insertAdjacentHTML('beforeend',
-      `<tr><td>${new Date(ev.t*1000).toISOString().slice(5,16).replace('T',' ')}</td>
+      `<tr><td>${utc(ev.t)}</td>
        <td><span class="pill">${esc(ev.impact)}</span></td><td>${esc((ev.entities||[]).join(', '))}</td>
-       <td>${esc(ev.title)}</td></tr>`));}catch(e){}
+       <td>${esc(ev.title)}</td></tr>`));
+    if(!(c.upcoming||[]).length)tb.innerHTML=
+      '<tr><td colspan="4" class="note">no calendar events in the next 48h — rows appear as the fetcher finds them</td></tr>';
+  }catch(e){failRow('#calTable',4,e);}
+  stamp('health');
 }
 
 /* ---------- performance ---------- */
 async function loadPerf(){
   const m=$('#perfMode').value,d=$('#perfDays').value;
-  const p=await GET(`/api/performance?mode=${m}${d?`&days=${d}`:''}`);
-  const t=p.total||{n:0};
-  $('#perfCards').innerHTML=statCard('Closed trades',t.n||0)+
-    statCard('Win rate',t.n?fmt(t.win_rate,1)+'%':'—')+
-    statCard('Expectancy',t.n?fmt(t.expectancy_r,3)+' R':'—','per trade',t.expectancy_r>0?'var(--good)':t.expectancy_r<0?'var(--crit)':undefined)+
-    statCard('Total',t.n?fmt(t.total_r,1)+' R':'—',fmt(t.pnl,2)+' P&L')+
-    statCard('Profit factor',t.profit_factor??'—');
-  const tb=$('#perfCells tbody');tb.innerHTML='';
-  (p.by_strategy_class||[]).forEach(r=>tb.insertAdjacentHTML('beforeend',
-    `<tr><td>${esc(r.strategy)}</td><td>${esc(r.asset_class||'?')}</td><td class="num">${r.n}</td>
-     <td class="num">${fmt(r.win_rate,1)}</td>
-     <td class="num ${r.expectancy_r>0?'pos':r.expectancy_r<0?'negt':''}">${fmt(r.expectancy_r,3)}</td>
-     <td class="num">${fmt(r.pnl,2)}</td></tr>`));
-  const ex=await GET('/api/studies/exposure?mode='+m);const ot=$('#openTable tbody');ot.innerHTML='';
-  (ex.positions||[]).forEach(x=>ot.insertAdjacentHTML('beforeend',
-    `<tr><td>${x.id}</td><td>${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${esc(x.asset_class)}</td>
-     <td>${esc(x.grade??'')}</td><td class="num">${fmt(x.risk_pct,2)}</td>
-     <td class="note">${esc(Object.entries(x.factors).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' '))}</td></tr>`));
-  if(!(ex.positions||[]).length)ot.innerHTML='<tr><td colspan="7" class="note">no open positions</td></tr>';
+  /* Two independent GETs: settle both, render what arrived, fail the rest. */
+  const [rp,rx]=await Promise.allSettled([
+    GET(`/api/performance?mode=${m}${d?`&days=${d}`:''}`),
+    GET('/api/studies/exposure?mode='+m)]);
+  if(rp.status==='fulfilled'){
+    const p=rp.value,t=p.total||{n:0};
+    $('#perfCards').innerHTML=statCard('Closed trades',int(t.n||0))+
+      statCard('Win rate',t.n?pct(t.win_rate,1):'—')+
+      statCard('Expectancy',t.n?signed(t.expectancy_r,3,' R'):'—','per trade')+
+      statCard('Total',t.n?signed(t.total_r,1,' R'):'—',t.n?signed(t.pnl,2)+' P&L':'')+
+      statCard('Profit factor',profitFactor(t));
+    const tb=$('#perfCells tbody');tb.innerHTML='';
+    (p.by_strategy_class||[]).forEach(r=>tb.insertAdjacentHTML('beforeend',
+      `<tr><td>${esc(r.strategy)}</td><td>${esc(r.asset_class||'?')}</td><td class="num">${int(r.n)}</td>
+       <td class="num">${pct(r.win_rate,1)}</td>
+       <td class="num">${signed(r.expectancy_r,3)}</td>
+       <td class="num">${signed(r.pnl,2)}</td></tr>`));
+    if(!(p.by_strategy_class||[]).length)tb.innerHTML=
+      '<tr><td colspan="6" class="note">no closed trades in this window yet — rows appear per strategy × class as samples close</td></tr>';
+  }else{fail('#perfCards',rp.reason);failRow('#perfCells',6,rp.reason);}
+  if(rx.status==='fulfilled'){
+    const ex=rx.value,ot=$('#openTable tbody');ot.innerHTML='';
+    (ex.positions||[]).forEach(x=>ot.insertAdjacentHTML('beforeend',
+      `<tr><td>${x.id}</td><td>${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${esc(x.asset_class)}</td>
+       <td>${esc(x.grade??'')}</td><td class="num">${pct(x.risk_pct,2)}</td>
+       <td class="note">${esc(Object.entries(x.factors||{}).map(([k,v])=>`${k}${v>0?'+':''}${v}`).join(' '))}</td></tr>`));
+    if(!(ex.positions||[]).length)ot.innerHTML='<tr><td colspan="7" class="note">no open positions right now</td></tr>';
+  }else{failRow('#openTable',7,rx.reason);}
+  stamp('perf');
 }
 
 /* ---------- trades + live analysis ---------- */
 async function loadTrades(){
-  const a=await GET('/api/analysis_now');
-  $('#anWindow').textContent=`(latest per symbol × speed, last ${a.window_min} min — empty until the EA feed is live)`;
-  const at=$('#anTable tbody');at.innerHTML='';
-  (a.rows||[]).forEach(r=>at.insertAdjacentHTML('beforeend',
-    `<tr><td>${esc(r.symbol)}</td><td>${esc(r.trade_mode)}</td>
-     <td><span class="pill">${esc(r.stage)}</span></td><td>${esc(r.action)}</td>
-     <td class="note">${ago(r.t)}</td><td class="note">${esc(r.reason||'')}</td></tr>`));
-  if(!(a.rows||[]).length)at.innerHTML=
-    '<tr><td colspan="6" class="note">no engine activity in the window — engine analyzes only while the EA feed is live</td></tr>';
   const q=new URLSearchParams({limit:200});
   if($('#trMode').value)q.set('mode',$('#trMode').value);
   if($('#trSymbol').value)q.set('symbol',$('#trSymbol').value.toUpperCase());
   if($('#trStatus').value)q.set('status',$('#trStatus').value);
   if($('#trDays').value)q.set('days',$('#trDays').value);
-  const d=await GET('/api/trades?'+q);
-  const tb=$('#trTable tbody');tb.innerHTML='';
-  (d.trades||[]).forEach(t=>{const r=t.r_multiple;
-    tb.insertAdjacentHTML('beforeend',
-    `<tr><td>${new Date(t.entry_time*1000).toISOString().slice(2,16).replace('T',' ')}</td>
-     <td>${esc(t.symbol)}</td><td>${esc(t.side)}</td><td>${esc(t.strategy||'slc')}</td>
-     <td>${esc(t.asset_class||'')}</td><td>${esc(t.grade||'')}</td>
-     <td class="num">${fmt(t.entry,5)}</td><td class="num">${t.exit_price!=null?fmt(t.exit_price,5):'—'}</td>
-     <td class="num ${r>0?'pos':r<0?'negt':''}">${r!=null?fmt(r,2):'—'}</td>
-     <td class="num ${t.pnl>0?'pos':t.pnl<0?'negt':''}">${t.status==='closed'?fmt(t.pnl,2):'—'}</td>
-     <td><span class="pill">${esc(t.mode)} ${esc(t.status)}</span></td>
-     <td class="note">${esc(t.exit_reason||'')}</td></tr>`);});
-  if(!(d.trades||[]).length)tb.innerHTML='<tr><td colspan="12" class="note">no trades match this filter</td></tr>';
+  const [ra,rt]=await Promise.allSettled([GET('/api/analysis_now'),GET('/api/trades?'+q)]);
+  if(ra.status==='fulfilled'){
+    const a=ra.value;
+    $('#anWindow').textContent=`(latest per symbol × speed, last ${a.window_min} min — empty until the EA feed is live)`;
+    const at=$('#anTable tbody');at.innerHTML='';
+    (a.rows||[]).forEach(r=>at.insertAdjacentHTML('beforeend',
+      `<tr><td>${esc(r.symbol)}</td><td>${esc(r.trade_mode)}</td>
+       <td><span class="pill">${esc(r.stage)}</span></td><td>${esc(r.action)}</td>
+       <td class="note">${ago(r.t)}</td><td class="note">${esc(r.reason||'')}</td></tr>`));
+    if(!(a.rows||[]).length)at.innerHTML=
+      '<tr><td colspan="6" class="note">no engine activity in the window — engine analyzes only while the EA feed is live</td></tr>';
+  }else{failRow('#anTable',6,ra.reason);}
+  if(rt.status==='fulfilled'){
+    const d=rt.value,tb=$('#trTable tbody');tb.innerHTML='';
+    (d.trades||[]).forEach(t=>{
+      tb.insertAdjacentHTML('beforeend',
+      `<tr><td>${utc(t.entry_time)}</td>
+       <td>${esc(t.symbol)}</td><td>${esc(t.side)}</td><td>${esc(t.strategy||'slc')}</td>
+       <td>${esc(t.asset_class||'')}</td><td>${esc(t.grade||'')}</td>
+       <td class="num">${price(t.entry)}</td><td class="num">${price(t.exit_price)}</td>
+       <td class="num">${signed(t.r_multiple,2)}</td>
+       <td class="num">${t.status==='closed'?signed(t.pnl,2):'<span class="num dim">—</span>'}</td>
+       <td><span class="pill">${esc(t.mode)} ${esc(t.status)}</span></td>
+       <td class="note">${esc(t.exit_reason||'')}</td></tr>`);});
+    if(!(d.trades||[]).length)tb.innerHTML=
+      '<tr><td colspan="12" class="note">no trades match this filter yet — closed and open trades land here as the engine takes them</td></tr>';
+  }else{failRow('#trTable',12,rt.reason);}
+  stamp('trades');
 }
 
 /* ---------- exposure ---------- */
@@ -949,50 +1096,78 @@ async function loadExposure(){
   try{
     const ex=await GET('/api/studies/exposure?mode='+encodeURIComponent(m));
     divergingBars($('#bucketBars'),Object.entries(ex.buckets||{}).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
-      .map(([k,v])=>({k,v})),ex.cap);
-    plainBars($('#classBars'),Object.entries(ex.by_class||{}).map(([k,v])=>({k,v})));
-  }catch(e){fail('#bucketBars',e);$('#classBars').innerHTML='';}
+      .map(([k,v])=>({k,v})),ex.cap,
+      'nothing open yet — buckets fill as positions open');
+    plainBars($('#classBars'),Object.entries(ex.by_class||{}).map(([k,v])=>({k,v})),
+      'no open positions yet — counts appear per asset class as positions open');
+  }catch(e){fail('#bucketBars',e);fail('#classBars',e);}
+  stamp('exposure');
 }
 
 /* ---------- regime & session ---------- */
 async function loadRegime(){
   const m=$('#rsMode').value,d=$('#rsDays').value;
-  const r=await GET(`/api/studies/regime_session?mode=${m}${d?`&days=${d}`:''}`);
-  $('#sessTable tbody').innerHTML=Object.entries(r.by_session||{}).map(([k,v])=>statsRow(k,v)).join('')
-    ||'<tr><td colspan="4" class="note">no closed trades yet</td></tr>';
-  $('#regTable tbody').innerHTML=Object.entries(r.by_regime||{}).map(([k,v])=>statsRow(k,v)).join('')
-    ||'<tr><td colspan="4" class="note">no closed trades yet</td></tr>';
-  $('#clsTable tbody').innerHTML=Object.entries(r.by_asset_class||{}).map(([k,v])=>
-    `<tr><td>${esc(k)}</td><td class="num">${v.n}</td><td class="num">${fmt(v.win_rate,1)}</td>
-     <td class="num ${v.expectancy_r>0?'pos':v.expectancy_r<0?'negt':''}">${fmt(v.expectancy_r,3)}</td>
-     <td class="num">${fmt(v.total_r,1)}</td></tr>`).join('')
-    ||'<tr><td colspan="5" class="note">no closed trades yet</td></tr>';
+  try{
+    const r=await GET(`/api/studies/regime_session?mode=${m}${d?`&days=${d}`:''}`);
+    $('#sessTable tbody').innerHTML=Object.entries(r.by_session||{}).map(([k,v])=>statsRow(k,v)).join('')
+      ||'<tr><td colspan="4" class="note">no closed trades yet — sessions fill as trades close</td></tr>';
+    $('#regTable tbody').innerHTML=Object.entries(r.by_regime||{}).map(([k,v])=>statsRow(k,v)).join('')
+      ||'<tr><td colspan="4" class="note">no closed trades yet — bands fill as trades close</td></tr>';
+    $('#clsTable tbody').innerHTML=Object.entries(r.by_asset_class||{}).map(([k,v])=>
+      `<tr><td>${esc(k)}</td><td class="num">${int(v.n)}</td><td class="num">${pct(v.win_rate,1)}</td>
+       <td class="num">${signed(v.expectancy_r,3)}</td>
+       <td class="num">${signed(v.total_r,1)}</td></tr>`).join('')
+      ||'<tr><td colspan="5" class="note">no closed trades yet — classes fill as trades close</td></tr>';
+  }catch(e){
+    failRow('#sessTable',4,e);failRow('#regTable',4,e);failRow('#clsTable',5,e);
+  }
+  stamp('regime');
 }
 
 /* ---------- drawdown ---------- */
 let eqData=[];
+/* Lost R is a loss whichever sign the API chose for it: normalise to a
+   negative signed() rendering so the direction glyph never claims a gain. */
+const lostR=v=>signed(FIN(v)?-Math.abs(Number(v)):null,2);
 async function loadDrawdown(){
-  const d=await GET('/api/studies/drawdown?mode='+$('#ddMode').value);
-  if(!d.n){$('#ddCards').innerHTML='<span class="note">no closed trades yet</span>';
-    eqData=[];drawEq();['#lossSym','#lossCls'].forEach(s=>$(s+' tbody').innerHTML='');return;}
-  $('#ddCards').innerHTML=statCard('Max drawdown',fmt(d.max_drawdown_r,2)+' R','peak→trough','var(--serious)')+
-    statCard('Worst losing streak',d.worst_losing_streak,'consecutive')+
-    statCard('Wick-out losers',`${d.wickout_losers.n}/${d.wickout_losers.of_losers}`,'reached +0.5R first — stop tightness')+
-    statCard('Spread-induced stops',d.spread_induced_stops);
-  eqData=d.equity_curve_r||[];drawEq();
-  $('#lossSym tbody').innerHTML=Object.entries(d.loss_concentration.by_symbol).map(([k,v])=>
-    `<tr><td>${esc(k)}</td><td class="num">${v.losses}</td><td class="num negt">${fmt(v.lost_r,2)}</td></tr>`).join('');
-  $('#lossCls tbody').innerHTML=
-    Object.entries(d.loss_concentration.by_class).map(([k,v])=>
-      `<tr><td>${esc(k)}</td><td class="num">${v.losses}</td><td class="num negt">${fmt(v.lost_r,2)}</td></tr>`).join('')+
-    Object.entries(d.loss_concentration.by_grade).map(([k,v])=>
-      `<tr><td>grade ${esc(k)}</td><td class="num">${v.losses}</td><td class="num negt">${fmt(v.lost_r,2)}</td></tr>`).join('');
+  try{
+    const d=await GET('/api/studies/drawdown?mode='+$('#ddMode').value);
+    if(!d.n){
+      $('#ddCards').innerHTML='<span class="note">no closed trades yet — every card and chart here fills from closed trades</span>';
+      eqData=[];drawEq();drawUnder();
+      ['#lossSym','#lossCls'].forEach(s=>$(s+' tbody').innerHTML=
+        '<tr><td colspan="3" class="note">no losses recorded yet</td></tr>');
+      stamp('drawdown');return;}
+    $('#ddCards').innerHTML=
+      statCard('Max drawdown',signed(FIN(d.max_drawdown_r)?-Math.abs(d.max_drawdown_r):null,2,' R'),'peak→trough')+
+      statCard('Worst losing streak',int(d.worst_losing_streak),'consecutive')+
+      statCard('Wick-out losers',`${(d.wickout_losers||{}).n??'—'}/${(d.wickout_losers||{}).of_losers??'—'}`,'reached +0.5R first — stop tightness')+
+      statCard('Spread-induced stops',int(d.spread_induced_stops));
+    eqData=d.equity_curve_r||[];drawEq();drawUnder();
+    const lc=d.loss_concentration||{};
+    $('#lossSym tbody').innerHTML=Object.entries(lc.by_symbol||{}).map(([k,v])=>
+      `<tr><td>${esc(k)}</td><td class="num">${int(v.losses)}</td><td class="num">${lostR(v.lost_r)}</td></tr>`).join('')
+      ||'<tr><td colspan="3" class="note">no losses recorded yet</td></tr>';
+    $('#lossCls tbody').innerHTML=(
+      Object.entries(lc.by_class||{}).map(([k,v])=>
+        `<tr><td>${esc(k)}</td><td class="num">${int(v.losses)}</td><td class="num">${lostR(v.lost_r)}</td></tr>`).join('')+
+      Object.entries(lc.by_grade||{}).map(([k,v])=>
+        `<tr><td>grade ${esc(k)}</td><td class="num">${int(v.losses)}</td><td class="num">${lostR(v.lost_r)}</td></tr>`).join(''))
+      ||'<tr><td colspan="3" class="note">no losses recorded yet</td></tr>';
+  }catch(e){
+    fail('#ddCards',e);
+    eqData=[];drawEq('request failed — see the error above');
+    drawUnder('request failed — see the error above');
+    failRow('#lossSym',3,e);failRow('#lossCls',3,e);
+  }
+  stamp('drawdown');
 }
-function drawEq(){
+function drawEq(msg){
   const cv=$('#eq'),dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=220;
   cv.width=W*dpr;cv.height=H*dpr;const g=cv.getContext('2d');g.scale(dpr,dpr);
   g.clearRect(0,0,W,H);
-  if(eqData.length<2){g.fillStyle='#898781';g.font='12px system-ui';g.fillText('not enough closed trades',12,24);return;}
+  if(eqData.length<2){g.fillStyle='#898781';g.font='12px system-ui';
+    g.fillText(msg||'not enough closed trades yet — the curve draws from the second closed trade',12,24);return;}
   const xs=eqData.map(p=>p.t),ys=eqData.map(p=>p.cum_r);
   const x0=Math.min(...xs),x1=Math.max(...xs),ylo=Math.min(0,...ys),yhi=Math.max(0,...ys);
   const pad={l:44,r:10,t:10,b:22};
@@ -1019,35 +1194,86 @@ function drawEq(){
   cv.onmouseleave=()=>$('#eqtip').style.display='none';
 }
 
+/* The underwater curve: drawdown-from-peak of the same cumulative-R series
+   drawEq plots. The equity curve shows where you got to; this shows what it
+   cost to get there. Inline SVG, no libraries; the viewBox scales with the
+   container so no resize redraw is needed. Worst point annotated with value
+   and date. */
+function drawUnder(msg){
+  const el=$('#underBox');if(!el)return;
+  if(eqData.length<2){
+    el.innerHTML=`<span class="note">${esc(msg||'not enough closed trades yet — fills from the same closed-trade series as the curve above')}</span>`;
+    return;}
+  let peak=-Infinity;
+  const dd=eqData.map(p=>{peak=Math.max(peak,p.cum_r);return {t:p.t,v:p.cum_r-peak};});
+  const W=720,H=200,pad={l:44,r:12,t:14,b:22};
+  const xs=dd.map(p=>p.t),x0=Math.min(...xs),x1=Math.max(...xs);
+  const byIndex=(x1-x0)<60;                     /* same fallback as drawEq */
+  const X=(t,i)=>byIndex?pad.l+i/((dd.length-1)||1)*(W-pad.l-pad.r)
+                        :pad.l+(t-x0)/((x1-x0)||1)*(W-pad.l-pad.r);
+  const lo=Math.min(...dd.map(p=>p.v),-0.1);
+  const Y=v=>pad.t+(0-v)/((0-lo)||1)*(H-pad.t-pad.b);
+  let worst=0;dd.forEach((p,i)=>{if(p.v<dd[worst].v)worst=i;});
+  const pts=dd.map((p,i)=>`${X(p.t,i).toFixed(1)},${Y(p.v).toFixed(1)}`);
+  const area=`M${X(dd[0].t,0).toFixed(1)},${Y(0).toFixed(1)} L`+pts.join(' L')
+    +` L${X(dd[dd.length-1].t,dd.length-1).toFixed(1)},${Y(0).toFixed(1)} Z`;
+  const steps=3,ticks=[];
+  for(let i=0;i<=steps;i++){const v=lo*i/steps,y=Y(v).toFixed(1);
+    ticks.push(`<line x1="${pad.l}" y1="${y}" x2="${W-pad.r}" y2="${y}" stroke="#2c2c2a" stroke-width="1"/>`
+      +`<text x="6" y="${(+y+4).toFixed(1)}" fill="#898781" font-size="11" font-family="system-ui">${v.toFixed(1)}</text>`);}
+  const wp=dd[worst],wx=X(wp.t,worst),wy=Y(wp.v);
+  const wdate=new Date(wp.t*1000).toISOString().slice(0,10);
+  const wlbl=`${wp.v.toFixed(2)} R · ${wdate}`;
+  const lblX=Math.min(Math.max(wx+8,pad.l+4),W-140);
+  el.innerHTML=`<svg viewBox="0 0 ${W} ${H}" role="img" style="width:100%;height:auto;display:block"
+      aria-label="Underwater drawdown curve; worst drawdown ${wp.v.toFixed(2)} R on ${wdate}">
+    ${ticks.join('')}
+    <line x1="${pad.l}" y1="${Y(0).toFixed(1)}" x2="${W-pad.r}" y2="${Y(0).toFixed(1)}" stroke="#383835" stroke-width="1"/>
+    <path d="${area}" fill="rgba(255,107,107,0.16)"/>
+    <polyline points="${pts.join(' ')}" fill="none" stroke="#ff6b6b" stroke-width="1.5"/>
+    <circle cx="${wx.toFixed(1)}" cy="${wy.toFixed(1)}" r="3.5" fill="#ff6b6b" stroke="#0d0d0d" stroke-width="1"/>
+    <text x="${lblX.toFixed(1)}" y="${Math.max(wy-9,12).toFixed(1)}" fill="#ffffff" font-size="11" font-family="system-ui">${wlbl}</text>
+  </svg>`;
+}
+
 /* ---------- promotion ---------- */
 async function loadPromotion(){
-  const p=await GET('/api/studies/promotion');
-  const cells=Object.values(p.cells||{});
-  $('#promoCells').innerHTML=cells.length?cells.map(c=>{
-    const rows=Object.entries(c.checks).map(([k,ch])=>{
-      const col=ch.pass?'var(--good)':'var(--crit)';
-      return `<tr><td><span class="check"><span class="dot" style="background:${col}"></span>${esc(k.replaceAll('_',' '))}</span></td>
-        <td>${esc(String(ch.value??'—'))}${ch.required?` / ${ch.required}`:''}</td>
-        <td class="note">${esc(ch.note||'')}</td></tr>`;}).join('');
-    const needsSignoff=!c.checks.manual_signoff.pass
-      && Object.entries(c.checks).every(([k,ch])=>k==='manual_signoff'||ch.pass);
-    const signBtn=needsSignoff
-      ?`<div class="row" style="margin:8px 0"><button class="act" onclick="signoff('${esc(c.strategy)}','${esc(c.asset_class)}')">
-         Sign off ${esc(c.strategy)} × ${esc(c.asset_class)}…</button>
-         <span class="note">all data checks pass — the manual sign-off is yours to give</span></div>`:'';
-    return `<h2>${esc(c.strategy)} × ${esc(c.asset_class)} —
-      <span style="color:${c.gate_open?'var(--good)':'var(--serious)'}">${c.gate_open?'GATE OPEN':'gate closed'}</span>
-      <span class="note">n=${c.stats.n}, exp ${fmt(c.stats.expectancy_r,3)}R</span></h2>
-      <table><thead><tr><th>Check</th><th>Value</th><th></th></tr></thead><tbody>${rows}</tbody></table>${signBtn}`;
-  }).join(''):'<p class="note">no closed paper trades attributed yet — cells appear as strategy×class samples accumulate</p>';
+  try{
+    const p=await GET('/api/studies/promotion');
+    const cells=Object.values(p.cells||{});
+    $('#promoCells').innerHTML=cells.length?cells.map(c=>{
+      const rows=Object.entries(c.checks||{}).map(([k,ch])=>{
+        const col=ch.pass?'var(--good)':'var(--crit)';
+        return `<tr><td><span class="check"><span class="dot" style="background:${col}"></span>${esc(k.replaceAll('_',' '))}</span></td>
+          <td>${esc(String(ch.value??'—'))}${ch.required?` / ${ch.required}`:''}</td>
+          <td class="note">${esc(ch.note||'')}</td></tr>`;}).join('');
+      const ms=(c.checks||{}).manual_signoff;
+      const needsSignoff=ms&&!ms.pass
+        && Object.entries(c.checks).every(([k,ch])=>k==='manual_signoff'||ch.pass);
+      const signBtn=needsSignoff
+        ?`<div class="row" style="margin:8px 0"><button class="act" onclick="signoff('${esc(c.strategy)}','${esc(c.asset_class)}')">
+           Sign off ${esc(c.strategy)} × ${esc(c.asset_class)}…</button>
+           <span class="note">all data checks pass — the manual sign-off is yours to give</span></div>`:'';
+      return `<h2>${esc(c.strategy)} × ${esc(c.asset_class)} —
+        <span style="color:${c.gate_open?'var(--good)':'var(--serious)'}">${c.gate_open?'GATE OPEN':'gate closed'}</span>
+        <span class="note">n=${int(c.stats.n)}, exp ${signed(c.stats.expectancy_r,3)}R</span></h2>
+        <table><thead><tr><th>Check</th><th>Value</th><th></th></tr></thead><tbody>${rows}</tbody></table>${signBtn}`;
+    }).join(''):'<p class="note">no closed paper trades attributed yet — cells appear as strategy×class samples accumulate</p>';
+    /* These tables are rebuilt on every load, so they get sort affordances
+       here rather than at boot. */
+    document.querySelectorAll('#promoCells table').forEach(t=>sortable(t));
+  }catch(e){fail('#promoCells',e);}
+  stamp('promotion');
 }
 
 async function signoff(strategy,asset_class){
   const signed_by=prompt(`Manual promotion sign-off for ${strategy} × ${asset_class}.\n\nYour name (recorded with the sample snapshot):`);
   if(!signed_by)return;
   const note=prompt('Optional note (e.g. "forward-test continuation, min size"):')||'';
-  const r=await POST('/api/live/signoff',{strategy,asset_class,signed_by,note});
-  alert(r.ok?'Sign-off recorded.':'Refused: '+(r.reason||''));
+  try{
+    const r=await POST('/api/live/signoff',{strategy,asset_class,signed_by,note});
+    alert(r.ok?'Sign-off recorded.':'Refused: '+(r.reason||''));
+  }catch(e){alert('Sign-off failed: '+e.message);}
   loadPromotion();
 }
 
@@ -1057,52 +1283,105 @@ async function loadDecisions(){
   if($('#decStage').value)q.set('stage',$('#decStage').value);
   if($('#decAction').value)q.set('action',$('#decAction').value);
   if($('#decSymbol').value)q.set('symbol',$('#decSymbol').value.toUpperCase());
-  const d=await GET('/api/decisions?'+q);
-  $('#funnelTotal').textContent=`(${d.funnel.total} decisions, last ${d.funnel.since_hours}h)`;
-  plainBars($('#funnelBars'),(d.funnel.by_stage||[]).map(r=>({k:`${r.stage}/${r.action}`,v:r.n})));
-  const tb=$('#decTable tbody');tb.innerHTML='';
-  (d.recent||[]).forEach(r=>tb.insertAdjacentHTML('beforeend',
-    `<tr><td>${new Date(r.t*1000).toISOString().slice(5,16).replace('T',' ')}</td>
-     <td>${esc(r.strategy||'—')}</td><td>${esc(r.symbol)}</td>
-     <td><span class="pill">${esc(r.stage)}</span></td><td>${esc(r.action)}</td>
-     <td class="note">${esc(r.session||'')}</td><td class="note">${esc(r.reason||'')}</td></tr>`));
-  if(!(d.recent||[]).length)tb.innerHTML='<tr><td colspan="7" class="note">no decisions recorded for this filter</td></tr>';
+  try{
+    const d=await GET('/api/decisions?'+q);
+    const f=d.funnel||{};
+    $('#funnelTotal').textContent=`(${int(f.total)} decisions, last ${f.since_hours??'?'}h)`;
+    plainBars($('#funnelBars'),(f.by_stage||[]).map(r=>({k:`${r.stage}/${r.action}`,v:r.n})),
+      'no decisions in this window yet — stages fill as the engine evaluates symbols');
+    const tb=$('#decTable tbody');tb.innerHTML='';
+    (d.recent||[]).forEach(r=>tb.insertAdjacentHTML('beforeend',
+      `<tr><td>${utc(r.t)}</td>
+       <td>${esc(r.strategy||'—')}</td><td>${esc(r.symbol)}</td>
+       <td><span class="pill">${esc(r.stage)}</span></td><td>${esc(r.action)}</td>
+       <td class="note">${esc(r.session||'')}</td><td class="note">${esc(r.reason||'')}</td></tr>`));
+    if(!(d.recent||[]).length)tb.innerHTML=
+      '<tr><td colspan="7" class="note">no decisions recorded for this filter yet — every skip, stand-aside and execution lands here</td></tr>';
+  }catch(e){fail('#funnelBars',e);failRow('#decTable',7,e);}
+  stamp('decisions');
 }
 
 /* ---------- controls ---------- */
 const PARAMS=['risk_pct','b_setup_risk_factor','min_rr','atr_buffer','max_concurrent',
   'max_concurrent_per_class','max_correlated','max_bucket_exposure','daily_stop_pct',
   'weekly_stop_pct','max_spread_frac','vol_mult'];
+/* Snapshot of the values the inputs were rendered with. Apply diffs against
+   this, so an Apply sends ONLY what the operator changed — the old code sent
+   all twelve every time, silently clobbering anything the agent or another
+   session had tuned in between. */
+let _paramSnap={};
+function paramsDirty(){
+  return PARAMS.some(k=>{const el=$('#p_'+k);
+    return el&&el.value!==String(_paramSnap[k]??'');});
+}
 async function loadControls(){
-  const s=await GET('/api/settings');
-  $('#paramRows').innerHTML=PARAMS.map(k=>{
-    const b=s.bounds[k]||[null,null];
-    return `<div class="row"><span style="width:200px;color:var(--ink2)">${k}</span>
-      <input type="number" step="0.05" id="p_${k}" value="${s.settings[k]??''}">
-      <span class="note">bounds [${b[0]}, ${b[1]}]</span></div>`;}).join('')+
-    `<div class="row"><button class="act" onclick="saveParams()">Apply (bounded)</button>
-     <span class="note" id="paramMsg"></span></div>`;
-  $('#haltState').textContent=s.settings.halt_new_entries?'currently HALTED':'currently allowing entries';
-  const pc=await GET('/api/param_changes?limit=40');
-  $('#pcTable tbody').innerHTML=(pc.changes||[]).map(c=>{
-    let trig='';try{trig=JSON.parse(c.trigger_data||'{}').reason||'';}catch(e){}
-    return `<tr ${c.accepted?'':'style="opacity:.55"'}><td>${new Date(c.t*1000).toISOString().slice(5,16).replace('T',' ')}</td>
-     <td><span class="pill">${esc(c.origin)}${c.accepted?'':' · REFUSED'}</span></td><td>${esc(c.key)}</td>
-     <td class="num">${esc(c.old)} → ${esc(c.new)}</td><td class="note">${esc(trig)}</td>
-     <td>${(!c.ack&&c.origin!=='human')?`<button class="act ghost" onclick="ack(${c.id})">ack</button>`:''}</td></tr>`;
-  }).join('')||'<tr><td colspan="6" class="note">no parameter changes recorded</td></tr>';
+  try{
+    const s=await GET('/api/settings');
+    /* Do not re-render the inputs under the operator's cursor: the 15s
+       refresh now reloads the active view, and wiping a half-typed value
+       every 15 seconds would make the form unusable. Skip the re-render
+       while an input is focused or holds unapplied edits. */
+    const editing=$('#paramRows input')&&
+      (paramsDirty()||$('#paramRows').contains(document.activeElement));
+    if(!editing){
+      _paramSnap={};PARAMS.forEach(k=>_paramSnap[k]=s.settings[k]??'');
+      $('#paramRows').innerHTML=PARAMS.map(k=>{
+        const b=(s.bounds||{})[k]||[null,null];
+        return `<div class="row"><label style="width:200px;color:var(--ink2)" for="p_${k}">${k}</label>
+          <input type="number" step="0.05" id="p_${k}" value="${s.settings[k]??''}"
+                 min="${b[0]??''}" max="${b[1]??''}">
+          <span class="note">bounds [${b[0]}, ${b[1]}]</span></div>`;}).join('')+
+        `<div class="row"><button class="act" onclick="saveParams()">Apply changed only (bounded)</button>
+         <span class="note" id="paramMsg"></span></div>`;
+    }
+    $('#haltState').textContent=s.settings.halt_new_entries?'currently HALTED':'currently allowing entries';
+  }catch(e){fail('#paramRows',e);}
+  try{
+    const pc=await GET('/api/param_changes?limit=40');
+    $('#pcTable tbody').innerHTML=(pc.changes||[]).map(c=>{
+      let trig='';try{trig=JSON.parse(c.trigger_data||'{}').reason||'';}catch(e){}
+      return `<tr ${c.accepted?'':'style="opacity:.55"'}><td>${utc(c.t)}</td>
+       <td><span class="pill">${esc(c.origin)}${c.accepted?'':' · REFUSED'}</span></td><td>${esc(c.key)}</td>
+       <td>${esc(c.old)} → ${esc(c.new)}</td><td class="note">${esc(trig)}</td>
+       <td>${(!c.ack&&c.origin!=='human')?`<button class="act ghost" onclick="ack(${c.id})">ack</button>`:''}</td></tr>`;
+    }).join('')||'<tr><td colspan="6" class="note">no parameter changes recorded yet — agent and human tuning lands here</td></tr>';
+  }catch(e){failRow('#pcTable',6,e);}
   loadLive();
+  stamp('controls');
 }
 async function saveParams(){
-  const body={};PARAMS.forEach(k=>{const v=$('#p_'+k).value;if(v!=='')body[k]=parseFloat(v);});
-  const r=await POST('/api/params',body);
-  $('#paramMsg').textContent=Object.keys(r.rejected||{}).length
-    ?('rejected: '+Object.entries(r.rejected).map(([k,v])=>`${k}: ${v}`).join(' · '))
-    :('applied: '+Object.keys(r.changed||{}).join(', '));
-  $('#paramMsg').style.color=Object.keys(r.rejected||{}).length?'var(--serious)':'var(--good)';
+  const msg=$('#paramMsg');
+  const body={};
+  PARAMS.forEach(k=>{const el=$('#p_'+k);if(!el)return;
+    const v=el.value;
+    if(v===String(_paramSnap[k]??''))return;   /* unchanged — do not send */
+    if(v!=='')body[k]=parseFloat(v);});
+  if(!Object.keys(body).length){
+    msg.textContent='no changes to apply';msg.style.color='var(--muted)';return;}
+  msg.textContent='applying…';msg.style.color='';
+  try{
+    const r=await POST('/api/params',body);
+    const rej=Object.keys(r.rejected||{}).length;
+    msg.textContent=rej
+      ?('rejected: '+Object.entries(r.rejected).map(([k,v])=>`${k}: ${v}`).join(' · '))
+      :('applied: '+(Object.keys(r.changed||{}).join(', ')||Object.keys(body).join(', ')));
+    msg.style.color=rej?'var(--serious)':'var(--good)';
+    /* accepted keys become the new baseline, so the next Apply diffs
+       against what the server now holds */
+    Object.keys(body).forEach(k=>{
+      if(!(r.rejected&&k in r.rejected))_paramSnap[k]=String(body[k]);});
+  }catch(e){msg.textContent='failed: '+e.message;msg.style.color='var(--crit)';}
 }
-async function halt(on){await POST(on?'/api/halt':'/api/resume');loadControls();}
-async function ack(id){await POST('/api/param_changes/ack/'+id);loadControls();}
+async function halt(on){
+  try{await POST(on?'/api/halt':'/api/resume');}
+  catch(e){alert((on?'HALT':'Resume')+' failed: '+e.message+'\n\nThe engine may still be taking entries — verify before walking away.');}
+  loadControls();
+}
+async function ack(id){
+  try{await POST('/api/param_changes/ack/'+id);}
+  catch(e){alert('Ack failed: '+e.message);}
+  loadControls();
+}
 
 /* ---------- live switch (Phase 5 module; degrades if absent) ---------- */
 async function loadLive(){
@@ -1120,29 +1399,42 @@ async function loadLive(){
   }catch(e){box.innerHTML='<span class="note">live switch module not mounted</span>';}
 }
 async function liveReq(){
-  const r=await POST('/api/live/request',{});
-  if(!r.ok){$('#liveMsg').textContent='refused: '+esc(r.reason||'');$('#liveMsg').style.color='var(--serious)';return;}
-  const phrase=prompt(`Promotion gate: ${r.gate_cell}\n\nType exactly:  ${r.confirm_phrase}\n\nto confirm switching to LIVE (expires in ${r.expires_in_s}s)`);
-  if(phrase==null)return;
-  const c=await POST('/api/live/confirm',{token:r.confirm_token,phrase});
-  $('#liveMsg').textContent=c.ok?'LIVE enabled — EA AllowTradeExecution is the final gate':'refused: '+esc(c.reason||'');
-  $('#liveMsg').style.color=c.ok?'var(--warn)':'var(--serious)';
+  const msg=$('#liveMsg');
+  try{
+    const r=await POST('/api/live/request',{});
+    if(!r.ok){msg.textContent='refused: '+(r.reason||'');msg.style.color='var(--serious)';return;}
+    const phrase=prompt(`Promotion gate: ${r.gate_cell}\n\nType exactly:  ${r.confirm_phrase}\n\nto confirm switching to LIVE (expires in ${r.expires_in_s}s)`);
+    if(phrase==null)return;
+    const c=await POST('/api/live/confirm',{token:r.confirm_token,phrase});
+    msg.textContent=c.ok?'LIVE enabled — EA AllowTradeExecution is the final gate':'refused: '+(c.reason||'');
+    msg.style.color=c.ok?'var(--warn)':'var(--serious)';
+  }catch(e){msg.textContent='live switch failed: '+e.message;msg.style.color='var(--crit)';}
   loadLive();
 }
-async function liveOff(){await POST('/api/live/paper',{});loadLive();}
+async function liveOff(){
+  try{await POST('/api/live/paper',{});}
+  catch(e){alert('Switch back to paper failed: '+e.message+'\n\nAssume the engine is STILL LIVE until /api/live/status says otherwise.');}
+  loadLive();
+}
 
 /* ---------- boot ---------- */
 setInterval(()=>{$('#clock').textContent=new Date().toISOString().slice(0,19).replace('T',' ')+' UTC';},1000);
-setInterval(()=>{if($('#v-health').classList.contains('on'))loadHealth();},15000);
+/* Refresh whichever view is open, not only Health. A reader could sit on
+   Trades for an hour while the numbers went stale and the header clock ticked
+   live above them. One interval, dispatched on the active view. */
+setInterval(()=>{const fn=LOADERS[activeView];if(fn)fn();},15000);
 ['perfMode','perfDays'].forEach(id=>$('#'+id).onchange=loadPerf);
 ['rsMode','rsDays'].forEach(id=>$('#'+id).onchange=loadRegime);
 $('#ddMode').onchange=loadDrawdown;
 $('#exMode').onchange=loadExposure;
 window.addEventListener('resize',()=>drawEq());
 
-/* Every long table gets sticky headers and click-to-sort. */
+/* Every data table gets sticky headers and click-to-sort — including the
+   perf, venue, loss and param-change tables the first pass left out.
+   Promotion tables are rebuilt per load and wired in loadPromotion. */
 ['#trTable','#venPos','#decTable','#sessTable','#regTable','#calTable',
- '#freshTable','#actTable'].forEach(sel=>{
+ '#freshTable','#anTable','#perfCells','#openTable','#venTable','#clsTable',
+ '#lossSym','#lossCls','#pcTable'].forEach(sel=>{
   const t=$(sel);if(!t)return;
   if(!t.parentElement.classList.contains('tscroll')){
     const w=document.createElement('div');w.className='tscroll';
