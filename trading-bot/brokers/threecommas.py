@@ -27,11 +27,32 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterator, List, Optional
 
-from . import (Balance, Order, OrderResult, Position, SymbolMeta, Tick,
-               VenueError, VenueHealth, VenueReadOnly, register)
+from . import (PROBE_ABSENT, PROBE_FOUND, PROBE_INDETERMINATE, Balance, Order,
+               OrderResult, Position, Probe, SymbolMeta, Tick, VenueError,
+               VenueHealth, VenueIndeterminate, VenueReadOnly, register)
 
 BASE = "https://api.3commas.io"
 _PREFIX = "/public/api"
+
+# The idempotency probe reads smart trades one page at a time. 3Commas has NO
+# clientOrderId, so the only key is a marker written into the note field, and
+# the only way to check it is to scan the smart-trade list. A page that comes
+# back this full may be hiding our trade past its end, so absence is unproven
+# until a page returns short. Reading one page and calling absence is exactly
+# how a trade at index 120 got a duplicate.
+_PROBE_PER_PAGE = 100
+
+
+def _finite(value: Any) -> Optional[float]:
+    """A finite float or None. NaN and +/-inf are never returned: they slip
+    through every comparison guard and must not reach a real venue."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
 
 
 class ThreeCommasVenue:
@@ -144,6 +165,45 @@ class ThreeCommasVenue:
         return out
 
     # --------------------------------------------------------------- writes
+    def _probe_by_note(self, client_order_id: str) -> Probe:
+        """Has a smart trade tagged with this client_order_id already been
+        placed? Three states, never a bare list scan.
+
+        3Commas has NO clientOrderId. The marker lives in the note field, and
+        the only check is scanning the smart-trade list — which is exactly the
+        weakness: unlike a real idempotency key, a list read can be paginated,
+        capped, or filtered, and a trade beyond what the venue returns is
+        invisible. Reading one page and calling absence is how a trade at
+        index 120 got a duplicate.
+
+        So the rule is conservative and matches the ccxt probe: read a page; if
+        the trade is in it, FOUND; if the page comes back FULL, the trade could
+        be beyond it and absence is UNPROVEN — INDETERMINATE, never 'no'; only
+        a SHORT page (fewer rows than we asked for) is a real, confirmed end of
+        list and therefore a real absence. Consequence: on an account already
+        holding more than _PROBE_PER_PAGE open smart trades, a placement stands
+        aside as indeterminate rather than risk a double fill. That is the
+        correct trade for a router whose idempotency cannot be trusted to a key.
+        """
+        try:
+            rows = self._call("GET", "/ver1/smart_trades/v2",
+                              {"status": "all", "per_page": _PROBE_PER_PAGE}) or []
+        except VenueError as e:
+            return Probe(PROBE_INDETERMINATE,
+                         reason="smart-trade list unreadable: %s" % e,
+                         retryable=e.retryable)
+        for t in rows:
+            if client_order_id in str(t.get("note") or ""):
+                return Probe(PROBE_FOUND, order=t, reason="matched by note")
+        if len(rows) >= _PROBE_PER_PAGE:
+            return Probe(PROBE_INDETERMINATE,
+                         reason="the smart-trade list returned a full page of "
+                                "%d, so the trade could be beyond it"
+                                % _PROBE_PER_PAGE)
+        return Probe(PROBE_ABSENT,
+                     reason="not present in a list of %d (fewer than a full "
+                            "page)" % len(rows))
+
     def place_order(self, order: Order) -> OrderResult:
         if self.read_only:
             raise VenueReadOnly(
@@ -157,14 +217,28 @@ class ThreeCommasVenue:
         if not self._account_id:
             raise VenueError("no 3Commas account_id configured", venue=self.name)
 
-        # Idempotency: 3Commas has no clientOrderId, so check before placing.
-        # note is the only field that round-trips, so the key lives there.
-        for t in self._call("GET", "/ver1/smart_trades/v2",
-                            {"status": "all", "per_page": 100}) or []:
-            if order.client_order_id in str(t.get("note") or ""):
-                return OrderResult(order.client_order_id, str(t.get("id")),
-                                   "accepted", message="idempotent: already placed",
-                                   raw=t)
+        # Last gate before the wire: a non-finite qty or price must never reach
+        # the venue. NaN passes every numeric guard upstream, so it stops here.
+        for fld in ("qty", "limit_price", "stop_loss", "take_profit"):
+            v = getattr(order, fld, None)
+            if v is not None and _finite(v) is None:
+                raise VenueError("%s: refusing to transmit a non-finite %s (%r)"
+                                 % (self.name, fld, v), venue=self.name)
+        if order.qty <= 0:
+            raise VenueError("%s: refusing to transmit a non-positive qty (%r)"
+                             % (self.name, order.qty), venue=self.name)
+
+        # Idempotency before placing. INDETERMINATE must not be read as absent.
+        probe = self._probe_by_note(order.client_order_id)
+        if probe.outcome == PROBE_FOUND:
+            return OrderResult(order.client_order_id, str(probe.order.get("id")),
+                               "accepted", message="idempotent: already placed",
+                               raw=probe.order)
+        if probe.outcome == PROBE_INDETERMINATE:
+            raise VenueIndeterminate(
+                "%s: cannot verify whether %s was already placed, refusing to "
+                "submit (%s)" % (self.name, order.client_order_id, probe.reason),
+                venue=self.name, client_order_id=order.client_order_id)
 
         body: Dict[str, Any] = {
             "account_id": self._account_id,
@@ -184,15 +258,55 @@ class ThreeCommasVenue:
                                                    "type": "last"},
                  "volume": 100}]}
 
-        raw = self._call("POST", "/ver1/smart_trades/v2", body=body)
+        try:
+            raw = self._call("POST", "/ver1/smart_trades/v2", body=body)
+        except VenueError as e:
+            # The POST may have landed. A blind retry on a transport error is
+            # the double fill. Probe by note, and only re-raise as retryable if
+            # the venue confirms the trade is NOT there.
+            after = self._probe_by_note(order.client_order_id)
+            if after.outcome == PROBE_FOUND:
+                return OrderResult(order.client_order_id,
+                                   str(after.order.get("id")), "accepted",
+                                   message="landed despite transport error",
+                                   raw=after.order)
+            if after.is_absent:
+                raise VenueError("3Commas: venue confirms trade not placed: %s"
+                                 % e, retryable=True, venue=self.name, cause=e)
+            raise VenueIndeterminate(
+                "%s: smart trade %s may or may not have been placed — the POST "
+                "failed (%s) and the probe could not settle it (%s). Reconcile "
+                "before any retry." % (self.name, order.client_order_id, e,
+                                       after.reason),
+                venue=self.name, cause=e, client_order_id=order.client_order_id)
         return OrderResult(order.client_order_id, str(raw.get("id") or ""),
                            "accepted", raw=raw)
 
     def cancel(self, venue_order_id: str, symbol: str = "") -> bool:
+        """True only when 3Commas confirms the smart trade is closed.
+
+        close_by_market is a REQUEST to close at market; the trade is still
+        working when the call returns. Returning True there tells the engine
+        the position is flat while it is live. We read the trade back and
+        confirm its status before claiming the cancel succeeded.
+        """
         if self.read_only:
             raise VenueReadOnly("%s is read-only" % self.name, venue=self.name)
-        self._call("POST", "/ver1/smart_trades/v2/%s/close_by_market" % venue_order_id)
-        return True
+        self._call("POST",
+                   "/ver1/smart_trades/v2/%s/close_by_market" % venue_order_id)
+        # close_by_market is async; confirm the resulting state rather than
+        # trust the acknowledgement.
+        try:
+            t = self._call("GET", "/ver1/smart_trades/v2/%s" % venue_order_id)
+        except VenueError:
+            return False        # cannot confirm -> do not claim success
+        status = str((t or {}).get("status", {})
+                     if isinstance((t or {}).get("status"), str)
+                     else ((t or {}).get("status") or {}).get("type") or "").lower()
+        return status in ("closed", "cancelled", "canceled", "finished")
+
+    def _probe(self, client_order_id: str) -> Probe:   # test/introspection alias
+        return self._probe_by_note(client_order_id)
 
     def stream_prices(self, symbols: List[str]) -> Iterator[Tick]:
         return iter(())      # price data comes from the exchange, not the router

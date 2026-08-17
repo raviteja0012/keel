@@ -32,6 +32,12 @@ _TRUSTED_CLIENT_ID = {"binance", "binanceusdm", "binancecoinm", "bybit", "okx",
 _RETRYABLE = (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable,
               ccxt.DDoSProtection, ccxt.RateLimitExceeded)
 
+# How many orders the idempotency probe reads per book. A page that comes back
+# this full means there may be more we did not see, so absence is unproven and
+# the probe returns INDETERMINATE rather than a false "no". Larger is safer for
+# accounts with many working orders, at the cost of a heavier probe.
+_PROBE_PAGE = 100
+
 
 class CcxtVenue:
     """One configured exchange account."""
@@ -196,13 +202,26 @@ class CcxtVenue:
         """
         errors: List[str] = []
         retryable = False
+        truncated = False
         for label, fetch in (("open", self._x.fetch_open_orders),
                              ("closed", self._x.fetch_closed_orders)):
             try:
-                for o in fetch(vs, limit=50) or []:
+                page = fetch(vs, limit=_PROBE_PAGE) or []
+                for o in page:
                     if (o.get("clientOrderId") or "") == client_order_id:
                         return Probe(PROBE_FOUND, order=o,
                                      reason="matched in %s orders" % label)
+                # A page that came back FULL may be hiding the order past its
+                # end. We read one page and cannot page all 103 exchanges
+                # uniformly, so a full page means absence is UNPROVEN — the
+                # same trap that double-filled 3commas (read one page, miss
+                # the order at index 120, submit again). A short page is a
+                # real, confirmed end-of-list.
+                if len(page) >= _PROBE_PAGE:
+                    truncated = True
+                    errors.append("%s orders: returned a full page of %d, so "
+                                  "the order could be beyond it" % (label,
+                                                                    _PROBE_PAGE))
             except ccxt.NotSupported as e:
                 # The exchange cannot answer this question at all. That is a
                 # permanent property of the venue, not a transient failure.
@@ -215,15 +234,36 @@ class CcxtVenue:
 
         if errors:
             return Probe(PROBE_INDETERMINATE,
-                         reason="; ".join(errors), retryable=retryable)
+                         reason="; ".join(errors),
+                         retryable=retryable and not truncated)
         return Probe(PROBE_ABSENT,
-                     reason="not present in open or closed orders")
+                     reason="not present in open or closed orders "
+                            "(both books returned fewer than %d)" % _PROBE_PAGE)
 
     def place_order(self, order: Order) -> OrderResult:
         if self.read_only:
             raise VenueReadOnly(
                 "%s is read-only; enable trading for this venue first" % self.name,
                 venue=self.name)
+
+        # The adapter is the last gate before the wire. A non-finite qty or
+        # price must never reach a real exchange: NaN slips through every
+        # numeric guard upstream (NaN < min, NaN > max are both False), so if
+        # a sizing bug ever produces one, this is where it stops. Refusing to
+        # transmit is always safe; transmitting qty=nan is not.
+        for field in ("qty", "limit_price", "stop_loss", "take_profit"):
+            v = getattr(order, field, None)
+            if v is None:
+                continue
+            if not isinstance(v, (int, float)) or v != v or v in (
+                    float("inf"), float("-inf")):
+                raise VenueError(
+                    "%s: refusing to transmit a non-finite %s (%r) to the "
+                    "venue" % (self.name, field, v), venue=self.name)
+        if order.qty <= 0:
+            raise VenueError("%s: refusing to transmit a non-positive qty (%r)"
+                             % (self.name, order.qty), venue=self.name)
+
         vs = self._resolve(order.symbol)
 
         # Idempotency. On venues we do not trust to honour clientOrderId we look
@@ -288,20 +328,47 @@ class CcxtVenue:
         status_map = {"open": "accepted", "closed": "filled",
                       "canceled": "cancelled", "cancelled": "cancelled",
                       "rejected": "rejected", "expired": "cancelled"}
+        # `float(raw.get("filled") or 0)` let NaN through: NaN is truthy, so the
+        # `or 0` never fired, and a NaN filled_qty passes every comparison-based
+        # guard downstream (NaN < x, NaN > x and NaN == x are all False). A
+        # non-finite quantity is a venue data fault, not a fill: report it as
+        # zero filled (nothing confirmed) and say so, rather than emit a number
+        # that defeats the rails silently.
+        filled = _finite(raw.get("filled"))
+        note = message
+        if filled is None:
+            filled = 0.0
+            note = ((note + " | ") if note else "") + \
+                "venue reported a non-finite filled qty (%r); treated as 0" \
+                % (raw.get("filled"),)
         return OrderResult(
             client_order_id=cid,
             venue_order_id=str(raw.get("id") or ""),
             status=status_map.get(raw.get("status") or "", "unknown"),
-            filled_qty=float(raw.get("filled") or 0),
-            avg_price=raw.get("average"),
-            message=message, raw=raw)
+            filled_qty=filled,
+            avg_price=_finite(raw.get("average")),   # None, never NaN
+            message=note, raw=raw)
 
     def cancel(self, venue_order_id: str, symbol: str = "") -> bool:
+        """True ONLY when the venue confirms the order is no longer working.
+
+        The previous version returned True the moment cancel_order did not
+        raise. But an accepted cancel is not a completed one: the order may
+        still be working, or already filling, when the request lands. Returning
+        True there tells the engine the position is flat while it is live —
+        the conformance law this failed. We read the returned order's status
+        and confirm cancellation; anything unconfirmed returns False so the
+        caller re-checks rather than assuming.
+        """
         if self.read_only:
             raise VenueReadOnly("%s is read-only" % self.name, venue=self.name)
         vs = self._resolve(symbol) if symbol else None
-        self._wrap(self._x.cancel_order, venue_order_id, vs)
-        return True
+        raw = self._wrap(self._x.cancel_order, venue_order_id, vs)
+        status = str((raw or {}).get("status") or "").lower()
+        # 'canceled'/'cancelled' is the confirmation. 'closed' means it FILLED
+        # before the cancel took, which is emphatically not a successful
+        # cancel. Anything else (open, pending, or an empty ack) is unconfirmed.
+        return status in ("canceled", "cancelled")
 
     def stream_prices(self, symbols: List[str]) -> Iterator[Tick]:
         """Polled ticker snapshots. CCXT's websocket support lives in ccxt.pro;
@@ -315,6 +382,19 @@ class CcxtVenue:
             if t.get("bid") and t.get("ask"):
                 yield Tick(vs, float(t["bid"]), float(t["ask"]),
                            int((t.get("timestamp") or time.time() * 1000) / 1000))
+
+
+def _finite(value: Any) -> Optional[float]:
+    """A finite float, or None. Never NaN and never +/-inf — those pass through
+    comparison guards silently and are the worst thing to leak onto a
+    money-handling path. None is an honest 'unknown'; NaN is a lie."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
 
 
 def new_client_order_id(prefix: str = "slc") -> str:

@@ -1,7 +1,8 @@
 """SQLite persistence for the SLC trading bot.
 
-One file: data/trading.db. Thread-safe via a module-level lock —
-the engine, Flask handlers, and the agent all share this module.
+One file: data/trading.db, or wherever TRADING_DB points. Thread-safe via a
+module-level lock — the engine, Flask handlers, and the agent all share this
+module.
 """
 import json
 import os
@@ -10,7 +11,15 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "trading.db")
+# TRADING_DB overrides the location. Every test file has set this env var from
+# the beginning — and until now NOTHING READ IT. The path was hardcoded, so
+# every local test run wrote its synthetic trades into the real data/trading.db:
+# 36 fixture trades and -394.56 of fake paper losses were found in the ledger
+# that feeds the daily stop and the promotion-gate sample. A test that believes
+# it is isolated and is not is worse than no test. The env var now does what
+# every caller already assumed it did.
+_DB_PATH = os.environ.get("TRADING_DB") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "trading.db")
 _lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
 _recover = {"last": 0.0, "in_progress": False}
