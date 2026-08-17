@@ -220,6 +220,7 @@ button.act:disabled{opacity:.45;cursor:default}
     <span class="navgrp" role="presentation"><span class="grplbl" aria-hidden="true">Operate</span>
       <button role="tab" id="tab-health" aria-controls="v-health" aria-selected="true" data-v="health" class="on">Health</button>
       <button role="tab" id="tab-venues" aria-controls="v-venues" aria-selected="false" tabindex="-1" data-v="venues">Venues</button>
+      <button role="tab" id="tab-hosts" aria-controls="v-hosts" aria-selected="false" tabindex="-1" data-v="hosts">Bot hosts</button>
       <button role="tab" id="tab-controls" aria-controls="v-controls" aria-selected="false" tabindex="-1" data-v="controls">Controls<span id="unackBadge" class="badge" style="display:none"></span></button>
     </span>
     <span class="navgrp" role="presentation"><span class="grplbl" aria-hidden="true">Analyze</span>
@@ -342,6 +343,57 @@ button.act:disabled{opacity:.45;cursor:default}
   <h2>Venue positions <span class="note">what the venues say we hold, for reconciliation</span></h2>
   <table id="venPos"><thead><tr><th>Venue</th><th>Symbol</th><th>Side</th>
     <th class="num">Qty</th><th class="num">Entry</th><th class="num">Unrealised</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section class="view" id="v-hosts" role="tabpanel" aria-labelledby="tab-hosts">
+  <div class="note stamp" id="st-hosts"></div>
+  <p class="note">A bot host runs its OWN strategy — a 3Commas DCA bot, a Cryptohopper grid.
+    Keel starts it, stops it and watches it; the host owns the position and Keel never places
+    or manages an order through one. Their open positions still count as money at risk, so they
+    feed the live kill switches. Add a host read-only first, then arm bot control as a separate act.</p>
+
+  <!-- Hosted exposure is the number the live kill switches read. Shown first and loudly,
+       because its TRUST status is what matters: an unreadable host is not a flat one. -->
+  <div id="hostExposure" class="hero" style="margin-bottom:14px"></div>
+
+  <h2>Bots</h2>
+  <table id="hostBots"><thead><tr>
+    <th>Host</th><th>Bot</th><th>Strategy</th><th>State</th>
+    <th class="num">Unrealised</th><th class="num">Realised</th><th>Positions</th><th></th>
+  </tr></thead><tbody></tbody></table>
+  <div id="hostBotDetail" class="note" style="margin-top:8px"></div>
+
+  <h2>Connected hosts</h2>
+  <table id="hostTable"><thead><tr>
+    <th>Host</th><th>Kind</th><th>Reachable</th><th>Auth</th><th>Control</th><th></th>
+  </tr></thead><tbody></tbody></table>
+
+  <h2>Add or update a host</h2>
+  <div class="controls">
+    <div class="row">
+      <select id="hKind">
+        <option value="3commas-bots">3Commas bots</option>
+        <option value="cryptohopper">Cryptohopper</option>
+        <option value="altrady">Altrady</option>
+      </select>
+      <input type="text" id="hName" placeholder="name (e.g. 3commas-main)">
+    </div>
+    <div class="row" id="hCredRow">
+      <input type="password" id="hKey" placeholder="API key" autocomplete="off" spellcheck="false" style="width:230px">
+      <input type="password" id="hSecret" placeholder="API secret" style="width:230px">
+    </div>
+    <p class="note" id="hAltradyNote" style="display:none">Altrady has no list-bots endpoint and one
+      key/secret <b>per bot</b>. Add the account here, then register each bot's own credentials — Keel
+      keeps the registry the platform does not provide.</p>
+    <div class="row">
+      <button class="act" onclick="saveHost()">Save read-only</button>
+      <button class="act ghost" onclick="probeHost()">Test reachability only</button>
+      <span class="note" id="hMsg"></span>
+    </div>
+    <p class="note">None of these platforms can scope a key to "read + start/stop", so Keel enforces
+      see-but-never-manage in its own client — an allowlist of the read/start/stop paths only. Leave
+      key and secret blank when updating to keep the stored ones. Saving never arms control.</p>
+  </div>
 </section>
 
 <section class="view" id="v-exposure" role="tabpanel" aria-labelledby="tab-exposure">
@@ -642,10 +694,10 @@ function sortable(tableSel){
    ever reloading Health underneath the reader. */
 const LOADERS={health:loadHealth,perf:loadPerf,trades:loadTrades,exposure:loadExposure,
   regime:loadRegime,drawdown:loadDrawdown,promotion:loadPromotion,
-  decisions:loadDecisions,venues:loadVenues,controls:loadControls};
+  decisions:loadDecisions,venues:loadVenues,hosts:loadHosts,controls:loadControls};
 /* Views whose main content is a wide table get the wide measure (finding: the
    12-column trades table was crushed at 1180px). Prose views stay narrow. */
-const WIDE=new Set(['perf','trades','venues','decisions']);
+const WIDE=new Set(['perf','trades','venues','hosts','decisions']);
 let activeView='health';
 
 function showView(name){
@@ -817,6 +869,166 @@ async function delVenue(n){
   try{ await POST('/api/venues/'+encodeURIComponent(n)+'/delete'); }
   catch(e){ alert('Delete failed: '+e.message); }
   loadVenues();
+}
+
+/* ---------- bot hosts ---------- */
+async function loadHosts(){
+  // Exposure first and loudest: it is the number the live kill switches read,
+  // and its TRUST is what matters. An unreadable host is not a flat one.
+  try{
+    const ex=await GET('/api/hosts/exposure');
+    const box=$('#hostExposure');
+    if(!ex.hosts){
+      box.className='hero good';
+      box.innerHTML='<div class="state">No bot hosts connected</div>'+
+        '<div class="because">Nothing hosted, nothing at risk here. Add a host below to '+
+        'start or stop its bots and fold their positions into the risk rails.</div>';
+    }else if(!ex.trustworthy){
+      box.className='hero warn';
+      box.innerHTML='<div class="state">Hosted exposure is not fully readable</div>'+
+        `<div class="because">${int(ex.unreadable_hosts)} host(s) unreachable, `+
+        `${int(ex.unvalued_bots)} bot(s) unvalued. In LIVE mode this stands new entries aside — `+
+        `a book Keel cannot read is not a flat book. ${esc(ex.detail||'')}</div>`;
+    }else{
+      box.className='hero good';
+      box.innerHTML='<div class="state">Hosted exposure '+signed(ex.unrealized_pnl,2)+'</div>'+
+        `<div class="because">${int(ex.open_positions)} open position(s) across `+
+        `${int(ex.hosts)} host(s), all readable. Losses here stack onto the live daily and `+
+        `weekly stops; profit never offsets.</div>`;
+    }
+  }catch(e){ fail('#hostExposure',e); }
+
+  try{
+    const d=await GET('/api/hosts');
+    const byName={}; (d.health||[]).forEach(h=>byName[h.name]=h);
+    const ht=$('#hostTable tbody');
+    if(!(d.hosts||[]).length){
+      ht.innerHTML='<tr><td colspan="6" class="note">No hosts configured yet. '+
+        'Add one below; bot control is disarmed until you enable it.</td></tr>';
+    }else{
+      ht.innerHTML=d.hosts.map(h=>{
+        const st=byName[h.name]||{};
+        return `<tr>
+          <td><b>${esc(h.name)}</b></td>
+          <td><span class="pill">${esc(h.kind)}</span></td>
+          <td>${st.reachable?'<span class="pos">yes</span>':'<span class="negt">no</span>'}</td>
+          <td>${st.authenticated?'<span class="pos">yes</span>':'<span class="negt">no</span>'}</td>
+          <td>${h.read_only
+                ? `<span class="pill">read-only</span> <button class="act ghost" onclick="armHost('${esc(h.name)}',true)">Arm control</button>`
+                : `<span class="armed">CONTROL ARMED</span> <button class="act ghost" onclick="armHost('${esc(h.name)}',false)">Disarm</button>`}</td>
+          <td><button class="act ghost" onclick="testHost('${esc(h.name)}')">Test</button>
+              <button class="act danger" onclick="delHost('${esc(h.name)}')">Delete</button></td>
+        </tr>`;}).join('');
+    }
+  }catch(e){ failRow('#hostTable',6,e); }
+
+  try{
+    const b=await GET('/api/hosts/bots');
+    const bt=$('#hostBots tbody');
+    if(!(b.bots||[]).length){
+      bt.innerHTML='<tr><td colspan="8" class="note">No bots reported. Configure a host, '+
+        'or this account simply has none.</td></tr>';
+    }else{
+      bt.innerHTML=b.bots.map(x=>{
+        if(x.error) return `<tr><td>${esc(x.host)}</td><td colspan="7" class="negt">${esc(x.error)}</td></tr>`;
+        const running=x.running;
+        const key=esc(x.host)+'||'+esc(x.bot_id);
+        return `<tr>
+          <td>${esc(x.host)}</td>
+          <td><b>${esc(x.name||x.bot_id)}</b><div class="note">${esc(x.bot_id)}</div></td>
+          <td>${esc(x.strategy||'—')}</td>
+          <td>${running?'<span class="pos">running</span>':'<span class="note">stopped</span>'}</td>
+          <td class="num">—</td><td class="num">—</td>
+          <td class="note">${(x.pairs||[]).map(esc).join(', ')||'—'}</td>
+          <td>${running
+                ? `<button class="act ghost" onclick="botCtl('${esc(x.host)}','${esc(x.bot_id)}',false)">Stop…</button>`
+                : `<button class="act ghost" onclick="botCtl('${esc(x.host)}','${esc(x.bot_id)}',true)">Start…</button>`}</td>
+        </tr>`;}).join('');
+      $('#hostBotDetail').innerHTML='<span class="note">Per-bot P&L is read on demand — '+
+        'open Exposure for the aggregate the kill switches actually use.</span>';
+    }
+  }catch(e){ failRow('#hostBots',8,e); }
+  stamp('hosts');
+}
+
+$('#hKind').addEventListener('change',()=>{
+  $('#hAltradyNote').style.display=$('#hKind').value==='altrady'?'':'none';
+});
+
+function hostBody(){
+  return {name:$('#hName').value.trim(), kind:$('#hKind').value,
+          api_key:$('#hKey').value.trim(), api_secret:$('#hSecret').value.trim()};
+}
+
+async function saveHost(){
+  const b=hostBody();
+  if(!b.name){ $('#hMsg').textContent='name is required'; return; }
+  $('#hMsg').textContent='saving…';
+  try{
+    const r=await POST('/api/hosts',b);
+    const h=r.health||{};
+    $('#hMsg').textContent = h.authenticated ? 'saved and authenticated'
+      : h.reachable ? 'saved; reachable but not authenticated — '+(h.detail||'check the key')
+      : 'saved; NOT reachable — '+(h.detail||'').slice(0,120);
+    ['hKey','hSecret'].forEach(i=>$('#'+i).value='');
+  }catch(e){ $('#hMsg').textContent='save failed: '+e.message; return; }
+  loadHosts();
+}
+
+async function probeHost(){
+  const b=hostBody(); b.name=b.name||'__probe';
+  $('#hMsg').textContent='testing…';
+  try{
+    const r=await POST('/api/hosts',b);
+    const h=r.health||{};
+    $('#hMsg').textContent = h.reachable
+      ? `reachable, auth=${h.authenticated}` : `NOT reachable: ${(h.detail||'').slice(0,140)}`;
+  }catch(e){ $('#hMsg').textContent='probe failed: '+e.message; return; }
+  loadHosts();
+}
+
+async function testHost(n){
+  $('#hMsg').textContent='testing '+n+'…';
+  try{
+    const r=await POST('/api/hosts/'+encodeURIComponent(n)+'/test');
+    const h=r.health||{};
+    $('#hMsg').textContent=`${n}: reachable=${h.reachable} auth=${h.authenticated} ${h.detail||''}`;
+  }catch(e){ $('#hMsg').textContent='test failed: '+e.message; }
+  loadHosts();
+}
+
+async function armHost(n,enable){
+  if(enable && !confirmPhrase('ARM',
+    `Arm bot control on ${n}?\n\nOnce armed, Keel can START and STOP the bots on ${n} — and their `+
+    `bots move REAL money on the exchange behind them. Keel never places orders itself here, but a `+
+    `bot it starts will.`)) return;
+  try{ await POST('/api/hosts/'+encodeURIComponent(n)+'/control',{enabled:!!enable}); }
+  catch(e){ alert((enable?'Arm':'Disarm')+' failed: '+e.message); }
+  loadHosts();
+}
+
+async function delHost(n){
+  if(!confirmPhrase('DELETE',
+    `Delete host ${n}?\n\nThis removes the host AND its stored credentials from the runtime DB.`)) return;
+  try{ await POST('/api/hosts/'+encodeURIComponent(n)+'/delete'); }
+  catch(e){ alert('Delete failed: '+e.message); }
+  loadHosts();
+}
+
+async function botCtl(host,bot,start){
+  const verb=start?'START':'STOP';
+  if(!confirmPhrase(verb,
+    `${verb} bot ${bot} on ${host}?\n\n`+
+    (start ? `Starting it hands control of a REAL position to the host's own bot. Keel will watch it `+
+             `but will not manage it.`
+           : `Stopping it does NOT necessarily flatten open positions — some hosts leave them running. `+
+             `Check the host's stop behaviour.`))) return;
+  const path=`/api/hosts/${encodeURIComponent(host)}/bots/${encodeURIComponent(bot)}/${start?'start':'stop'}`;
+  try{ const r=await POST(path); $('#hostBotDetail').innerHTML=
+        `<span class="note">${esc(verb.toLowerCase())} ${esc(bot)}: `+
+        `${r.action&&r.action.changed?'changed':'already in that state'}</span>`; }
+  catch(e){ alert(verb+' failed: '+e.message); }
+  loadHosts();
 }
 
 /* ---------- shared renderers ---------- */
