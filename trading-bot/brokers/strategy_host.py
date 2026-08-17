@@ -208,3 +208,24 @@ class HostedExposure(NamedTuple):
     @property
     def trustworthy(self) -> bool:
         return self.unvalued_bots == 0
+
+
+# Import side-effect registration, mirroring brokers/__init__.py. Each host
+# adapter registers itself and is optional: a missing dependency disables that
+# host kind, it does not stop the engine.
+#
+# Bitsgap is deliberately absent. Its current official API (open.bitsgap.com,
+# topic-based) has no bot concept at all — no list, start, stop or bot-state —
+# so there is nothing to build. See docs: it is not a documentation gap.
+try:
+    from . import threecommas_hosts    # noqa: F401  (kind "3commas-bots")
+except ImportError:                    # pragma: no cover - optional dependency
+    pass
+try:
+    from . import cryptohopper         # noqa: F401  (kind "cryptohopper")
+except ImportError:                    # pragma: no cover - optional dependency
+    pass
+try:
+    from . import altrady              # noqa: F401  (kind "altrady")
+except ImportError:                    # pragma: no cover - optional dependency
+    pass
